@@ -23,6 +23,18 @@ pub enum IaGetError {
     /// XML parsing errors
     #[error("Failed to parse XML: {0}")]
     XmlParsing(String),
+
+    /// Server rejected the resume offset (HTTP 416): the local partial file is not a valid prefix
+    #[error("Server rejected the resume offset (HTTP 416); the partial file must be re-downloaded from scratch")]
+    RangeNotSatisfiable,
+
+    /// One or more files in a batch could not be downloaded
+    #[error("{count} of {total} file(s) failed to download. {details}")]
+    BatchFailed {
+        count: usize,
+        total: usize,
+        details: String,
+    },
 }
 
 impl From<reqwest::Error> for IaGetError {

@@ -36,6 +36,17 @@ ia-get --list https://archive.org/details/<identifier>
 ia-get -l https://archive.org/details/<identifier>
 ```
 
+Archive.org's edge servers occasionally return error pages, empty responses, or drop connections mid-transfer. `ia-get` is built to ride out those outages:
+
+- Server errors (timeouts, connection resets, HTTP 5xx/429) are retried with exponential backoff — 5s base, doubling per attempt up to a 60s cap, with ±20% jitter — and a `Retry-After` header is honored when present.
+- Error response bodies are never written into your files, and an empty or truncated response is retried rather than saved.
+- Each file is downloaded to a `<name>.part` temporary file and renamed to its final name only after the size (when known) and MD5 hash have been verified. A failed verification triggers a re-download from scratch, up to three attempts per file.
+- If a file ultimately fails, the remaining files in the archive still download; `ia-get` exits with a non-zero status and prints a list of the failures. Use `--stop-on-error` to abort at the first failure instead.
+
+```shell
+ia-get --stop-on-error https://archive.org/details/<identifier>
+```
+
 ## Why? 🤔💭
 
 I wanted to download high-quality scans of [ZZap!64 magazine](https://en.wikipedia.org/wiki/Zzap!64) and some read-only memory from archive.org.
@@ -50,6 +61,9 @@ So I co-authored `ia-get` to automate the download process.
 - 🌳 Preserves the original directory structure
 - 🔄 Automatically resumes partial or failed downloads
 - 🔏 Hash checks to confirm file integrity
+- 🔁 Retries server errors (timeouts, HTTP 5xx/429, empty or truncated responses) with exponential backoff that honors `Retry-After`
+- 🧩 Downloads to `<name>.part` files and renames them only after size and MD5 verification passes
+- 🚦 A failed file no longer aborts the batch — the remaining files continue and `ia-get` exits non-zero, listing the failures
 - 🌱 Can be run multiple times to update existing downloads
 - 📊 Gets all the metadata for the archive
 - 📦️ Available for **Linux** 🐧 **macOS** 🍏 and **Windows** 🪟

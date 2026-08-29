@@ -341,6 +341,9 @@ struct Cli {
     /// Cookie header or Netscape cookies.txt file for authenticated downloads
     #[arg(short = 'b', long = "cookies", value_name = "COOKIES")]
     cookies: Option<String>,
+    /// Stop at the first failed file instead of continuing with the rest
+    #[arg(long)]
+    stop_on_error: bool,
 }
 
 /// Main application entry point
@@ -433,7 +436,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 sanitized_count += 1;
             }
 
-            (absolute_url.to_string(), sanitized_name, file.md5)
+            (
+                absolute_url.to_string(),
+                sanitized_name,
+                file.md5,
+                file.size,
+            )
         })
         .collect::<Vec<_>>();
 
@@ -454,6 +462,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         download_data.clone(),
         download_data.len(),
         download_cookie_header.as_deref(),
+        cli.stop_on_error,
     )
     .await?;
 
