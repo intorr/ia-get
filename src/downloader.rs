@@ -116,19 +116,30 @@ fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
     Ok(format!("{:x}", hash))
 }
 
+/// Outcome of checking whether an already-downloaded file is still valid
+enum ExistingFileStatus {
+    /// The file does not exist and must be downloaded
+    Missing,
+    /// The file exists and passed verification; `md5` is the verified hash
+    /// when archive.org provided one to compare against
+    Verified { md5: Option<String> },
+    /// The file exists but failed verification
+    Invalid,
+}
+
 /// Check if an existing file has the correct hash
 fn check_existing_file(
     file_path: &str,
     expected_md5: Option<&str>,
     running: &Arc<AtomicBool>,
-) -> Result<Option<bool>> {
+) -> Result<ExistingFileStatus> {
     if !Path::new(file_path).exists() {
-        return Ok(None);
+        return Ok(ExistingFileStatus::Missing);
     }
 
-    if expected_md5.is_none() {
-        return Ok(Some(true));
-    }
+    let Some(expected_md5) = expected_md5 else {
+        return Ok(ExistingFileStatus::Verified { md5: None });
+    };
 
     let local_md5 = match calculate_md5(file_path, running) {
         Ok(hash) => hash,
@@ -142,11 +153,36 @@ fn check_existing_file(
                 "Failed".red().bold(),
                 e
             );
-            return Ok(Some(false));
+            return Ok(ExistingFileStatus::Invalid);
         }
     };
 
-    Ok(Some(local_md5 == expected_md5.unwrap()))
+    if local_md5 == expected_md5 {
+        Ok(ExistingFileStatus::Verified {
+            md5: Some(local_md5),
+        })
+    } else {
+        Ok(ExistingFileStatus::Invalid)
+    }
+}
+
+/// Print the line shown once a file has been verified, using the same
+/// format for freshly downloaded and already-verified files
+fn print_verified_hash(md5: Option<&str>) {
+    match md5 {
+        Some(hash) => println!(
+            "{} {}         {} {}",
+            "╰╼".cyan().dimmed(),
+            "Hash".white(),
+            "✔".green().bold(),
+            format!("({})", hash).dimmed()
+        ),
+        None => println!(
+            "{} {}",
+            "-".dimmed(),
+            "No MD5 hash provided for verification.".dimmed()
+        ),
+    }
 }
 
 /// Ensure parent directories exist for a file
@@ -622,23 +658,13 @@ fn verify_downloaded_file(
     }
 
     if expected_md5.is_none() {
-        println!(
-            "{} {}",
-            "-".dimmed(),
-            "No MD5 hash provided for verification.".dimmed()
-        );
+        print_verified_hash(None);
         return Ok(true); // No hash to check against, consider it verified
     }
     let expected_md5_str = expected_md5.unwrap();
     let local_md5 = calculate_md5(file_path, running)?;
     if local_md5 == expected_md5_str {
-        println!(
-            "{} {}         {} {}",
-            "╰╼".cyan().dimmed(),
-            "Hash".white(),
-            "✔".green().bold(),
-            format!("({})", local_md5).dimmed()
-        );
+        print_verified_hash(Some(&local_md5));
         Ok(true)
     } else {
         println!(
@@ -735,7 +761,7 @@ where
         let part_path = format!("{}.part", file_path);
 
         match check_existing_file(&file_path, expected_md5.as_deref(), running)? {
-            Some(true) => {
+            ExistingFileStatus::Verified { md5 } => {
                 // Final file is already valid; clean up any stale .part file
                 let _ = fs::remove_file(&part_path);
                 // No request is made for a verified file, so only the XML
@@ -743,15 +769,10 @@ where
                 if let Some(target) = mtime_from_xml(expected_mtime) {
                     sync_file_mtime(&file_path, target);
                 }
-                println!(
-                    "{} {}   {}",
-                    "╰╼".cyan().dimmed(),
-                    "Downloaded".white(),
-                    "✔".green().bold()
-                );
+                print_verified_hash(md5.as_deref());
                 continue;
             }
-            Some(false) => {
+            ExistingFileStatus::Invalid => {
                 println!(
                     "{} {}      {} the existing file failed verification, re-downloading",
                     "├╼".cyan().dimmed(),
@@ -761,7 +782,7 @@ where
                 fs::remove_file(&file_path)?;
                 let _ = fs::remove_file(&part_path);
             }
-            None => {}
+            ExistingFileStatus::Missing => {}
         }
 
         let mut downloaded = false;
@@ -839,12 +860,6 @@ where
             if let Some(target) = downloaded_mtime.or(mtime_from_xml(expected_mtime)) {
                 sync_file_mtime(&file_path, target);
             }
-            println!(
-                "{} {}   {}",
-                "╰╼".cyan().dimmed(),
-                "Downloaded".white(),
-                "✔".green().bold()
-            );
         } else {
             if range_rejected {
                 // The server rejected the resume offset; the .part file is not
