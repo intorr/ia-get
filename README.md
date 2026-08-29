@@ -67,6 +67,7 @@ So I co-authored `ia-get` to automate the download process.
 - 🚦 A failed file no longer aborts the batch — the remaining files continue and `ia-get` exits non-zero, listing the failures
 - 🌱 Can be run multiple times to update existing downloads
 - 📊 Gets all the metadata for the archive
+- 📄 Saves the archive's own `<id>_files.xml` locally with the server's `Last-Modified` time on every run (overwriting any previous copy) and skips its stale self-reference when downloading the rest
 - 📦️ Available for **Linux** 🐧 **macOS** 🍏 and **Windows** 🪟
 
 ### Sharing is caring 🤝

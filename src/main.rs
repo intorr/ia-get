@@ -7,7 +7,7 @@
 
 use clap::Parser;
 use colored::*;
-use ia_get::archive_metadata::{parse_xml_files, XmlFiles};
+use ia_get::archive_metadata::{parse_xml_files, XmlFile, XmlFiles};
 use ia_get::constants::USER_AGENT;
 use ia_get::downloader;
 use ia_get::utils::{create_spinner, format_size, sanitize_filename, validate_archive_url};
@@ -189,6 +189,16 @@ fn cookie_header_value(cookie_input: Option<&str>, url: &Url) -> Result<Option<H
     Ok(Some(value))
 }
 
+/// XML metadata response: the parsed file list plus the raw data needed to
+/// persist the `_files.xml` document locally.
+struct XmlMetadata {
+    files: XmlFiles,
+    base_url: reqwest::Url,
+    cookie_header: Option<String>,
+    content: String,
+    last_modified: Option<SystemTime>,
+}
+
 /// Fetches and parses XML metadata from archive.org
 ///
 /// Combines XML URL generation, accessibility check, download, and parsing
@@ -200,13 +210,14 @@ fn cookie_header_value(cookie_input: Option<&str>, url: &Url) -> Result<Option<H
 /// * `spinner` - Progress spinner to update during processing
 ///
 /// # Returns
-/// Tuple of (XmlFiles, base_url) for download processing
+/// The `XmlMetadata` with the parsed files, base URL, cookie header, raw
+/// XML content and the server's `Last-Modified` time
 async fn fetch_xml_metadata(
     details_url: &str,
     client: &Client,
     spinner: &indicatif::ProgressBar,
     cookie_input: Option<&str>,
-) -> Result<(XmlFiles, reqwest::Url, Option<String>)> {
+) -> Result<XmlMetadata> {
     // Generate XML URL
     let xml_url = get_xml_url(details_url);
     spinner.set_message(format!(
@@ -251,12 +262,45 @@ async fn fetch_xml_metadata(
     }
 
     let response = request.send().await?;
+    let last_modified = downloader::parse_last_modified(response.headers());
     let xml_content = response.text().await?;
 
     // Parse XML content with improved error handling
     let files = parse_xml_files(&xml_content)?;
 
-    Ok((files, base_url, download_cookie_header))
+    Ok(XmlMetadata {
+        files,
+        base_url,
+        cookie_header: download_cookie_header,
+        content: xml_content,
+        last_modified,
+    })
+}
+
+/// Saves the raw `_files.xml` document to `path`, overwriting any existing
+/// copy, and syncs its last-modified time with the server's
+/// `Last-Modified` header when present.
+///
+/// The time is never taken from the document itself: its self-entry carries
+/// unreliable metadata. Failing to set the time is not fatal, mirroring the
+/// download batch.
+fn save_xml_metadata(path: &Path, content: &str, last_modified: Option<SystemTime>) -> Result<()> {
+    fs::write(path, content)?;
+
+    if let Some(target) = last_modified {
+        downloader::sync_file_mtime(path, target);
+    }
+
+    Ok(())
+}
+
+/// Filters out the archive's self-referencing `_files.xml` entry, whose
+/// checksum, mtime and size are unreliable, leaving the files to download.
+fn files_to_download(files: Vec<XmlFile>, xml_file_name: &str) -> Vec<XmlFile> {
+    files
+        .into_iter()
+        .filter(|file| file.name != xml_file_name)
+        .collect()
 }
 
 /// Return formatted file rows for `--list` output.
@@ -387,14 +431,33 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     // Fetch and parse XML metadata in one operation
-    let (files, base_url, download_cookie_header) =
-        fetch_xml_metadata(&cli.url, &client, &spinner, cli.cookies.as_deref()).await?;
+    let XmlMetadata {
+        files,
+        base_url,
+        cookie_header,
+        content,
+        last_modified,
+    } = fetch_xml_metadata(&cli.url, &client, &spinner, cli.cookies.as_deref()).await?;
+
+    // Persist the freshly fetched _files.xml (overwriting any previous copy)
+    // with the server's Last-Modified time, before anything else.
+    //
+    // The XML URL always ends in "<identifier>_files.xml" (see get_xml_url),
+    // so the last path segment is the file name.
+    let xml_file_name = base_url
+        .path()
+        .rsplit('/')
+        .next()
+        .expect("XML URL should have a file name segment");
+    save_xml_metadata(Path::new(xml_file_name), &content, last_modified)?;
 
     // If requested, list parsed filenames and exit
     if cli.list {
         list_files(&files, &spinner);
         return Ok(());
     }
+
+    let files = files_to_download(files.files, xml_file_name);
 
     // Successfully finished initialization
     spinner.set_style(
@@ -403,7 +466,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "{} {} to download {} files from archive.org {}",
                 "✔".green().bold(),
                 "Ready".bold(),
-                files.files.len().to_string().bold(),
+                files.len().to_string().bold(),
                 "★".yellow()
             ))
             .expect("Failed to set completion style"),
@@ -413,7 +476,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Prepare download data for batch processing
     let mut sanitized_count = 0;
     let download_data = files
-        .files
         .into_iter()
         .map(|file| {
             let mut absolute_url = base_url.clone();
@@ -462,7 +524,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         &client,
         download_data.clone(),
         download_data.len(),
-        download_cookie_header.as_deref(),
+        cookie_header.as_deref(),
         cli.stop_on_error,
     )
     .await?;
@@ -474,6 +536,34 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use ia_get::utils::validate_archive_url;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    /// Creates a unique temp directory for a test (no cleanup, mirroring
+    /// the downloader test helpers).
+    fn temp_dir_for(test_name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("System time should be after Unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ia-get-test-{}-{}-{}",
+            std::process::id(),
+            test_name,
+            nanos
+        ));
+        fs::create_dir_all(&dir).expect("Failed to create temp directory");
+        dir
+    }
+
+    /// Returns the file's mtime as unix seconds, if readable.
+    fn mtime_of(path: &Path) -> Option<u64> {
+        fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+    }
 
     #[test]
     fn check_valid_pattern() {
@@ -637,6 +727,74 @@ archive.org\tFALSE\t/\tFALSE\t2145916800\tcurrent\tvalue\n";
         assert_eq!(
             list_summary(&files),
             "3 files, 3.00MB total known size, 1 unknown size"
+        );
+    }
+
+    #[test]
+    fn files_to_download_excludes_xml_self_reference() {
+        let files = vec![
+            xml_file("item1_files.xml", Some(123)),
+            xml_file("scan.jpg", Some(456)),
+        ];
+
+        let result = files_to_download(files, "item1_files.xml");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "scan.jpg");
+    }
+
+    #[test]
+    fn files_to_download_keeps_all_when_no_self_reference() {
+        let files = vec![xml_file("scan.jpg", Some(456)), xml_file("notes.txt", None)];
+
+        let result = files_to_download(files, "item1_files.xml");
+
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn save_xml_metadata_writes_file_and_sets_mtime() {
+        let dir = temp_dir_for("save_xml_sets_mtime");
+        let path = dir.join("item1_files.xml");
+
+        save_xml_metadata(
+            &path,
+            "<files><file name=\"item1_files.xml\"/></files>",
+            Some(UNIX_EPOCH + Duration::from_secs(1_545_586_142)),
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("item1_files.xml"));
+        assert_eq!(mtime_of(&path), Some(1_545_586_142));
+    }
+
+    #[test]
+    fn save_xml_metadata_overwrites_existing_file() {
+        let dir = temp_dir_for("save_xml_overwrites");
+        let path = dir.join("item1_files.xml");
+        fs::write(&path, "stale content").unwrap();
+
+        save_xml_metadata(&path, "<files/>", None).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "<files/>");
+    }
+
+    #[test]
+    fn save_xml_metadata_without_last_modified_keeps_current_time() {
+        let dir = temp_dir_for("save_xml_no_mtime");
+        let path = dir.join("item1_files.xml");
+
+        save_xml_metadata(&path, "<files/>", None).unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mtime = mtime_of(&path).expect("mtime should be readable");
+        assert!(
+            mtime.abs_diff(now) < 60,
+            "mtime {mtime} should be within 60s of now {now}"
         );
     }
 }

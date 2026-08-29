@@ -222,7 +222,7 @@ fn is_retryable_status(status: StatusCode) -> bool {
 ///
 /// `reqwest::Response` has no typed accessor for this header, so the raw
 /// HTTP-date is parsed with `httpdate`.
-fn parse_last_modified(headers: &HeaderMap) -> Option<SystemTime> {
+pub fn parse_last_modified(headers: &HeaderMap) -> Option<SystemTime> {
     headers
         .get(LAST_MODIFIED)
         .and_then(|v| v.to_str().ok())
@@ -240,13 +240,13 @@ fn mtime_from_xml(mtime: Option<u64>) -> Option<SystemTime> {
 ///
 /// A failure to set the time is not fatal: it prints a warning and returns
 /// `false` so the batch can continue.
-fn sync_file_mtime(file_path: &str, target: SystemTime) -> bool {
+pub fn sync_file_mtime(file_path: impl AsRef<Path>, target: SystemTime) -> bool {
     let target_secs = target
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let current_secs = fs::metadata(file_path)
+    let current_secs = fs::metadata(&file_path)
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -259,7 +259,7 @@ fn sync_file_mtime(file_path: &str, target: SystemTime) -> bool {
     let file_time =
         filetime::FileTime::from_unix_time(i64::try_from(target_secs).unwrap_or(i64::MAX), 0);
 
-    if let Err(e) = filetime::set_file_mtime(file_path, file_time) {
+    if let Err(e) = filetime::set_file_mtime(&file_path, file_time) {
         println!(
             "{} {}      {}",
             "⚠".yellow().bold(),
