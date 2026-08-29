@@ -61,6 +61,7 @@ So I co-authored `ia-get` to automate the download process.
 - 🌳 Preserves the original directory structure
 - 🔄 Automatically resumes partial or failed downloads
 - 🔏 Hash checks to confirm file integrity
+- 🕓 Preserves file modification times — taken from the server's `Last-Modified` header, or from the `<mtime>` entry in `_files.xml` when the header is absent; already-verified files get their times corrected on re-runs
 - 🔁 Retries server errors (timeouts, HTTP 5xx/429, empty or truncated responses) with exponential backoff that honors `Retry-After`
 - 🧩 Downloads to `<name>.part` files and renames them only after size and MD5 verification passes
 - 🚦 A failed file no longer aborts the batch — the remaining files continue and `ia-get` exits non-zero, listing the failures

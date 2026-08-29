@@ -441,6 +441,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 sanitized_name,
                 file.md5,
                 file.size,
+                file.mtime,
             )
         })
         .collect::<Vec<_>>();

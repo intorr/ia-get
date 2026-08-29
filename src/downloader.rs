@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use colored::*;
-use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+use reqwest::header::{HeaderMap, HeaderValue, LAST_MODIFIED, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
 
 use crate::error::IaGetError; // Import IaGetError for explicit error conversion
@@ -218,6 +218,60 @@ fn is_retryable_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
 }
 
+/// Parses the server-provided `Last-Modified` header into a `SystemTime`.
+///
+/// `reqwest::Response` has no typed accessor for this header, so the raw
+/// HTTP-date is parsed with `httpdate`.
+fn parse_last_modified(headers: &HeaderMap) -> Option<SystemTime> {
+    headers
+        .get(LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| httpdate::parse_http_date(s).ok())
+}
+
+/// Converts the `<mtime>` value from `_files.xml` (unix seconds) into a
+/// `SystemTime`, or `None` when absent or out of representable range.
+fn mtime_from_xml(mtime: Option<u64>) -> Option<SystemTime> {
+    mtime.and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
+}
+
+/// Sets the file's last-modified time to `target` when the current time
+/// differs at second granularity.
+///
+/// A failure to set the time is not fatal: it prints a warning and returns
+/// `false` so the batch can continue.
+fn sync_file_mtime(file_path: &str, target: SystemTime) -> bool {
+    let target_secs = target
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let current_secs = fs::metadata(file_path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+
+    if current_secs == Some(target_secs) {
+        return false;
+    }
+
+    let file_time =
+        filetime::FileTime::from_unix_time(i64::try_from(target_secs).unwrap_or(i64::MAX), 0);
+
+    if let Err(e) = filetime::set_file_mtime(file_path, file_time) {
+        println!(
+            "{} {}      {}",
+            "⚠".yellow().bold(),
+            "Could not set last modified time".yellow(),
+            e.to_string().dimmed()
+        );
+        return false;
+    }
+
+    true
+}
+
 /// Records a failed attempt, prints the retry notice and waits.
 ///
 /// Returns an error once `MAX_RETRIES` has been exhausted.
@@ -282,7 +336,7 @@ async fn download_file_content(
     running: &Arc<AtomicBool>,
     cookie_header: Option<&str>,
     expected_size: Option<u64>,
-) -> Result<u64> {
+) -> Result<(u64, Option<SystemTime>)> {
     download_file_content_with_delay(
         client,
         url,
@@ -303,6 +357,9 @@ async fn download_file_content(
 /// Only a successful (2xx) response body is ever written to `file`. Error
 /// pages are discarded, empty and truncated bodies are retried, and a 200
 /// response to a ranged request resets the file instead of appending to it.
+///
+/// Returns the total file size and, when the server sent one on the final
+/// successful response, the parsed `Last-Modified` header value.
 async fn download_file_content_with_delay(
     client: &Client,
     url: &str,
@@ -311,7 +368,7 @@ async fn download_file_content_with_delay(
     cookie_header: Option<&str>,
     expected_size: Option<u64>,
     retry_delay: fn(u32) -> Duration,
-) -> Result<u64> {
+) -> Result<(u64, Option<SystemTime>)> {
     let mut retry_count = 0;
 
     loop {
@@ -370,6 +427,9 @@ async fn download_file_content_with_delay(
             .get(RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after);
+        // Captured on every successful response so the value returned to the
+        // caller always comes from the attempt that completed the download.
+        let last_modified = parse_last_modified(response.headers());
 
         if !status.is_success() {
             // Error pages must never be written to the file; drop the body.
@@ -513,7 +573,7 @@ async fn download_file_content_with_delay(
                     unit
                 );
 
-                return Ok(total_bytes);
+                return Ok((total_bytes, last_modified));
             }
             Err(e) => {
                 pb.finish_and_clear();
@@ -611,7 +671,7 @@ pub async fn download_files<I>(
     stop_on_error: bool,
 ) -> Result<()>
 where
-    I: IntoIterator<Item = (String, String, Option<String>, Option<u64>)>, // (url, filename, md5, size)
+    I: IntoIterator<Item = (String, String, Option<String>, Option<u64>, Option<u64>)>, // (url, filename, md5, size, mtime)
 {
     // Set up signal handling for the entire download session
     let running = setup_signal_handler();
@@ -640,11 +700,13 @@ async fn download_files_with_signal<I>(
     running: &Arc<AtomicBool>,
 ) -> Result<()>
 where
-    I: IntoIterator<Item = (String, String, Option<String>, Option<u64>)>, // (url, filename, md5, size)
+    I: IntoIterator<Item = (String, String, Option<String>, Option<u64>, Option<u64>)>, // (url, filename, md5, size, mtime)
 {
     let mut failed_files: Vec<(String, String)> = Vec::new();
 
-    for (index, (url, file_path, expected_md5, expected_size)) in files.into_iter().enumerate() {
+    for (index, (url, file_path, expected_md5, expected_size, expected_mtime)) in
+        files.into_iter().enumerate()
+    {
         // Check if we should stop due to signal
         if !running.load(Ordering::SeqCst) {
             println!(
@@ -676,6 +738,11 @@ where
             Some(true) => {
                 // Final file is already valid; clean up any stale .part file
                 let _ = fs::remove_file(&part_path);
+                // No request is made for a verified file, so only the XML
+                // mtime is available here.
+                if let Some(target) = mtime_from_xml(expected_mtime) {
+                    sync_file_mtime(&file_path, target);
+                }
                 println!(
                     "{} {}   {}",
                     "╰╼".cyan().dimmed(),
@@ -698,6 +765,7 @@ where
         }
 
         let mut downloaded = false;
+        let mut downloaded_mtime: Option<SystemTime> = None;
         let mut range_rejected = false;
         let mut last_error = String::new();
 
@@ -729,13 +797,14 @@ where
             )
             .await
             {
-                Ok(_) => {
+                Ok((_, server_mtime)) => {
                     if verify_downloaded_file(
                         &part_path,
                         expected_md5.as_deref(),
                         expected_size,
                         running,
                     )? {
+                        downloaded_mtime = server_mtime;
                         downloaded = true;
                         break;
                     }
@@ -764,6 +833,12 @@ where
                 fs::remove_file(&file_path)?;
             }
             fs::rename(&part_path, &file_path)?;
+            // Prefer the server's Last-Modified header, fall back to the
+            // mtime from _files.xml, and leave the time untouched if both
+            // are absent.
+            if let Some(target) = downloaded_mtime.or(mtime_from_xml(expected_mtime)) {
+                sync_file_mtime(&file_path, target);
+            }
             println!(
                 "{} {}   {}",
                 "╰╼".cyan().dimmed(),
@@ -1014,9 +1089,22 @@ mod tests {
         Arc::new(AtomicBool::new(true))
     }
 
+    /// Reads a file's last-modified time as unix seconds, if available.
+    fn mtime_of(path: &Path) -> Option<u64> {
+        fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+    }
+
     /// Runs a single download against the mock server and returns the bytes
-    /// reported as downloaded.
-    async fn run_download(url: &str, part_path: &str, expected_size: Option<u64>) -> Result<u64> {
+    /// reported as downloaded along with the captured `Last-Modified` time.
+    async fn run_download(
+        url: &str,
+        part_path: &str,
+        expected_size: Option<u64>,
+    ) -> Result<(u64, Option<SystemTime>)> {
         let client = Client::new();
         let mut file = prepare_file_for_download(part_path)?;
         let result = download_file_content_with_delay(
@@ -1119,7 +1207,8 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result.expect("download should succeed"), full.len() as u64);
+        let (bytes, _) = result.expect("download should succeed");
+        assert_eq!(bytes, full.len() as u64);
         assert_eq!(fs::read(&part).unwrap(), full);
         assert_eq!(server.ranges(), vec![None, Some(8)]);
         let _ = fs::remove_dir_all(&dir);
@@ -1146,7 +1235,8 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result.expect("download should succeed"), full.len() as u64);
+        let (bytes, _) = result.expect("download should succeed");
+        assert_eq!(bytes, full.len() as u64);
         assert_eq!(
             fs::read(&part).unwrap(),
             full,
@@ -1274,12 +1364,19 @@ mod tests {
         let missing_path = dir.join("missing.bin").to_str().unwrap().to_string();
         let ok_path = dir.join("ok.bin").to_str().unwrap().to_string();
         let files = vec![
-            (server.url("/missing.bin"), missing_path, None, Some(5)),
+            (
+                server.url("/missing.bin"),
+                missing_path,
+                None,
+                Some(5),
+                None,
+            ),
             (
                 server.url("/ok.bin"),
                 ok_path,
                 Some(ok_md5),
                 Some(ok_content.len() as u64),
+                None,
             ),
         ];
         let client = Client::new();
@@ -1325,12 +1422,19 @@ mod tests {
         let missing_path = dir.join("missing.bin").to_str().unwrap().to_string();
         let ok_path = dir.join("ok.bin").to_str().unwrap().to_string();
         let files = vec![
-            (server.url("/missing.bin"), missing_path, None, Some(5)),
+            (
+                server.url("/missing.bin"),
+                missing_path,
+                None,
+                Some(5),
+                None,
+            ),
             (
                 server.url("/ok.bin"),
                 ok_path,
                 Some(ok_md5),
                 Some(ok_content.len() as u64),
+                None,
             ),
         ];
         let client = Client::new();
@@ -1376,6 +1480,7 @@ mod tests {
             file_path,
             Some(md5),
             Some(correct.len() as u64),
+            None,
         )];
         let client = Client::new();
         let running = test_running();
@@ -1390,6 +1495,221 @@ mod tests {
             "mismatch must trigger exactly one re-download"
         );
         assert_eq!(fs::read(dir.join("file.bin")).unwrap(), correct);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mtime_from_xml_converts_and_rejects_overflow() {
+        assert_eq!(mtime_from_xml(None), None);
+        assert_eq!(
+            mtime_from_xml(Some(1_735_965_174)),
+            Some(UNIX_EPOCH + Duration::from_secs(1_735_965_174))
+        );
+        assert_eq!(mtime_from_xml(Some(u64::MAX)), None);
+    }
+
+    #[tokio::test]
+    async fn last_modified_header_is_captured() {
+        let content = b"0123456789abcdef";
+
+        let mut scripts = HashMap::new();
+        scripts.insert(
+            "/file.bin".to_string(),
+            VecDeque::from(vec![MockResponse::new(
+                200,
+                MockBody::Full(content.to_vec()),
+            )
+            .with_header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")]),
+        );
+        let server = start_mock_server(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+
+        let dir = temp_dir_for("last_modified");
+        let part = dir.join("file.bin.part");
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(content.len() as u64),
+        )
+        .await;
+
+        let (bytes, mtime) = result.expect("download should succeed");
+        assert_eq!(bytes, content.len() as u64);
+        assert_eq!(
+            mtime,
+            httpdate::parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT").ok()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn downloaded_file_gets_xml_mtime_when_server_sends_none() {
+        let content = b"xml-mtime-content";
+        let md5 = format!("{:x}", md5::compute(content));
+        let xml_mtime = 1_545_586_142;
+
+        let mut scripts = HashMap::new();
+        scripts.insert(
+            "/file.bin".to_string(),
+            VecDeque::from(vec![MockResponse::new(
+                200,
+                MockBody::Full(content.to_vec()),
+            )]),
+        );
+        let server = start_mock_server(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+
+        let dir = temp_dir_for("xml_mtime");
+        let file_path = dir.join("file.bin").to_str().unwrap().to_string();
+        let files = vec![(
+            server.url("/file.bin"),
+            file_path,
+            Some(md5),
+            Some(content.len() as u64),
+            Some(xml_mtime),
+        )];
+        let client = Client::new();
+        let running = test_running();
+
+        download_files_with_signal(&client, files, 1, None, false, &running)
+            .await
+            .expect("batch should succeed");
+
+        assert_eq!(
+            mtime_of(&dir.join("file.bin")),
+            Some(xml_mtime),
+            "file mtime must be set from _files.xml when the server sent no Last-Modified"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn server_last_modified_wins_over_xml_mtime() {
+        let content = b"server-mtime-content";
+        let md5 = format!("{:x}", md5::compute(content));
+        let xml_mtime = 1_545_586_142;
+        let header_mtime =
+            httpdate::parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT").expect("valid date");
+        let expected = header_mtime
+            .duration_since(UNIX_EPOCH)
+            .expect("valid date")
+            .as_secs();
+
+        let mut scripts = HashMap::new();
+        scripts.insert(
+            "/file.bin".to_string(),
+            VecDeque::from(vec![MockResponse::new(
+                200,
+                MockBody::Full(content.to_vec()),
+            )
+            .with_header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")]),
+        );
+        let server = start_mock_server(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+
+        let dir = temp_dir_for("server_mtime");
+        let file_path = dir.join("file.bin").to_str().unwrap().to_string();
+        let files = vec![(
+            server.url("/file.bin"),
+            file_path,
+            Some(md5),
+            Some(content.len() as u64),
+            Some(xml_mtime),
+        )];
+        let client = Client::new();
+        let running = test_running();
+
+        download_files_with_signal(&client, files, 1, None, false, &running)
+            .await
+            .expect("batch should succeed");
+
+        assert_eq!(
+            mtime_of(&dir.join("file.bin")),
+            Some(expected),
+            "server Last-Modified must take precedence over the _files.xml mtime"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn verified_existing_file_gets_xml_mtime_without_download() {
+        let content = b"already-verified-content";
+        let xml_mtime = 1_545_586_142;
+
+        let server = start_mock_server(
+            HashMap::new(),
+            MockResponse::new(200, MockBody::Full(vec![])),
+        );
+
+        let dir = temp_dir_for("verified_mtime");
+        let file_path = dir.join("file.bin");
+        fs::write(&file_path, content).expect("failed to write test file");
+        let files = vec![(
+            server.url("/file.bin"),
+            file_path.to_str().unwrap().to_string(),
+            None,
+            Some(content.len() as u64),
+            Some(xml_mtime),
+        )];
+        let client = Client::new();
+        let running = test_running();
+
+        download_files_with_signal(&client, files, 1, None, false, &running)
+            .await
+            .expect("batch should succeed");
+
+        assert_eq!(
+            server.request_count(),
+            0,
+            "verified file must not be re-downloaded"
+        );
+        assert_eq!(
+            mtime_of(&file_path),
+            Some(xml_mtime),
+            "already-verified file must still get the _files.xml mtime"
+        );
+        assert_eq!(fs::read(&file_path).unwrap(), content);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn file_mtime_untouched_without_mtime_sources() {
+        let content = b"no-mtime-content";
+        let md5 = format!("{:x}", md5::compute(content));
+
+        let mut scripts = HashMap::new();
+        scripts.insert(
+            "/file.bin".to_string(),
+            VecDeque::from(vec![MockResponse::new(
+                200,
+                MockBody::Full(content.to_vec()),
+            )]),
+        );
+        let server = start_mock_server(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+
+        let dir = temp_dir_for("no_mtime");
+        let file_path = dir.join("file.bin").to_str().unwrap().to_string();
+        let files = vec![(
+            server.url("/file.bin"),
+            file_path,
+            Some(md5),
+            Some(content.len() as u64),
+            None,
+        )];
+        let client = Client::new();
+        let running = test_running();
+
+        download_files_with_signal(&client, files, 1, None, false, &running)
+            .await
+            .expect("batch should succeed");
+
+        let secs = mtime_of(&dir.join("file.bin")).expect("file must exist");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            now.saturating_sub(secs) < 60,
+            "mtime must stay at the download time when no source is available (age {}s)",
+            now.saturating_sub(secs)
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
