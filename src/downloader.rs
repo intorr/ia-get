@@ -131,6 +131,7 @@ enum ExistingFileStatus {
 fn check_existing_file(
     file_path: &str,
     expected_md5: Option<&str>,
+    expected_size: Option<u64>,
     running: &Arc<AtomicBool>,
 ) -> Result<ExistingFileStatus> {
     if !Path::new(file_path).exists() {
@@ -138,6 +139,14 @@ fn check_existing_file(
     }
 
     let Some(expected_md5) = expected_md5 else {
+        // No hash to compare against: still reject a file whose size does not
+        // match the metadata, so a stale or truncated copy is re-downloaded.
+        if let Some(expected_size) = expected_size {
+            let local_size = fs::metadata(file_path)?.len();
+            if local_size != expected_size {
+                return Ok(ExistingFileStatus::Invalid);
+            }
+        }
         return Ok(ExistingFileStatus::Verified { md5: None });
     };
 
@@ -760,7 +769,7 @@ where
 
         let part_path = format!("{}.part", file_path);
 
-        match check_existing_file(&file_path, expected_md5.as_deref(), running)? {
+        match check_existing_file(&file_path, expected_md5.as_deref(), expected_size, running)? {
             ExistingFileStatus::Verified { md5 } => {
                 // Final file is already valid; clean up any stale .part file
                 let _ = fs::remove_file(&part_path);
@@ -779,7 +788,23 @@ where
                     "Partial".white(),
                     "▲".yellow().bold()
                 );
-                fs::remove_file(&file_path)?;
+                if let Err(e) = fs::remove_file(&file_path) {
+                    // A stale file that cannot be removed (locked, read-only)
+                    // is a per-file failure, not a batch-aborting one.
+                    let _ = fs::remove_file(&part_path);
+                    failed_files.push((
+                        file_path.clone(),
+                        format!("stale file could not be removed: {e}"),
+                    ));
+                    if stop_on_error {
+                        return Err(IaGetError::BatchFailed {
+                            count: failed_files.len(),
+                            total: total_files,
+                            details: batch_failure_details(&failed_files),
+                        });
+                    }
+                    continue;
+                }
                 let _ = fs::remove_file(&part_path);
             }
             ExistingFileStatus::Missing => {}
@@ -1777,5 +1802,110 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[tokio::test]
+    async fn existing_file_with_wrong_size_and_no_md5_is_redownloaded() {
+        let content = b"fresh-content-001";
+
+        let mut scripts = HashMap::new();
+        scripts.insert(
+            "/file.bin".to_string(),
+            VecDeque::from(vec![MockResponse::new(
+                200,
+                MockBody::Full(content.to_vec()),
+            )]),
+        );
+        let server = start_mock_server(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+
+        let dir = temp_dir_for("size_mismatch_skip");
+        let file_path = dir.join("file.bin").to_str().unwrap().to_string();
+        // A stale copy with the wrong size and no MD5 in the metadata: the
+        // skip path must re-download instead of accepting it.
+        fs::write(&file_path, b"stale").unwrap();
+        let files = vec![(
+            server.url("/file.bin"),
+            file_path,
+            None,
+            Some(content.len() as u64),
+            None,
+        )];
+        let client = Client::new();
+        let running = test_running();
+
+        download_files_with_signal(&client, files, 1, None, false, &running)
+            .await
+            .expect("batch should succeed after re-download");
+
+        assert_eq!(
+            server.request_count(),
+            1,
+            "size mismatch without MD5 must trigger a re-download"
+        );
+        assert_eq!(fs::read(dir.join("file.bin")).unwrap(), content);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unremovable_stale_file_fails_only_that_file() {
+        let ok_content = b"ok-content-123";
+        let ok_md5 = format!("{:x}", md5::compute(ok_content));
+
+        let mut scripts = HashMap::new();
+        scripts.insert(
+            "/ok.bin".to_string(),
+            VecDeque::from(vec![MockResponse::new(
+                200,
+                MockBody::Full(ok_content.to_vec()),
+            )]),
+        );
+        let server = start_mock_server(scripts, MockResponse::new(404, MockBody::Full(vec![])));
+
+        let dir = temp_dir_for("unremovable_stale");
+        // A directory at the final path: both MD5 calculation and remove_file
+        // fail on it on every platform, so it lands in the Invalid branch.
+        let blocked = dir.join("blocked.bin");
+        fs::create_dir(&blocked).unwrap();
+        let blocked_path = blocked.to_str().unwrap().to_string();
+        let ok_path = dir.join("ok.bin").to_str().unwrap().to_string();
+        let files = vec![
+            (
+                server.url("/blocked.bin"),
+                blocked_path,
+                Some("00000000000000000000000000000000".to_string()),
+                None,
+                None,
+            ),
+            (
+                server.url("/ok.bin"),
+                ok_path,
+                Some(ok_md5),
+                Some(ok_content.len() as u64),
+                None,
+            ),
+        ];
+        let client = Client::new();
+        let running = test_running();
+
+        let err = download_files_with_signal(&client, files, 2, None, false, &running)
+            .await
+            .unwrap_err();
+        match err {
+            IaGetError::BatchFailed {
+                count,
+                total,
+                details,
+            } => {
+                assert_eq!((count, total), (1, 2));
+                assert!(details.contains("blocked.bin"), "{details}");
+            }
+            other => panic!("expected BatchFailed with one file, got {:?}", other),
+        }
+        assert_eq!(fs::read(dir.join("ok.bin")).unwrap(), ok_content);
+        assert!(
+            blocked.exists(),
+            "unremovable stale file must stay in place"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

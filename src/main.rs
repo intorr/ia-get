@@ -19,8 +19,13 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Extended timeout for large file downloads (10 minutes for connection, no read timeout)
+/// Extended timeout for large file downloads (10 minutes for connection)
 const CONNECTION_TIMEOUT_SECS: u64 = 600;
+
+/// Idle timeout for reading the response body. Applies to each read and resets
+/// after a successful one, so a stalled mid-transfer becomes a retryable
+/// mid-stream error (resumed later) instead of an infinite hang.
+const READ_TIMEOUT_SECS: u64 = 300;
 
 /// Checks if a URL is accessible by sending a HEAD request
 async fn is_url_accessible(url: &Url, client: &Client, cookie_input: Option<&str>) -> Result<()> {
@@ -67,6 +72,31 @@ fn get_xml_url(original_url: &str) -> String {
 
     // The XML URL is "{download_url_base}/{identifier}_files.xml"
     format!("{}/{}_files.xml", download_url_base, identifier)
+}
+
+/// Percent-encodes every path segment of a file name, preserving the `/`
+/// separators, so that URL-special characters in the name (`?`, `#`, `%`,
+/// spaces, non-ASCII, ...) cannot be misread as a query string or fragment
+/// by `Url::join`.
+fn encode_download_path(name: &str) -> String {
+    let mut out = String::new();
+    for (i, segment) in name.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        for ch in segment.chars() {
+            match ch {
+                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(ch),
+                _ => {
+                    let mut buf = [0u8; 4];
+                    for b in ch.encode_utf8(&mut buf).as_bytes() {
+                        out.push_str(&format!("%{b:02X}"));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,6 +434,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(CONNECTION_TIMEOUT_SECS))
+        .read_timeout(std::time::Duration::from_secs(READ_TIMEOUT_SECS))
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .pool_max_idle_per_host(1)
         .tcp_keepalive(std::time::Duration::from_secs(60))
@@ -479,7 +510,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .map(|file| {
             let mut absolute_url = base_url.clone();
-            if let Ok(joined_url) = absolute_url.join(&file.name) {
+            // Percent-encode the name first so '?' / '#' / '%' characters in
+            // it cannot split the URL into query or fragment components.
+            let encoded_name = encode_download_path(&file.name);
+            if let Ok(joined_url) = absolute_url.join(&encoded_name) {
                 absolute_url = joined_url;
             }
 
@@ -605,6 +639,26 @@ mod tests {
         assert_eq!(
             get_xml_url("https://archive.org/details/another-item_v2.0/"), // With trailing slash
             "https://archive.org/download/another-item_v2.0/another-item_v2.0_files.xml"
+        );
+    }
+
+    #[test]
+    fn encode_download_path_escapes_url_specials() {
+        // '#' starts a fragment and '?' a query — both must be escaped.
+        assert_eq!(encode_download_path("clip#1.mp4"), "clip%231.mp4");
+        assert_eq!(encode_download_path("a?b.mp4"), "a%3Fb.mp4");
+        // A literal '%' in the name must be escaped so it is not read as an
+        // existing escape sequence.
+        assert_eq!(encode_download_path("100%25off.mp4"), "100%2525off.mp4");
+        // Spaces and non-ASCII are encoded; '/' separators are preserved.
+        assert_eq!(
+            encode_download_path("sub dir/файл.mp4"),
+            "sub%20dir/%D1%84%D0%B0%D0%B9%D0%BB.mp4"
+        );
+        // Unreserved characters pass through unchanged.
+        assert_eq!(
+            encode_download_path("plain-file_v2.0.tar.gz"),
+            "plain-file_v2.0.tar.gz"
         );
     }
 
