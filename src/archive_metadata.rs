@@ -27,8 +27,10 @@ pub struct XmlFiles {
 pub struct XmlFile {
     #[serde(rename = "@name")]
     pub name: String,
-    #[serde(rename = "@source")]
-    pub source: String,
+    // Optional: a missing @source attribute must not break parsing of the
+    // whole document.
+    #[serde(rename = "@source", default)]
+    pub source: Option<String>,
     pub mtime: Option<u64>,
     pub size: Option<u64>,
     pub format: Option<String>,
@@ -68,4 +70,28 @@ pub fn parse_xml_files(xml_content: &str) -> Result<XmlFiles> {
             }
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_entry_without_source_attribute_parses() {
+        // A missing @source must not break parsing of the whole document.
+        let files = parse_xml_files("<files><file name=\"a.bin\"><size>3</size></file></files>")
+            .expect("source attribute must be optional");
+        assert_eq!(files.files.len(), 1);
+        assert_eq!(files.files[0].name, "a.bin");
+        assert!(files.files[0].source.is_none());
+    }
+
+    #[test]
+    fn file_entry_with_source_attribute_parses() {
+        let files = parse_xml_files(
+            "<files><file name=\"a.bin\" source=\"original\"><size>3</size></file></files>",
+        )
+        .expect("valid metadata must parse");
+        assert_eq!(files.files[0].source.as_deref(), Some("original"));
+    }
 }

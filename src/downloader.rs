@@ -698,10 +698,15 @@ fn verify_downloaded_file(
 /// the final file. By default the batch continues after a failed file and
 /// returns `IaGetError::BatchFailed` at the end; pass `stop_on_error` to
 /// abort at the first failure instead.
+///
+/// Files are numbered starting at `file_number_start` (1-based) out of
+/// `total_files`, so files handled before the batch (for example the
+/// locally saved `_files.xml` as file #1) can be counted into the numbering.
 pub async fn download_files<I>(
     client: &Client,
     files: I,
     total_files: usize,
+    file_number_start: usize,
     cookie_header: Option<&str>,
     stop_on_error: bool,
 ) -> Result<()>
@@ -715,6 +720,7 @@ where
         client,
         files,
         total_files,
+        file_number_start,
         cookie_header,
         stop_on_error,
         &running,
@@ -726,10 +732,14 @@ where
 ///
 /// Split out from `download_files` so tests can drive the batch loop without
 /// registering a second (and panicking) Ctrl+C handler.
+///
+/// `file_number_start` is the 1-based number assigned to the first file of
+/// the batch.
 async fn download_files_with_signal<I>(
     client: &Client,
     files: I,
     total_files: usize,
+    file_number_start: usize,
     cookie_header: Option<&str>,
     stop_on_error: bool,
     running: &Arc<AtomicBool>,
@@ -763,7 +773,7 @@ where
             "├╼".cyan().dimmed(),
             "Count".white(),
             "#".blue().bold(),
-            (index + 1).to_string().bold(),
+            (index + file_number_start).to_string().bold(),
             total_files.to_string().bold()
         );
 
@@ -1422,7 +1432,7 @@ mod tests {
         let client = Client::new();
         let running = test_running();
 
-        let err = download_files_with_signal(&client, files, 2, None, false, &running)
+        let err = download_files_with_signal(&client, files, 2, 1, None, false, &running)
             .await
             .unwrap_err();
         match err {
@@ -1480,7 +1490,7 @@ mod tests {
         let client = Client::new();
         let running = test_running();
 
-        let err = download_files_with_signal(&client, files, 2, None, true, &running)
+        let err = download_files_with_signal(&client, files, 2, 1, None, true, &running)
             .await
             .unwrap_err();
         assert!(
@@ -1525,7 +1535,7 @@ mod tests {
         let client = Client::new();
         let running = test_running();
 
-        download_files_with_signal(&client, files, 1, None, false, &running)
+        download_files_with_signal(&client, files, 1, 1, None, false, &running)
             .await
             .expect("batch should succeed after re-download");
 
@@ -1609,7 +1619,7 @@ mod tests {
         let client = Client::new();
         let running = test_running();
 
-        download_files_with_signal(&client, files, 1, None, false, &running)
+        download_files_with_signal(&client, files, 1, 1, None, false, &running)
             .await
             .expect("batch should succeed");
 
@@ -1656,7 +1666,7 @@ mod tests {
         let client = Client::new();
         let running = test_running();
 
-        download_files_with_signal(&client, files, 1, None, false, &running)
+        download_files_with_signal(&client, files, 1, 1, None, false, &running)
             .await
             .expect("batch should succeed");
 
@@ -1691,7 +1701,7 @@ mod tests {
         let client = Client::new();
         let running = test_running();
 
-        download_files_with_signal(&client, files, 1, None, false, &running)
+        download_files_with_signal(&client, files, 1, 1, None, false, &running)
             .await
             .expect("batch should succeed");
 
@@ -1736,7 +1746,7 @@ mod tests {
         let client = Client::new();
         let running = test_running();
 
-        download_files_with_signal(&client, files, 1, None, false, &running)
+        download_files_with_signal(&client, files, 1, 1, None, false, &running)
             .await
             .expect("batch should succeed");
 
@@ -1833,7 +1843,7 @@ mod tests {
         let client = Client::new();
         let running = test_running();
 
-        download_files_with_signal(&client, files, 1, None, false, &running)
+        download_files_with_signal(&client, files, 1, 1, None, false, &running)
             .await
             .expect("batch should succeed after re-download");
 
@@ -1887,7 +1897,7 @@ mod tests {
         let client = Client::new();
         let running = test_running();
 
-        let err = download_files_with_signal(&client, files, 2, None, false, &running)
+        let err = download_files_with_signal(&client, files, 2, 1, None, false, &running)
             .await
             .unwrap_err();
         match err {

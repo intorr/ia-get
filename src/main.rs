@@ -221,6 +221,7 @@ fn cookie_header_value(cookie_input: Option<&str>, url: &Url) -> Result<Option<H
 
 /// XML metadata response: the parsed file list plus the raw data needed to
 /// persist the `_files.xml` document locally.
+#[derive(Debug)]
 struct XmlMetadata {
     files: XmlFiles,
     base_url: reqwest::Url,
@@ -255,9 +256,21 @@ async fn fetch_xml_metadata(
         "⚙".blue(),
         xml_url.bold()
     ));
+    fetch_and_parse_xml(&xml_url, client, spinner, cookie_input).await
+}
 
+/// Fetches, downloads and parses a `_files.xml` document from an explicit URL.
+///
+/// Split out of `fetch_xml_metadata` so tests can point it at a local mock
+/// server instead of the fixed archive.org download URL.
+async fn fetch_and_parse_xml(
+    xml_url: &str,
+    client: &Client,
+    spinner: &indicatif::ProgressBar,
+    cookie_input: Option<&str>,
+) -> Result<XmlMetadata> {
     // Parse base URL and fetch XML content
-    let base_url = reqwest::Url::parse(&xml_url)?;
+    let base_url = reqwest::Url::parse(xml_url)?;
     let download_cookie_header = cookie_input
         .map(|input| cookie_header_from_input(input, &base_url))
         .transpose()?
@@ -291,7 +304,10 @@ async fn fetch_xml_metadata(
         request = request.headers(headers);
     }
 
-    let response = request.send().await?;
+    // The HEAD check above can pass while the GET still fails (throttling,
+    // transient edge errors): surface it as a network error instead of
+    // feeding an error page into the XML parser.
+    let response = request.send().await?.error_for_status()?;
     let last_modified = downloader::parse_last_modified(response.headers());
     let xml_content = response.text().await?;
 
@@ -482,6 +498,38 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .expect("XML URL should have a file name segment");
     save_xml_metadata(Path::new(xml_file_name), &content, last_modified)?;
 
+    // The saved _files.xml counts as the archive's first file (that is how
+    // archive.org lists it), so it is announced as #1 and the downloaded
+    // files are numbered from #2, keeping the counts consistent with the
+    // website. If the metadata lacks its own entry, the saved copy is still
+    // counted.
+    let total_files =
+        files.files.len() + usize::from(!files.files.iter().any(|f| f.name == xml_file_name));
+    println!(" ");
+    println!(
+        "{}  {}     {}",
+        "▣".bright_cyan().bold(),
+        "Filename".white(),
+        xml_file_name.bold()
+    );
+    println!(
+        "{} {}        {} {} of {}",
+        "├╼".cyan().dimmed(),
+        "Count".white(),
+        "#".blue().bold(),
+        "1".bold(),
+        total_files.to_string().bold()
+    );
+    // Same line shape as the batch's "Downloaded" lines, minus time/rate:
+    // the file is local, so there was no transfer.
+    println!(
+        "{} {}   {} {}",
+        "╰╼".cyan().dimmed(),
+        "Downloaded".white(),
+        "↓".green().bold(),
+        format_size(content.len() as u64).bold()
+    );
+
     // If requested, list parsed filenames and exit
     if cli.list {
         list_files(&files, &spinner);
@@ -490,7 +538,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let files = files_to_download(files.files, xml_file_name);
 
-    // Successfully finished initialization
+    // Successfully finished initialization; separate the banner from the
+    // saved-metadata block above.
+    println!();
     spinner.set_style(
         ProgressStyle::default_spinner()
             .template(&format!(
@@ -509,13 +559,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let download_data = files
         .into_iter()
         .map(|file| {
-            let mut absolute_url = base_url.clone();
             // Percent-encode the name first so '?' / '#' / '%' characters in
             // it cannot split the URL into query or fragment components.
             let encoded_name = encode_download_path(&file.name);
-            if let Ok(joined_url) = absolute_url.join(&encoded_name) {
-                absolute_url = joined_url;
-            }
+            // A failed join must abort the run: silently keeping the base URL
+            // would download the metadata file under the file's name.
+            let absolute_url = base_url.join(&encoded_name)?;
 
             // Sanitize filename for filesystem compatibility
             let (sanitized_name, was_modified) = sanitize_filename(&file.name);
@@ -532,15 +581,15 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 sanitized_count += 1;
             }
 
-            (
+            Ok((
                 absolute_url.to_string(),
                 sanitized_name,
                 file.md5,
                 file.size,
                 file.mtime,
-            )
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
 
     // Show summary if any files were sanitized
     if sanitized_count > 0 {
@@ -553,11 +602,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Download all files with integrated signal handling
+    // Download all files with integrated signal handling. File numbering
+    // starts at #2: #1 is the _files.xml saved above.
     downloader::download_files(
         &client,
-        download_data.clone(),
-        download_data.len(),
+        download_data,
+        total_files,
+        2,
         cookie_header.as_deref(),
         cli.stop_on_error,
     )
@@ -736,7 +787,7 @@ archive.org\tFALSE\t/\tFALSE\t2145916800\tcurrent\tvalue\n";
     fn xml_file(name: &str, size: Option<u64>) -> ia_get::archive_metadata::XmlFile {
         ia_get::archive_metadata::XmlFile {
             name: name.to_string(),
-            source: "original".to_string(),
+            source: None,
             mtime: None,
             size,
             format: None,
@@ -849,6 +900,120 @@ archive.org\tFALSE\t/\tFALSE\t2145916800\tcurrent\tvalue\n";
         assert!(
             mtime.abs_diff(now) < 60,
             "mtime {mtime} should be within 60s of now {now}"
+        );
+    }
+
+    /// Minimal single-purpose mock: HEAD always succeeds, GET returns the
+    /// given status and body. Used to drive `fetch_and_parse_xml` against a
+    /// local URL instead of archive.org.
+    fn start_xml_mock(get_status: u16, get_body: &str) -> String {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind mock server");
+        let port = listener.local_addr().unwrap().port();
+        let body = get_body.to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                handle_xml_mock_connection(stream, get_status, &body);
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn handle_xml_mock_connection(
+        mut stream: std::net::TcpStream,
+        get_status: u16,
+        get_body: &str,
+    ) {
+        use std::io::{Read, Write};
+
+        let mut buf = [0u8; 1024];
+        let mut request = Vec::new();
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+
+        let head = String::from_utf8_lossy(&request);
+        let method = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .unwrap_or("GET");
+
+        let (status, reason, body) = if method == "HEAD" {
+            (200, "OK", "")
+        } else {
+            (get_status, "Error", get_body)
+        };
+
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn xml_metadata_http_error_is_a_network_error() {
+        // The HEAD check passes; the GET must fail with a status error.
+        let base = start_xml_mock(500, "<html><body>nginx error page</body></html>");
+        let url = format!("{base}/download/item1/item1_files.xml");
+        let client = Client::new();
+        let spinner = create_spinner("mock");
+
+        let err = fetch_and_parse_xml(&url, &client, &spinner, None)
+            .await
+            .expect_err("an HTTP error on the metadata GET must fail the fetch");
+
+        match err {
+            ia_get::IaGetError::Network(detail) => {
+                assert!(
+                    detail.contains("500"),
+                    "expected the status code in the error, got: {detail}"
+                );
+            }
+            other => panic!("expected a Network error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn xml_metadata_success_parses_files() {
+        let xml = "<files><file name=\"item1_files.xml\" source=\"original\"><size>23</size></file><file name=\"scan.jpg\" source=\"original\"><size>456</size></file></files>";
+        let base = start_xml_mock(200, xml);
+        let url = format!("{base}/download/item1/item1_files.xml");
+        let client = Client::new();
+        let spinner = create_spinner("mock");
+
+        let meta = fetch_and_parse_xml(&url, &client, &spinner, None)
+            .await
+            .expect("metadata fetch should succeed");
+
+        assert_eq!(meta.files.files.len(), 2);
+        assert_eq!(meta.files.files[1].name, "scan.jpg");
+        assert_eq!(meta.content, xml);
+    }
+
+    #[test]
+    fn file_url_join_must_not_silently_fall_back() {
+        // Regression: a failed join used to keep the XML metadata URL, which
+        // would download _files.xml under the file's name. Encoded names must
+        // always join cleanly against the metadata base URL.
+        let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
+        let joined = base
+            .join(&encode_download_path("Season 1/clip#1.mp4"))
+            .expect("encoded name must join against the base URL");
+        assert_eq!(
+            joined.as_str(),
+            "https://archive.org/download/item1/Season%201/clip%231.mp4"
         );
     }
 }
