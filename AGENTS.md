@@ -36,10 +36,11 @@ src/
 ├── main.rs              # CLI entry point (clap)
 ├── lib.rs               # Library exports
 ├── downloader.rs        # HTTP download logic with retry/resume
-├── archive_metadata.rs  # XML parsing for archive.org
+├── archive_metadata.rs  # XML parsing and _files.xml persistence
 ├── utils.rs             # Helpers (filename sanitisation, etc.)
 ├── error.rs             # Custom error types
-└── constants.rs         # Timeouts, retries, etc.
+├── constants.rs         # Timeouts, retries, etc.
+└── test_support.rs      # Shared test helpers (lib unit tests only)
 ```
 
 ## Dependencies

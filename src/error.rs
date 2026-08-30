@@ -28,6 +28,10 @@ pub enum IaGetError {
     #[error("Server rejected the resume offset (HTTP 416); the partial file must be re-downloaded from scratch")]
     RangeNotSatisfiable,
 
+    /// The run was interrupted by the user (Ctrl+C)
+    #[error("Interrupted by user")]
+    Interrupted,
+
     /// One or more files in a batch could not be downloaded
     #[error("{count} of {total} file(s) failed to download. {details}")]
     BatchFailed {
@@ -52,7 +56,11 @@ impl From<reqwest::Error> for IaGetError {
 
 impl From<std::io::Error> for IaGetError {
     fn from(err: std::io::Error) -> Self {
-        IaGetError::FileSystem(err.to_string())
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            IaGetError::Interrupted
+        } else {
+            IaGetError::FileSystem(err.to_string())
+        }
     }
 }
 

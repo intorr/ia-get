@@ -9,6 +9,8 @@ pub mod archive_metadata;
 pub mod constants;
 pub mod downloader;
 pub mod error;
+#[cfg(test)]
+pub mod test_support;
 pub mod utils;
 
 // Re-export the error types for convenience

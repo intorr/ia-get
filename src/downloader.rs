@@ -5,14 +5,17 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use colored::*;
+use indicatif::ProgressBar;
 use reqwest::header::{HeaderMap, HeaderValue, LAST_MODIFIED, RETRY_AFTER};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Response, StatusCode};
 
 use crate::error::IaGetError; // Import IaGetError for explicit error conversion
-use crate::utils::{create_progress_bar, format_duration, format_size, format_transfer_rate};
+use crate::utils::{
+    create_progress_bar, format_size, print_downloaded_line, print_file_banner, with_cookie,
+};
 use crate::Result; // Import utility functions
 
 /// Buffer size for file operations (8KB)
@@ -60,6 +63,13 @@ fn setup_signal_handler() -> Arc<AtomicBool> {
     running
 }
 
+/// Finishes and clears the progress bar, if one was created
+fn finish_progress_bar(pb: &Option<ProgressBar>) {
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+    }
+}
+
 /// Calculates the MD5 hash of a file
 fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
     let file = File::open(file_path)?;
@@ -70,16 +80,14 @@ fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
     let mut context = md5::Context::new();
     let mut buffer = [0; BUFFER_SIZE];
 
-    let pb = if is_large_file {
-        Some(create_progress_bar(
+    let pb = is_large_file.then(|| {
+        create_progress_bar(
             file_size,
             &format!("{} {}    ", "╰╼".cyan().dimmed(), "Verifying".white()),
             Some("blue/blue"),
             false,
-        ))
-    } else {
-        None
-    };
+        )
+    });
 
     let mut bytes_processed: u64 = 0;
 
@@ -90,14 +98,8 @@ fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
         }
 
         if !running.load(Ordering::SeqCst) {
-            if let Some(ref progress_bar) = pb {
-                progress_bar.finish_and_clear();
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "Hash calculation interrupted by signal",
-            )
-            .into());
+            finish_progress_bar(&pb);
+            return Err(IaGetError::Interrupted);
         }
 
         context.consume(&buffer[..bytes_read]);
@@ -108,9 +110,7 @@ fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
         }
     }
 
-    if let Some(progress_bar) = pb.as_ref() {
-        progress_bar.finish_and_clear();
-    }
+    finish_progress_bar(&pb);
 
     let hash = context.finalize();
     Ok(format!("{:x}", hash))
@@ -127,6 +127,24 @@ enum ExistingFileStatus {
     Invalid,
 }
 
+/// Size guard shared by the pre-download check and the post-download
+/// verification.
+///
+/// Returns `Some((actual, expected))` when the local file's size differs
+/// from the metadata, `None` when the sizes match or no size is known.
+fn size_mismatch(file_path: &str, expected_size: Option<u64>) -> Result<Option<(u64, u64)>> {
+    let Some(expected) = expected_size else {
+        return Ok(None);
+    };
+
+    let actual = fs::metadata(file_path)?.len();
+    if actual == expected {
+        Ok(None)
+    } else {
+        Ok(Some((actual, expected)))
+    }
+}
+
 /// Check if an existing file has the correct hash
 fn check_existing_file(
     file_path: &str,
@@ -141,11 +159,8 @@ fn check_existing_file(
     let Some(expected_md5) = expected_md5 else {
         // No hash to compare against: still reject a file whose size does not
         // match the metadata, so a stale or truncated copy is re-downloaded.
-        if let Some(expected_size) = expected_size {
-            let local_size = fs::metadata(file_path)?.len();
-            if local_size != expected_size {
-                return Ok(ExistingFileStatus::Invalid);
-            }
+        if size_mismatch(file_path, expected_size)?.is_some() {
+            return Ok(ExistingFileStatus::Invalid);
         }
         return Ok(ExistingFileStatus::Verified { md5: None });
     };
@@ -153,7 +168,7 @@ fn check_existing_file(
     let local_md5 = match calculate_md5(file_path, running) {
         Ok(hash) => hash,
         Err(e) => {
-            if e.to_string().contains("interrupted by signal") {
+            if matches!(e, IaGetError::Interrupted) {
                 return Err(e);
             }
             println!(
@@ -317,127 +332,160 @@ pub fn sync_file_mtime(file_path: impl AsRef<Path>, target: SystemTime) -> bool 
     true
 }
 
-/// Records a failed attempt, prints the retry notice and waits.
-///
-/// Returns an error once `MAX_RETRIES` has been exhausted.
-async fn handle_retry(
-    retry_count: &mut u32,
+/// Tracks how many times a file transfer has been retried and how long to
+/// wait before each retry, so retry call sites stay short.
+struct RetryTracker {
+    count: u32,
+    delay: fn(u32) -> Duration,
+}
+
+impl RetryTracker {
+    fn new(delay: fn(u32) -> Duration) -> Self {
+        Self { count: 0, delay }
+    }
+
+    /// Records a failed attempt, prints the retry notice and waits.
+    ///
+    /// Returns an error once `MAX_RETRIES` has been exhausted.
+    async fn record(
+        &mut self,
+        kind: &str,
+        detail: &str,
+        retry_after_secs: Option<u64>,
+    ) -> Result<()> {
+        self.count += 1;
+
+        if self.count > MAX_RETRIES {
+            println!(
+                "{} {}      {} Maximum retries ({}) exceeded",
+                "├╼".cyan().dimmed(),
+                "Failed".red().bold(),
+                "✘".red().bold(),
+                MAX_RETRIES
+            );
+            return Err(IaGetError::Network(format!(
+                "{kind}: {detail} (maximum retries {MAX_RETRIES} exceeded)"
+            )));
+        }
+
+        let delay = retry_after_secs
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| (self.delay)(self.count));
+
+        println!(
+            "{} {}      {} {} (attempt {}/{}): {}",
+            "├╼".cyan().dimmed(),
+            "Retry".yellow().bold(),
+            "⟳".yellow().bold(),
+            kind,
+            self.count,
+            MAX_RETRIES,
+            detail
+        );
+        println!(
+            "{} {}      Waiting {:.1}s before retry{}",
+            "├╼".cyan().dimmed(),
+            "Wait".white(),
+            delay.as_secs_f64(),
+            if retry_after_secs.is_some() {
+                " (server requested)"
+            } else {
+                ""
+            }
+        );
+
+        tokio::time::sleep(delay).await;
+        Ok(())
+    }
+}
+
+/// Streams the response body into `file`, updating the progress bar as data
+/// arrives. Returns the number of new bytes written. A user interruption
+/// aborts with `IaGetError::Interrupted`; partial data stays in the file so
+/// the next attempt can resume.
+async fn stream_response_body(
+    response: &mut Response,
+    file: &mut File,
+    base_size: u64,
+    pb: &ProgressBar,
+    running: &Arc<AtomicBool>,
+) -> Result<u64> {
+    let mut downloaded_bytes: u64 = 0;
+
+    while let Some(chunk_result) = response.chunk().await.transpose() {
+        if !running.load(Ordering::SeqCst) {
+            pb.finish_and_clear();
+            return Err(IaGetError::Interrupted);
+        }
+
+        let chunk = chunk_result?;
+        file.write_all(&chunk)?;
+        downloaded_bytes += chunk.len() as u64;
+        pb.set_position(base_size + downloaded_bytes);
+    }
+
+    Ok(downloaded_bytes)
+}
+
+/// A transfer's body could not be used: clear the progress bar, record the
+/// retry, and leave the file positioned at its end so the next attempt
+/// resumes from where this one stopped.
+async fn retry_open_file(
+    file: &mut File,
+    pb: &ProgressBar,
+    retry: &mut RetryTracker,
     kind: &str,
     detail: &str,
     retry_after_secs: Option<u64>,
-    retry_delay: fn(u32) -> Duration,
 ) -> Result<()> {
-    *retry_count += 1;
-
-    if *retry_count > MAX_RETRIES {
-        println!(
-            "{} {}      {} Maximum retries ({}) exceeded",
-            "├╼".cyan().dimmed(),
-            "Failed".red().bold(),
-            "✘".red().bold(),
-            MAX_RETRIES
-        );
-        return Err(IaGetError::Network(format!(
-            "{}: {} (maximum retries {} exceeded)",
-            kind, detail, MAX_RETRIES
-        )));
-    }
-
-    let delay = retry_after_secs
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| retry_delay(*retry_count));
-
-    println!(
-        "{} {}      {} {} (attempt {}/{}): {}",
-        "├╼".cyan().dimmed(),
-        "Retry".yellow().bold(),
-        "⟳".yellow().bold(),
-        kind,
-        retry_count,
-        MAX_RETRIES,
-        detail
-    );
-    println!(
-        "{} {}      Waiting {:.1}s before retry{}",
-        "├╼".cyan().dimmed(),
-        "Wait".white(),
-        delay.as_secs_f64(),
-        if retry_after_secs.is_some() {
-            " (server requested)"
-        } else {
-            ""
-        }
-    );
-
-    tokio::time::sleep(delay).await;
+    pb.finish_and_clear();
+    retry.record(kind, detail, retry_after_secs).await?;
+    file.flush()?;
+    file.seek(SeekFrom::End(0))?;
     Ok(())
 }
 
-/// Download file content with progress reporting and automatic retry on failure.
-async fn download_file_content(
-    client: &Client,
-    url: &str,
-    file: &mut File,
-    running: &Arc<AtomicBool>,
-    cookie_header: Option<&str>,
-    expected_size: Option<u64>,
-) -> Result<(u64, Option<SystemTime>)> {
-    download_file_content_with_delay(
-        client,
-        url,
-        file,
-        running,
-        cookie_header,
-        expected_size,
-        backoff_delay,
-    )
-    .await
+/// Progress bar label for a download attempt: "Resuming" when a Range
+/// request continues an existing `.part` file, "Downloading" otherwise.
+fn download_action_label(resuming: bool) -> String {
+    if resuming {
+        format!("{} {}     ", "╰╼".cyan().dimmed(), "Resuming".white())
+    } else {
+        format!("{} {}  ", "╰╼".cyan().dimmed(), "Downloading".white())
+    }
 }
 
-/// Download file content, using the supplied function to compute retry delays.
+/// Download file content with progress reporting and automatic retry on failure.
 ///
-/// `download_file_content` is a thin wrapper over this function so tests can
-/// substitute near-instant delays.
+/// `retry_delay` computes the delay for a given 1-based retry attempt; tests
+/// substitute near-instant delays for `backoff_delay`.
 ///
 /// Only a successful (2xx) response body is ever written to `file`. Error
 /// pages are discarded, empty and truncated bodies are retried, and a 200
 /// response to a ranged request resets the file instead of appending to it.
 ///
-/// Returns the total file size and, when the server sent one on the final
-/// successful response, the parsed `Last-Modified` header value.
-async fn download_file_content_with_delay(
+/// Returns, when the server sent one on the final successful response, the
+/// parsed `Last-Modified` header value.
+async fn download_file_content(
     client: &Client,
     url: &str,
     file: &mut File,
     running: &Arc<AtomicBool>,
-    cookie_header: Option<&str>,
+    cookie_header: Option<&HeaderValue>,
     expected_size: Option<u64>,
     retry_delay: fn(u32) -> Duration,
-) -> Result<(u64, Option<SystemTime>)> {
-    let mut retry_count = 0;
+) -> Result<Option<SystemTime>> {
+    let mut retry = RetryTracker::new(retry_delay);
 
     loop {
         // Re-check file size at start of each attempt (in case of retry)
         let current_file_size = file.metadata()?.len();
         let resuming = current_file_size > 0;
-        let mut download_action = if resuming {
-            format!("{} {}     ", "╰╼".cyan().dimmed(), "Resuming".white())
-        } else {
-            format!("{} {}  ", "╰╼".cyan().dimmed(), "Downloading".white())
-        };
+        let mut download_action = download_action_label(resuming);
 
-        let mut headers = HeaderMap::new();
-        if let Some(cookie_header) = cookie_header {
-            headers.insert(
-                reqwest::header::COOKIE,
-                HeaderValue::from_str(cookie_header).map_err(|e| {
-                    IaGetError::Network(format!("Invalid cookie header value: {}", e))
-                })?,
-            );
-        }
+        let mut request = with_cookie(client.get(url), cookie_header);
         if resuming {
-            // Use IaGetError::Network for header parsing errors
-            headers.insert(
+            request = request.header(
                 reqwest::header::RANGE,
                 HeaderValue::from_str(&format!("bytes={}-", current_file_size)).map_err(|e| {
                     IaGetError::Network(format!("Invalid range header value: {}", e))
@@ -445,23 +493,13 @@ async fn download_file_content_with_delay(
             );
         }
 
-        let mut request = client.get(url);
-        if !headers.is_empty() {
-            request = request.headers(headers);
-        }
-
         let mut response = match request.send().await {
             Ok(resp) => resp,
             Err(e) => {
                 // Request failed before we even got a response
-                handle_retry(
-                    &mut retry_count,
-                    "Connection error",
-                    &e.to_string(),
-                    None,
-                    retry_delay,
-                )
-                .await?;
+                retry
+                    .record("Connection error", &e.to_string(), None)
+                    .await?;
                 continue;
             }
         };
@@ -491,14 +529,9 @@ async fn download_file_content_with_delay(
                     .canonical_reason()
                     .unwrap_or("unknown status")
                     .to_string();
-                handle_retry(
-                    &mut retry_count,
-                    &format!("HTTP {status}"),
-                    &reason,
-                    retry_after,
-                    retry_delay,
-                )
-                .await?;
+                retry
+                    .record(&format!("HTTP {status}"), &reason, retry_after)
+                    .await?;
                 continue;
             }
 
@@ -514,67 +547,38 @@ async fn download_file_content_with_delay(
         if resuming && status == StatusCode::OK {
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
-            download_action = format!("{} {}  ", "╰╼".cyan().dimmed(), "Downloading".white());
+            download_action = download_action_label(false);
         }
         let base_size = file.metadata()?.len();
 
-        let content_length = response.content_length().unwrap_or(0);
-        let total_expected_size = base_size + content_length;
-
         let pb = create_progress_bar(
-            total_expected_size,
+            base_size + response.content_length().unwrap_or(0),
             &download_action,
             Some("green/green"),
             true,
         );
-
         // Set initial progress to current file size for resumed downloads
         pb.set_position(base_size);
 
-        let start_time = std::time::Instant::now();
-        let mut total_bytes: u64 = base_size;
-        let mut downloaded_bytes: u64 = 0;
-
-        // Attempt the download
-        let download_result: Result<()> = async {
-            while let Some(chunk_result) = response.chunk().await.transpose() {
-                if !running.load(Ordering::SeqCst) {
-                    pb.finish_and_clear();
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "Download interrupted during file transfer",
-                    )
-                    .into());
-                }
-
-                let chunk = chunk_result?;
-                file.write_all(&chunk)?;
-                downloaded_bytes += chunk.len() as u64;
-                total_bytes += chunk.len() as u64;
-                pb.set_position(total_bytes);
-            }
-            Ok(())
-        }
-        .await;
-
-        match download_result {
-            Ok(_) => {
+        let start_time = Instant::now();
+        match stream_response_body(&mut response, file, base_size, &pb, running).await {
+            Ok(downloaded_bytes) => {
+                let total_bytes = base_size + downloaded_bytes;
                 // Ensure data is written to disk
                 file.flush()?;
 
                 // A 2xx body with zero bytes is a server malfunction (unless
                 // the server explicitly announced a zero-byte file).
                 if downloaded_bytes == 0 && base_size == 0 && expected_size != Some(0) {
-                    pb.finish_and_clear();
-                    handle_retry(
-                        &mut retry_count,
+                    retry_open_file(
+                        file,
+                        &pb,
+                        &mut retry,
                         "Empty response",
                         "server returned no data",
                         retry_after,
-                        retry_delay,
                     )
                     .await?;
-                    file.seek(SeekFrom::End(0))?;
                     continue;
                 }
 
@@ -582,63 +586,45 @@ async fn download_file_content_with_delay(
                 // truncated, so resume from where we stopped.
                 if let Some(expected) = expected_size {
                     if total_bytes < expected {
-                        pb.finish_and_clear();
-                        handle_retry(
-                            &mut retry_count,
+                        retry_open_file(
+                            file,
+                            &pb,
+                            &mut retry,
                             "Incomplete body",
-                            &format!("received {} of {} bytes", total_bytes, expected),
+                            &format!("received {total_bytes} of {expected} bytes"),
                             None,
-                            retry_delay,
                         )
                         .await?;
-                        file.seek(SeekFrom::End(0))?;
                         continue;
                     }
                 }
 
-                let elapsed = start_time.elapsed();
-                let elapsed_secs = elapsed.as_secs_f64();
-                let transfer_rate_val = if elapsed_secs > 0.0 {
-                    downloaded_bytes as f64 / elapsed_secs
-                } else {
-                    0.0
-                };
-
-                let (rate, unit) = format_transfer_rate(transfer_rate_val);
-
                 pb.finish_and_clear();
-                println!(
-                    "{} {}   {} {} in {} ({:.2} {}/s)",
-                    "├╼".cyan().dimmed(),
-                    "Downloaded".white(),
-                    "↓".green().bold(),
-                    format_size(downloaded_bytes).bold(),
-                    format_duration(elapsed).bold(),
-                    rate,
-                    unit
+                print_downloaded_line(
+                    &"├╼".cyan().dimmed(),
+                    downloaded_bytes,
+                    Some(start_time.elapsed()),
                 );
 
-                return Ok((total_bytes, last_modified));
+                return Ok(last_modified);
             }
             Err(e) => {
-                pb.finish_and_clear();
-
-                // Check if this is a user interruption
-                if e.to_string().contains("interrupted") {
+                // A user interruption aborts the run, other errors retry
+                if matches!(e, IaGetError::Interrupted) {
+                    pb.finish_and_clear();
                     return Err(e);
                 }
 
                 // Mid-stream failure: keep the partial data and resume later.
-                handle_retry(
-                    &mut retry_count,
+                retry_open_file(
+                    file,
+                    &pb,
+                    &mut retry,
                     "Download error",
                     &e.to_string(),
                     None,
-                    retry_delay,
                 )
                 .await?;
-                file.flush()?;
-                file.seek(SeekFrom::End(0))?;
             }
         }
     }
@@ -651,19 +637,16 @@ fn verify_downloaded_file(
     expected_size: Option<u64>,
     running: &Arc<AtomicBool>,
 ) -> Result<bool> {
-    if let Some(expected_size) = expected_size {
-        let local_size = fs::metadata(file_path)?.len();
-        if local_size != expected_size {
-            println!(
-                "{} {}         {} {} (expected {})",
-                "╰╼".cyan().dimmed(),
-                "Size".white(),
-                "✘".red().bold(),
-                format_size(local_size).red(),
-                format_size(expected_size).dimmed()
-            );
-            return Ok(false);
-        }
+    if let Some((actual_size, expected_size)) = size_mismatch(file_path, expected_size)? {
+        println!(
+            "{} {}         {} {} (expected {})",
+            "╰╼".cyan().dimmed(),
+            "Size".white(),
+            "✘".red().bold(),
+            format_size(actual_size).red(),
+            format_size(expected_size).dimmed()
+        );
+        return Ok(false);
     }
 
     if expected_md5.is_none() {
@@ -688,6 +671,21 @@ fn verify_downloaded_file(
     }
 }
 
+/// A single file to download, plus the archive metadata used to verify it
+#[derive(Debug)]
+pub struct DownloadTask {
+    /// URL the file is downloaded from
+    pub url: String,
+    /// Path of the final file on disk (may include subdirectories)
+    pub file_path: String,
+    /// MD5 hash from the archive metadata, if present
+    pub expected_md5: Option<String>,
+    /// Expected size in bytes, if known
+    pub expected_size: Option<u64>,
+    /// Unix mtime from the archive metadata, if present
+    pub expected_mtime: Option<u64>,
+}
+
 /// Download multiple files with shared signal handling
 ///
 /// This function sets up signal handling once for the entire download session
@@ -707,11 +705,11 @@ pub async fn download_files<I>(
     files: I,
     total_files: usize,
     file_number_start: usize,
-    cookie_header: Option<&str>,
+    cookie_header: Option<&HeaderValue>,
     stop_on_error: bool,
 ) -> Result<()>
 where
-    I: IntoIterator<Item = (String, String, Option<String>, Option<u64>, Option<u64>)>, // (url, filename, md5, size, mtime)
+    I: IntoIterator<Item = DownloadTask>,
 {
     // Set up signal handling for the entire download session
     let running = setup_signal_handler();
@@ -728,6 +726,214 @@ where
     .await
 }
 
+/// Outcome of processing a single file of the batch
+enum FileOutcome {
+    /// The file is now valid: already verified, or freshly downloaded
+    Succeeded,
+    /// The file could not be downloaded; holds the reason for the failure report
+    Failed(String),
+}
+
+/// Processes one file of the batch: verifies an existing copy or downloads
+/// (with verification) and renames the `.part` file to its final name.
+///
+/// Prints the file banner and status lines. Per-file problems (a stale file
+/// that cannot be removed, a failed download) yield
+/// `FileOutcome::Failed`; hard errors (I/O, user interruption) propagate.
+async fn process_file(
+    client: &Client,
+    task: &DownloadTask,
+    number: usize,
+    total_files: usize,
+    running: &Arc<AtomicBool>,
+    cookie_header: Option<&HeaderValue>,
+) -> Result<FileOutcome> {
+    let url = &task.url;
+    let file_path = &task.file_path;
+    let expected_md5 = task.expected_md5.as_deref();
+    let expected_size = task.expected_size;
+    let expected_mtime = task.expected_mtime;
+
+    println!(" ");
+    print_file_banner(file_path, number, total_files);
+
+    let part_path = format!("{}.part", file_path);
+
+    match check_existing_file(file_path, expected_md5, expected_size, running)? {
+        ExistingFileStatus::Verified { md5 } => {
+            // Final file is already valid; clean up any stale .part file
+            remove_part_file(&part_path);
+            // No request is made for a verified file, so only the XML
+            // mtime is available here.
+            if let Some(target) = mtime_from_xml(expected_mtime) {
+                sync_file_mtime(file_path, target);
+            }
+            print_verified_hash(md5.as_deref());
+            return Ok(FileOutcome::Succeeded);
+        }
+        ExistingFileStatus::Invalid => {
+            println!(
+                "{} {}      {} the existing file failed verification, re-downloading",
+                "├╼".cyan().dimmed(),
+                "Partial".white(),
+                "▲".yellow().bold()
+            );
+            if let Err(e) = fs::remove_file(file_path) {
+                // A stale file that cannot be removed (locked, read-only)
+                // is a per-file failure, not a batch-aborting one.
+                remove_part_file(&part_path);
+                return Ok(FileOutcome::Failed(format!(
+                    "stale file could not be removed: {e}"
+                )));
+            }
+            remove_part_file(&part_path);
+        }
+        ExistingFileStatus::Missing => {}
+    }
+
+    let outcome = run_download_attempts(
+        client,
+        url,
+        &part_path,
+        running,
+        cookie_header,
+        expected_md5,
+        expected_size,
+    )
+    .await?;
+
+    match outcome {
+        DownloadOutcome::Verified { server_mtime } => {
+            if Path::new(file_path).exists() {
+                fs::remove_file(file_path)?;
+            }
+            fs::rename(&part_path, file_path)?;
+            // Prefer the server's Last-Modified header, fall back to the
+            // mtime from _files.xml, and leave the time untouched if both
+            // are absent.
+            if let Some(target) = server_mtime.or(mtime_from_xml(expected_mtime)) {
+                sync_file_mtime(file_path, target);
+            }
+            Ok(FileOutcome::Succeeded)
+        }
+        DownloadOutcome::Failed {
+            reason,
+            discard_part,
+        } => {
+            if discard_part {
+                // The server rejected the resume offset; the .part file is
+                // not a valid prefix, so discard it for the next run.
+                remove_part_file(&part_path);
+            }
+            Ok(FileOutcome::Failed(reason))
+        }
+    }
+}
+
+/// Best-effort removal of a leftover `.part` file: its absence is not an
+/// error, and a locked file must not fail the processing of the file itself
+fn remove_part_file(part_path: &str) {
+    let _ = fs::remove_file(part_path);
+}
+
+/// Outcome of the re-download attempts for one file
+enum DownloadOutcome {
+    /// The file was downloaded and passed verification; `server_mtime` is
+    /// the `Last-Modified` header of the final response, if the server sent one
+    Verified { server_mtime: Option<SystemTime> },
+    /// The file could not be downloaded; `reason` is reported in the batch
+    /// summary, and `discard_part` says whether the `.part` file must not be
+    /// kept for resuming
+    Failed { reason: String, discard_part: bool },
+}
+
+/// Runs the download+verification attempts for one file, re-downloading from
+/// scratch after a failed verification or a rejected resume offset.
+async fn run_download_attempts(
+    client: &Client,
+    url: &str,
+    part_path: &str,
+    running: &Arc<AtomicBool>,
+    cookie_header: Option<&HeaderValue>,
+    expected_md5: Option<&str>,
+    expected_size: Option<u64>,
+) -> Result<DownloadOutcome> {
+    ensure_parent_directories(part_path)?;
+    let mut file = prepare_file_for_download(part_path)?;
+
+    let mut last_reason = String::new();
+    // True when the .part file does not hold a valid prefix and must not be
+    // kept for resuming; reset whenever the file is re-created below
+    let mut discard_part = false;
+    let mut attempt = 0;
+
+    let outcome = loop {
+        attempt += 1;
+        if attempt > MAX_DOWNLOAD_ATTEMPTS {
+            break DownloadOutcome::Failed {
+                reason: last_reason,
+                discard_part,
+            };
+        }
+
+        if attempt > 1 {
+            // The .part file is re-created from scratch, so an earlier
+            // range reject no longer applies to it
+            discard_part = false;
+            drop(file);
+            remove_part_file(part_path);
+            file = prepare_file_for_download(part_path)?;
+            println!(
+                "{} {}      {} Re-downloading from scratch (attempt {}/{})",
+                "├╼".cyan().dimmed(),
+                "Retry".yellow().bold(),
+                "⟳".yellow().bold(),
+                attempt,
+                MAX_DOWNLOAD_ATTEMPTS
+            );
+        }
+
+        match download_file_content(
+            client,
+            url,
+            &mut file,
+            running,
+            cookie_header,
+            expected_size,
+            backoff_delay,
+        )
+        .await
+        {
+            Ok(server_mtime) => {
+                if verify_downloaded_file(part_path, expected_md5, expected_size, running)? {
+                    break DownloadOutcome::Verified { server_mtime };
+                }
+                last_reason = format!("file failed verification after {attempt} attempt(s)");
+            }
+            Err(e) if matches!(e, IaGetError::Interrupted) => return Err(e),
+            // The server rejected our offset: the .part file is not a valid
+            // prefix, so it must not be kept if the attempts end here
+            Err(IaGetError::RangeNotSatisfiable) => {
+                last_reason = IaGetError::RangeNotSatisfiable.to_string();
+                discard_part = true;
+            }
+            // Any other failure is final; the partial .part file is still a
+            // resumable prefix
+            Err(e) => {
+                break DownloadOutcome::Failed {
+                    reason: e.to_string(),
+                    discard_part,
+                }
+            }
+        }
+    };
+
+    // Close the handle before renaming (Windows refuses to rename open files)
+    drop(file);
+
+    Ok(outcome)
+}
+
 /// Batch download logic with an externally provided signal flag.
 ///
 /// Split out from `download_files` so tests can drive the batch loop without
@@ -740,18 +946,16 @@ async fn download_files_with_signal<I>(
     files: I,
     total_files: usize,
     file_number_start: usize,
-    cookie_header: Option<&str>,
+    cookie_header: Option<&HeaderValue>,
     stop_on_error: bool,
     running: &Arc<AtomicBool>,
 ) -> Result<()>
 where
-    I: IntoIterator<Item = (String, String, Option<String>, Option<u64>, Option<u64>)>, // (url, filename, md5, size, mtime)
+    I: IntoIterator<Item = DownloadTask>,
 {
     let mut failed_files: Vec<(String, String)> = Vec::new();
 
-    for (index, (url, file_path, expected_md5, expected_size, expected_mtime)) in
-        files.into_iter().enumerate()
-    {
+    for (index, task) in files.into_iter().enumerate() {
         // Check if we should stop due to signal
         if !running.load(Ordering::SeqCst) {
             println!(
@@ -761,153 +965,20 @@ where
             break;
         }
 
-        println!(" ");
-        println!(
-            "{}  {}     {}",
-            "▣".bright_cyan().bold(),
-            "Filename".white(),
-            file_path.bold()
-        );
-        println!(
-            "{} {}        {} {} of {}",
-            "├╼".cyan().dimmed(),
-            "Count".white(),
-            "#".blue().bold(),
-            (index + file_number_start).to_string().bold(),
-            total_files.to_string().bold()
-        );
+        let outcome = process_file(
+            client,
+            &task,
+            index + file_number_start,
+            total_files,
+            running,
+            cookie_header,
+        )
+        .await?;
 
-        let part_path = format!("{}.part", file_path);
-
-        match check_existing_file(&file_path, expected_md5.as_deref(), expected_size, running)? {
-            ExistingFileStatus::Verified { md5 } => {
-                // Final file is already valid; clean up any stale .part file
-                let _ = fs::remove_file(&part_path);
-                // No request is made for a verified file, so only the XML
-                // mtime is available here.
-                if let Some(target) = mtime_from_xml(expected_mtime) {
-                    sync_file_mtime(&file_path, target);
-                }
-                print_verified_hash(md5.as_deref());
-                continue;
-            }
-            ExistingFileStatus::Invalid => {
-                println!(
-                    "{} {}      {} the existing file failed verification, re-downloading",
-                    "├╼".cyan().dimmed(),
-                    "Partial".white(),
-                    "▲".yellow().bold()
-                );
-                if let Err(e) = fs::remove_file(&file_path) {
-                    // A stale file that cannot be removed (locked, read-only)
-                    // is a per-file failure, not a batch-aborting one.
-                    let _ = fs::remove_file(&part_path);
-                    failed_files.push((
-                        file_path.clone(),
-                        format!("stale file could not be removed: {e}"),
-                    ));
-                    if stop_on_error {
-                        return Err(IaGetError::BatchFailed {
-                            count: failed_files.len(),
-                            total: total_files,
-                            details: batch_failure_details(&failed_files),
-                        });
-                    }
-                    continue;
-                }
-                let _ = fs::remove_file(&part_path);
-            }
-            ExistingFileStatus::Missing => {}
-        }
-
-        let mut downloaded = false;
-        let mut downloaded_mtime: Option<SystemTime> = None;
-        let mut range_rejected = false;
-        let mut last_error = String::new();
-
-        ensure_parent_directories(&part_path)?;
-        let mut file = prepare_file_for_download(&part_path)?;
-
-        for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
-            if attempt > 1 {
-                drop(file);
-                let _ = fs::remove_file(&part_path);
-                file = prepare_file_for_download(&part_path)?;
-                println!(
-                    "{} {}      {} Re-downloading from scratch (attempt {}/{})",
-                    "├╼".cyan().dimmed(),
-                    "Retry".yellow().bold(),
-                    "⟳".yellow().bold(),
-                    attempt,
-                    MAX_DOWNLOAD_ATTEMPTS
-                );
-            }
-
-            match download_file_content(
-                client,
-                &url,
-                &mut file,
-                running,
-                cookie_header,
-                expected_size,
-            )
-            .await
-            {
-                Ok((_, server_mtime)) => {
-                    if verify_downloaded_file(
-                        &part_path,
-                        expected_md5.as_deref(),
-                        expected_size,
-                        running,
-                    )? {
-                        downloaded_mtime = server_mtime;
-                        downloaded = true;
-                        break;
-                    }
-                    last_error = format!("file failed verification after {} attempt(s)", attempt);
-                }
-                Err(e) => {
-                    if e.to_string().contains("interrupted") {
-                        return Err(e);
-                    }
-                    last_error = e.to_string();
-                    match e {
-                        // The server rejected our offset: the partial file is
-                        // not a valid prefix, so re-download from scratch.
-                        IaGetError::RangeNotSatisfiable => range_rejected = true,
-                        _ => break,
-                    }
-                }
-            }
-        }
-
-        // Close the handle before renaming (Windows refuses to rename open files)
-        drop(file);
-
-        if downloaded {
-            if Path::new(&file_path).exists() {
-                fs::remove_file(&file_path)?;
-            }
-            fs::rename(&part_path, &file_path)?;
-            // Prefer the server's Last-Modified header, fall back to the
-            // mtime from _files.xml, and leave the time untouched if both
-            // are absent.
-            if let Some(target) = downloaded_mtime.or(mtime_from_xml(expected_mtime)) {
-                sync_file_mtime(&file_path, target);
-            }
-        } else {
-            if range_rejected {
-                // The server rejected the resume offset; the .part file is not
-                // a valid prefix, so discard it for the next run.
-                let _ = fs::remove_file(&part_path);
-            }
-            failed_files.push((file_path.clone(), last_error));
+        if let FileOutcome::Failed(reason) = outcome {
+            failed_files.push((task.file_path.clone(), reason));
             if stop_on_error {
-                return Err(IaGetError::BatchFailed {
-                    count: failed_files.len(),
-                    total: total_files,
-                    details: batch_failure_details(&failed_files),
-                });
+                return Err(batch_failed(&failed_files, total_files));
             }
         }
     }
@@ -923,11 +994,7 @@ where
         for (path, reason) in &failed_files {
             println!("  {} {}", path.bold(), reason.dimmed());
         }
-        return Err(IaGetError::BatchFailed {
-            count: failed_files.len(),
-            total: total_files,
-            details: batch_failure_details(&failed_files),
-        });
+        return Err(batch_failed(&failed_files, total_files));
     }
 
     Ok(())
@@ -942,9 +1009,19 @@ fn batch_failure_details(failed: &[(String, String)]) -> String {
         .join("; ")
 }
 
+/// Builds the terminal `IaGetError::BatchFailed` from the accumulated failures
+fn batch_failed(failed_files: &[(String, String)], total: usize) -> IaGetError {
+    IaGetError::BatchFailed {
+        count: failed_files.len(),
+        total,
+        details: batch_failure_details(failed_files),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{mtime_of, temp_dir_for};
     use std::collections::{HashMap, VecDeque};
     use std::net::{TcpListener, TcpStream};
     use std::sync::Mutex;
@@ -1120,44 +1197,37 @@ mod tests {
         Duration::from_millis(1)
     }
 
-    fn temp_dir_for(test_name: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "ia-get-test-{}-{}-{}",
-            std::process::id(),
-            test_name,
-            nanos
-        ));
-        fs::create_dir_all(&dir).expect("failed to create temp dir");
-        dir
-    }
-
     fn test_running() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(true))
     }
 
-    /// Reads a file's last-modified time as unix seconds, if available.
-    fn mtime_of(path: &Path) -> Option<u64> {
-        fs::metadata(path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
+    /// Builds a `DownloadTask` for the mock server
+    fn task(
+        url: String,
+        file_path: String,
+        md5: Option<String>,
+        size: Option<u64>,
+        mtime: Option<u64>,
+    ) -> DownloadTask {
+        DownloadTask {
+            url,
+            file_path,
+            expected_md5: md5,
+            expected_size: size,
+            expected_mtime: mtime,
+        }
     }
 
-    /// Runs a single download against the mock server and returns the bytes
-    /// reported as downloaded along with the captured `Last-Modified` time.
+    /// Runs a single download against the mock server and returns the
+    /// captured `Last-Modified` time.
     async fn run_download(
         url: &str,
         part_path: &str,
         expected_size: Option<u64>,
-    ) -> Result<(u64, Option<SystemTime>)> {
+    ) -> Result<Option<SystemTime>> {
         let client = Client::new();
         let mut file = prepare_file_for_download(part_path)?;
-        let result = download_file_content_with_delay(
+        let result = download_file_content(
             &client,
             url,
             &mut file,
@@ -1257,8 +1327,7 @@ mod tests {
         )
         .await;
 
-        let (bytes, _) = result.expect("download should succeed");
-        assert_eq!(bytes, full.len() as u64);
+        result.expect("download should succeed");
         assert_eq!(fs::read(&part).unwrap(), full);
         assert_eq!(server.ranges(), vec![None, Some(8)]);
         let _ = fs::remove_dir_all(&dir);
@@ -1285,8 +1354,7 @@ mod tests {
         )
         .await;
 
-        let (bytes, _) = result.expect("download should succeed");
-        assert_eq!(bytes, full.len() as u64);
+        result.expect("download should succeed");
         assert_eq!(
             fs::read(&part).unwrap(),
             full,
@@ -1414,14 +1482,14 @@ mod tests {
         let missing_path = dir.join("missing.bin").to_str().unwrap().to_string();
         let ok_path = dir.join("ok.bin").to_str().unwrap().to_string();
         let files = vec![
-            (
+            task(
                 server.url("/missing.bin"),
                 missing_path,
                 None,
                 Some(5),
                 None,
             ),
-            (
+            task(
                 server.url("/ok.bin"),
                 ok_path,
                 Some(ok_md5),
@@ -1472,14 +1540,14 @@ mod tests {
         let missing_path = dir.join("missing.bin").to_str().unwrap().to_string();
         let ok_path = dir.join("ok.bin").to_str().unwrap().to_string();
         let files = vec![
-            (
+            task(
                 server.url("/missing.bin"),
                 missing_path,
                 None,
                 Some(5),
                 None,
             ),
-            (
+            task(
                 server.url("/ok.bin"),
                 ok_path,
                 Some(ok_md5),
@@ -1525,7 +1593,7 @@ mod tests {
 
         let dir = temp_dir_for("hash_mismatch");
         let file_path = dir.join("file.bin").to_str().unwrap().to_string();
-        let files = vec![(
+        let files = vec![task(
             server.url("/file.bin"),
             file_path,
             Some(md5),
@@ -1582,8 +1650,8 @@ mod tests {
         )
         .await;
 
-        let (bytes, mtime) = result.expect("download should succeed");
-        assert_eq!(bytes, content.len() as u64);
+        let mtime = result.expect("download should succeed");
+        assert_eq!(fs::read(&part).unwrap(), content);
         assert_eq!(
             mtime,
             httpdate::parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT").ok()
@@ -1609,7 +1677,7 @@ mod tests {
 
         let dir = temp_dir_for("xml_mtime");
         let file_path = dir.join("file.bin").to_str().unwrap().to_string();
-        let files = vec![(
+        let files = vec![task(
             server.url("/file.bin"),
             file_path,
             Some(md5),
@@ -1656,7 +1724,7 @@ mod tests {
 
         let dir = temp_dir_for("server_mtime");
         let file_path = dir.join("file.bin").to_str().unwrap().to_string();
-        let files = vec![(
+        let files = vec![task(
             server.url("/file.bin"),
             file_path,
             Some(md5),
@@ -1691,7 +1759,7 @@ mod tests {
         let dir = temp_dir_for("verified_mtime");
         let file_path = dir.join("file.bin");
         fs::write(&file_path, content).expect("failed to write test file");
-        let files = vec![(
+        let files = vec![task(
             server.url("/file.bin"),
             file_path.to_str().unwrap().to_string(),
             None,
@@ -1736,7 +1804,7 @@ mod tests {
 
         let dir = temp_dir_for("no_mtime");
         let file_path = dir.join("file.bin").to_str().unwrap().to_string();
-        let files = vec![(
+        let files = vec![task(
             server.url("/file.bin"),
             file_path,
             Some(md5),
@@ -1833,7 +1901,7 @@ mod tests {
         // A stale copy with the wrong size and no MD5 in the metadata: the
         // skip path must re-download instead of accepting it.
         fs::write(&file_path, b"stale").unwrap();
-        let files = vec![(
+        let files = vec![task(
             server.url("/file.bin"),
             file_path,
             None,
@@ -1879,14 +1947,14 @@ mod tests {
         let blocked_path = blocked.to_str().unwrap().to_string();
         let ok_path = dir.join("ok.bin").to_str().unwrap().to_string();
         let files = vec![
-            (
+            task(
                 server.url("/blocked.bin"),
                 blocked_path,
                 Some("00000000000000000000000000000000".to_string()),
                 None,
                 None,
             ),
-            (
+            task(
                 server.url("/ok.bin"),
                 ok_path,
                 Some(ok_md5),

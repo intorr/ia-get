@@ -7,17 +7,19 @@
 
 use clap::Parser;
 use colored::*;
-use ia_get::archive_metadata::{parse_xml_files, XmlFile, XmlFiles};
+use ia_get::archive_metadata::{parse_xml_files, save_xml_metadata, XmlFile, XmlFiles};
 use ia_get::constants::USER_AGENT;
-use ia_get::downloader;
-use ia_get::utils::{create_spinner, format_size, sanitize_filename, validate_archive_url};
-use ia_get::Result;
-use indicatif::ProgressStyle;
-use reqwest::header::{HeaderMap, HeaderValue, COOKIE};
+use ia_get::downloader::{self, DownloadTask};
+use ia_get::utils::{
+    create_spinner, finish_spinner, format_size, print_downloaded_line, print_file_banner,
+    sanitize_filename, validate_archive_url, with_cookie,
+};
+use ia_get::{IaGetError, Result};
+use reqwest::header::HeaderValue;
 use reqwest::{Client, Url};
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Extended timeout for large file downloads (10 minutes for connection)
 const CONNECTION_TIMEOUT_SECS: u64 = 600;
@@ -28,13 +30,12 @@ const CONNECTION_TIMEOUT_SECS: u64 = 600;
 const READ_TIMEOUT_SECS: u64 = 300;
 
 /// Checks if a URL is accessible by sending a HEAD request
-async fn is_url_accessible(url: &Url, client: &Client, cookie_input: Option<&str>) -> Result<()> {
-    let mut request = client.head(url.clone());
-    if let Some(cookie_header) = cookie_header_value(cookie_input, url)? {
-        let mut headers = HeaderMap::new();
-        headers.insert(COOKIE, cookie_header);
-        request = request.headers(headers);
-    }
+async fn is_url_accessible(
+    url: &Url,
+    client: &Client,
+    cookie_header: Option<&HeaderValue>,
+) -> Result<()> {
+    let request = with_cookie(client.head(url.clone()), cookie_header);
 
     let response = request
         .timeout(std::time::Duration::from_secs(60))
@@ -191,7 +192,7 @@ fn cookie_applies_to_url(cookie: &NetscapeCookie, url: &Url, now: u64) -> bool {
 fn cookie_header_from_netscape_file(content: &str, url: &Url) -> Result<String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| ia_get::IaGetError::FileSystem(e.to_string()))?
+        .map_err(|e| IaGetError::FileSystem(e.to_string()))?
         .as_secs();
 
     let cookies = content
@@ -215,7 +216,7 @@ fn cookie_header_value(cookie_input: Option<&str>, url: &Url) -> Result<Option<H
     }
 
     let value = HeaderValue::from_str(&cookie_header)
-        .map_err(|e| ia_get::IaGetError::Network(format!("Invalid cookie header: {}", e)))?;
+        .map_err(|e| IaGetError::Network(format!("Invalid cookie header: {e}")))?;
     Ok(Some(value))
 }
 
@@ -224,8 +225,8 @@ fn cookie_header_value(cookie_input: Option<&str>, url: &Url) -> Result<Option<H
 #[derive(Debug)]
 struct XmlMetadata {
     files: XmlFiles,
-    base_url: reqwest::Url,
-    cookie_header: Option<String>,
+    base_url: Url,
+    cookie_header: Option<HeaderValue>,
     content: String,
     last_modified: Option<SystemTime>,
 }
@@ -270,14 +271,11 @@ async fn fetch_and_parse_xml(
     cookie_input: Option<&str>,
 ) -> Result<XmlMetadata> {
     // Parse base URL and fetch XML content
-    let base_url = reqwest::Url::parse(xml_url)?;
-    let download_cookie_header = cookie_input
-        .map(|input| cookie_header_from_input(input, &base_url))
-        .transpose()?
-        .filter(|header| !header.is_empty());
+    let base_url = Url::parse(xml_url)?;
+    let cookie_header = cookie_header_value(cookie_input, &base_url)?;
 
     // Check XML URL accessibility
-    if let Err(e) = is_url_accessible(&base_url, client, cookie_input).await {
+    if let Err(e) = is_url_accessible(&base_url, client, cookie_header.as_ref()).await {
         spinner.finish_with_message(format!(
             "{} XML metadata not accessible: {}",
             "✘".red().bold(),
@@ -292,17 +290,7 @@ async fn fetch_and_parse_xml(
         "Parsing archive metadata...".bold()
     ));
 
-    let mut request = client.get(base_url.clone());
-    if let Some(cookie_header) = download_cookie_header.as_deref() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            COOKIE,
-            HeaderValue::from_str(cookie_header).map_err(|e| {
-                ia_get::IaGetError::Network(format!("Invalid cookie header: {}", e))
-            })?,
-        );
-        request = request.headers(headers);
-    }
+    let request = with_cookie(client.get(base_url.clone()), cookie_header.as_ref());
 
     // The HEAD check above can pass while the GET still fails (throttling,
     // transient edge errors): surface it as a network error instead of
@@ -317,27 +305,45 @@ async fn fetch_and_parse_xml(
     Ok(XmlMetadata {
         files,
         base_url,
-        cookie_header: download_cookie_header,
+        cookie_header,
         content: xml_content,
         last_modified,
     })
 }
 
-/// Saves the raw `_files.xml` document to `path`, overwriting any existing
-/// copy, and syncs its last-modified time with the server's
-/// `Last-Modified` header when present.
+/// The `_files.xml` entry name: the last path segment of the XML URL
+/// (which always ends in "<identifier>_files.xml", see get_xml_url)
+fn xml_file_name_of(url: &Url) -> &str {
+    url.path()
+        .rsplit('/')
+        .next()
+        .expect("XML URL should have a file name segment")
+}
+
+/// Persists the freshly fetched `_files.xml` (overwriting any previous copy)
+/// and prints its "#1" file block.
 ///
-/// The time is never taken from the document itself: its self-entry carries
-/// unreliable metadata. Failing to set the time is not fatal, mirroring the
-/// download batch.
-fn save_xml_metadata(path: &Path, content: &str, last_modified: Option<SystemTime>) -> Result<()> {
-    fs::write(path, content)?;
+/// Returns the total file count: the archive's files plus the saved
+/// `_files.xml`, which archive.org lists as the first file, so the
+/// downloaded files are numbered from #2. If the metadata lacks its own
+/// entry, the saved copy is still counted.
+fn save_and_announce_xml(
+    files: &XmlFiles,
+    base_url: &Url,
+    content: &str,
+    last_modified: Option<SystemTime>,
+) -> Result<usize> {
+    let xml_file_name = xml_file_name_of(base_url);
+    save_xml_metadata(Path::new(xml_file_name), content, last_modified)?;
 
-    if let Some(target) = last_modified {
-        downloader::sync_file_mtime(path, target);
-    }
+    let total_files =
+        files.files.len() + usize::from(!files.files.iter().any(|f| f.name == xml_file_name));
+    println!(" ");
+    print_file_banner(xml_file_name, 1, total_files);
+    // The file never crossed the network, so its line carries no time/rate
+    print_downloaded_line(&"╰╼".cyan().dimmed(), content.len() as u64, None);
 
-    Ok(())
+    Ok(total_files)
 }
 
 /// Filters out the archive's self-referencing `_files.xml` entry, whose
@@ -347,6 +353,50 @@ fn files_to_download(files: Vec<XmlFile>, xml_file_name: &str) -> Vec<XmlFile> {
         .into_iter()
         .filter(|file| file.name != xml_file_name)
         .collect()
+}
+
+/// Converts the parsed metadata into download tasks: builds each file's
+/// absolute URL and its sanitized local path, warning about every rename.
+///
+/// Returns the tasks and how many filenames were sanitized. A failed URL
+/// join aborts the run: silently keeping the base URL would download the
+/// metadata file under the file's name.
+fn build_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<(Vec<DownloadTask>, usize)> {
+    let mut sanitized_count = 0;
+    let tasks = files
+        .into_iter()
+        .map(|file| {
+            // Percent-encode the name first so '?' / '#' / '%' characters in
+            // it cannot split the URL into query or fragment components.
+            let encoded_name = encode_download_path(&file.name);
+            let absolute_url = base_url.join(&encoded_name)?;
+
+            // Sanitize filename for filesystem compatibility
+            let (sanitized_name, was_modified) = sanitize_filename(&file.name);
+
+            // Warn user if filename was modified
+            if was_modified {
+                println!(
+                    "{} {} {} → {}",
+                    "⚠".yellow().bold(),
+                    "Sanitized:".yellow(),
+                    file.name.dimmed(),
+                    sanitized_name.bold()
+                );
+                sanitized_count += 1;
+            }
+
+            Ok(DownloadTask {
+                url: absolute_url.to_string(),
+                file_path: sanitized_name,
+                expected_md5: file.md5,
+                expected_size: file.size,
+                expected_mtime: file.mtime,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok((tasks, sanitized_count))
 }
 
 /// Return formatted file rows for `--list` output.
@@ -401,16 +451,14 @@ fn list_summary(files: &XmlFiles) -> String {
 
 /// Lists parsed filenames from XML metadata when --list/-l is used
 fn list_files(files: &XmlFiles, spinner: &indicatif::ProgressBar) {
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template(&format!(
-                "{} Archive has {}",
-                "✔".green().bold(),
-                list_summary(files).bold()
-            ))
-            .expect("Failed to set completion style"),
+    finish_spinner(
+        spinner,
+        &format!(
+            "{} Archive has {}",
+            "✔".green().bold(),
+            list_summary(files).bold()
+        ),
     );
-    spinner.finish();
     for row in list_file_rows(files) {
         println!("{row}");
     }
@@ -444,16 +492,16 @@ struct Cli {
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Create a client with extended timeouts for large file downloads
-    // Connection timeout is set high, but no read timeout since large files
-    // may take a long time to transfer
+    // Extended timeouts for large file downloads: a long connection timeout,
+    // plus a per-read idle timeout that resets after each successful read,
+    // so a stalled mid-transfer becomes a retryable error instead of a hang
     let client = Client::builder()
         .user_agent(USER_AGENT)
-        .connect_timeout(std::time::Duration::from_secs(CONNECTION_TIMEOUT_SECS))
-        .read_timeout(std::time::Duration::from_secs(READ_TIMEOUT_SECS))
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .connect_timeout(Duration::from_secs(CONNECTION_TIMEOUT_SECS))
+        .read_timeout(Duration::from_secs(READ_TIMEOUT_SECS))
+        .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(1)
-        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(60))
         .build()?;
 
     // Start a single spinner for the entire initialization process
@@ -466,9 +514,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     let details_url = Url::parse(&cli.url)?;
+    let cookie_header = cookie_header_value(cli.cookies.as_deref(), &details_url)?;
 
     // Check URL accessibility
-    if let Err(e) = is_url_accessible(&details_url, &client, cli.cookies.as_deref()).await {
+    if let Err(e) = is_url_accessible(&details_url, &client, cookie_header.as_ref()).await {
         spinner.finish_with_message(format!(
             "{} Archive.org URL not accessible: {}",
             "✘".red().bold(),
@@ -487,48 +536,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     } = fetch_xml_metadata(&cli.url, &client, &spinner, cli.cookies.as_deref()).await?;
 
     // Persist the freshly fetched _files.xml (overwriting any previous copy)
-    // with the server's Last-Modified time, before anything else.
-    //
-    // The XML URL always ends in "<identifier>_files.xml" (see get_xml_url),
-    // so the last path segment is the file name.
-    let xml_file_name = base_url
-        .path()
-        .rsplit('/')
-        .next()
-        .expect("XML URL should have a file name segment");
-    save_xml_metadata(Path::new(xml_file_name), &content, last_modified)?;
-
-    // The saved _files.xml counts as the archive's first file (that is how
-    // archive.org lists it), so it is announced as #1 and the downloaded
-    // files are numbered from #2, keeping the counts consistent with the
-    // website. If the metadata lacks its own entry, the saved copy is still
-    // counted.
-    let total_files =
-        files.files.len() + usize::from(!files.files.iter().any(|f| f.name == xml_file_name));
-    println!(" ");
-    println!(
-        "{}  {}     {}",
-        "▣".bright_cyan().bold(),
-        "Filename".white(),
-        xml_file_name.bold()
-    );
-    println!(
-        "{} {}        {} {} of {}",
-        "├╼".cyan().dimmed(),
-        "Count".white(),
-        "#".blue().bold(),
-        "1".bold(),
-        total_files.to_string().bold()
-    );
-    // Same line shape as the batch's "Downloaded" lines, minus time/rate:
-    // the file is local, so there was no transfer.
-    println!(
-        "{} {}   {} {}",
-        "╰╼".cyan().dimmed(),
-        "Downloaded".white(),
-        "↓".green().bold(),
-        format_size(content.len() as u64).bold()
-    );
+    // with the server's Last-Modified time, and announce it as file #1
+    let total_files = save_and_announce_xml(&files, &base_url, &content, last_modified)?;
 
     // If requested, list parsed filenames and exit
     if cli.list {
@@ -536,60 +545,24 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let files = files_to_download(files.files, xml_file_name);
+    let files = files_to_download(files.files, xml_file_name_of(&base_url));
 
     // Successfully finished initialization; separate the banner from the
     // saved-metadata block above.
     println!();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template(&format!(
-                "{} {} to download {} files from archive.org {}",
-                "✔".green().bold(),
-                "Ready".bold(),
-                files.len().to_string().bold(),
-                "★".yellow()
-            ))
-            .expect("Failed to set completion style"),
+    finish_spinner(
+        &spinner,
+        &format!(
+            "{} {} to download {} files from archive.org {}",
+            "✔".green().bold(),
+            "Ready".bold(),
+            files.len().to_string().bold(),
+            "★".yellow()
+        ),
     );
-    spinner.finish();
 
     // Prepare download data for batch processing
-    let mut sanitized_count = 0;
-    let download_data = files
-        .into_iter()
-        .map(|file| {
-            // Percent-encode the name first so '?' / '#' / '%' characters in
-            // it cannot split the URL into query or fragment components.
-            let encoded_name = encode_download_path(&file.name);
-            // A failed join must abort the run: silently keeping the base URL
-            // would download the metadata file under the file's name.
-            let absolute_url = base_url.join(&encoded_name)?;
-
-            // Sanitize filename for filesystem compatibility
-            let (sanitized_name, was_modified) = sanitize_filename(&file.name);
-
-            // Warn user if filename was modified
-            if was_modified {
-                println!(
-                    "{} {} {} → {}",
-                    "⚠".yellow().bold(),
-                    "Sanitized:".yellow(),
-                    file.name.dimmed(),
-                    sanitized_name.bold()
-                );
-                sanitized_count += 1;
-            }
-
-            Ok((
-                absolute_url.to_string(),
-                sanitized_name,
-                file.md5,
-                file.size,
-                file.mtime,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let (download_tasks, sanitized_count) = build_download_tasks(files, &base_url)?;
 
     // Show summary if any files were sanitized
     if sanitized_count > 0 {
@@ -606,10 +579,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // starts at #2: #1 is the _files.xml saved above.
     downloader::download_files(
         &client,
-        download_data,
+        download_tasks,
         total_files,
         2,
-        cookie_header.as_deref(),
+        cookie_header.as_ref(),
         cli.stop_on_error,
     )
     .await?;
@@ -621,34 +594,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use ia_get::utils::validate_archive_url;
-    use std::path::PathBuf;
-    use std::time::Duration;
-
-    /// Creates a unique temp directory for a test (no cleanup, mirroring
-    /// the downloader test helpers).
-    fn temp_dir_for(test_name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time should be after Unix epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "ia-get-test-{}-{}-{}",
-            std::process::id(),
-            test_name,
-            nanos
-        ));
-        fs::create_dir_all(&dir).expect("Failed to create temp directory");
-        dir
-    }
-
-    /// Returns the file's mtime as unix seconds, if readable.
-    fn mtime_of(path: &Path) -> Option<u64> {
-        fs::metadata(path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-    }
 
     #[test]
     fn check_valid_pattern() {
@@ -855,52 +800,6 @@ archive.org\tFALSE\t/\tFALSE\t2145916800\tcurrent\tvalue\n";
         let result = files_to_download(files, "item1_files.xml");
 
         assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn save_xml_metadata_writes_file_and_sets_mtime() {
-        let dir = temp_dir_for("save_xml_sets_mtime");
-        let path = dir.join("item1_files.xml");
-
-        save_xml_metadata(
-            &path,
-            "<files><file name=\"item1_files.xml\"/></files>",
-            Some(UNIX_EPOCH + Duration::from_secs(1_545_586_142)),
-        )
-        .unwrap();
-
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains("item1_files.xml"));
-        assert_eq!(mtime_of(&path), Some(1_545_586_142));
-    }
-
-    #[test]
-    fn save_xml_metadata_overwrites_existing_file() {
-        let dir = temp_dir_for("save_xml_overwrites");
-        let path = dir.join("item1_files.xml");
-        fs::write(&path, "stale content").unwrap();
-
-        save_xml_metadata(&path, "<files/>", None).unwrap();
-
-        assert_eq!(fs::read_to_string(&path).unwrap(), "<files/>");
-    }
-
-    #[test]
-    fn save_xml_metadata_without_last_modified_keeps_current_time() {
-        let dir = temp_dir_for("save_xml_no_mtime");
-        let path = dir.join("item1_files.xml");
-
-        save_xml_metadata(&path, "<files/>", None).unwrap();
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let mtime = mtime_of(&path).expect("mtime should be readable");
-        assert!(
-            mtime.abs_diff(now) < 60,
-            "mtime {mtime} should be within 60s of now {now}"
-        );
     }
 
     /// Minimal single-purpose mock: HEAD always succeeds, GET returns the

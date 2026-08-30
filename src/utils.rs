@@ -5,7 +5,19 @@ use crate::{IaGetError, Result};
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
+use reqwest::header::{HeaderValue, COOKIE};
+use reqwest::RequestBuilder;
 use std::sync::LazyLock;
+use std::time::Duration;
+
+/// Adds the `Cookie` header to a request builder when a cookie value is
+/// present, so every authenticated request is built the same way.
+pub fn with_cookie(mut request: RequestBuilder, cookie: Option<&HeaderValue>) -> RequestBuilder {
+    if let Some(cookie) = cookie {
+        request = request.header(COOKIE, cookie);
+    }
+    request
+}
 
 /// Spinner tick interval in milliseconds
 pub const SPINNER_TICK_INTERVAL: u64 = 100;
@@ -53,8 +65,9 @@ pub fn validate_archive_url(url: &str) -> Result<()> {
 ///
 /// # Arguments
 /// * `total` - Total value for the progress bar
-/// * `action` - Action text to show at the beginning (e.g., "╰╼ Downloading  ")
-/// * `color` - Optional color style (defaults to "green/green")
+/// * `action` - Action text to show at the beginning, pre-styled with the
+///   `colored` crate (e.g., "╰╼ Downloading  ")
+/// * `color` - Optional bar color style (defaults to "green/green")
 /// * `with_eta` - Whether to include ETA in the template
 ///
 /// # Returns
@@ -68,24 +81,12 @@ pub fn create_progress_bar(
     let pb = ProgressBar::new(total);
     let color_str = color.unwrap_or("green/green");
 
-    let styled_action = if action.contains("├╼") || action.contains("╰╼") {
-        action
-            .replace("├╼", &"├╼".cyan().dimmed().to_string())
-            .replace("╰╼", &"╰╼".cyan().dimmed().to_string())
-    } else {
-        action.to_string()
-    };
-
+    let template =
+        format!("{action}{{elapsed_precise}} {{bar:40.{color_str}}} {{bytes}}/{{total_bytes}}");
     let template = if with_eta {
-        format!(
-            "{}{{elapsed_precise}} {{bar:40.{}}} {{bytes}}/{{total_bytes}} (ETA: {{eta}})",
-            styled_action, color_str
-        )
+        format!("{template} (ETA: {{eta}})")
     } else {
-        format!(
-            "{}{{elapsed_precise}} {{bar:40.{}}} {{bytes}}/{{total_bytes}}",
-            styled_action, color_str
-        )
+        template
     };
 
     pb.set_style(
@@ -96,6 +97,24 @@ pub fn create_progress_bar(
     );
 
     pb
+}
+
+/// Print the "Filename / Count" banner for one file of a numbered list
+pub fn print_file_banner(file_path: &str, number: usize, total: usize) {
+    println!(
+        "{}  {}     {}",
+        "▣".bright_cyan().bold(),
+        "Filename".white(),
+        file_path.bold()
+    );
+    println!(
+        "{} {}        {} {} of {}",
+        "├╼".cyan().dimmed(),
+        "Count".white(),
+        "#".blue().bold(),
+        number.to_string().bold(),
+        total.to_string().bold()
+    );
 }
 
 /// Create a spinner with braille animation
@@ -113,12 +132,55 @@ pub fn create_spinner(message: &str) -> ProgressBar {
             .template(&format!("{} {}", "{spinner}".yellow().bold(), message))
             .expect("Failed to set spinner style"),
     );
-    spinner.enable_steady_tick(std::time::Duration::from_millis(SPINNER_TICK_INTERVAL));
+    spinner.enable_steady_tick(Duration::from_millis(SPINNER_TICK_INTERVAL));
     spinner
 }
 
+/// Restyles a running spinner as a static completion message and finishes it
+pub fn finish_spinner(spinner: &ProgressBar, message: &str) {
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template(message)
+            .expect("Failed to set spinner style"),
+    );
+    spinner.finish();
+}
+
+/// Print the "Downloaded ↓ size" status line for a finished file
+///
+/// `prefix` is the pre-styled tree glyph: "├╼" when more lines follow in the
+/// file's block, "╰╼" for its last line. When `elapsed` is present, the
+/// transfer time and rate are appended; it is absent for files that never
+/// crossed the network (e.g. the locally saved `_files.xml`).
+pub fn print_downloaded_line(prefix: &str, transferred: u64, elapsed: Option<Duration>) {
+    let head = format!(
+        "{} {}   {} {}",
+        prefix,
+        "Downloaded".white(),
+        "↓".green().bold(),
+        format_size(transferred).bold()
+    );
+
+    match elapsed {
+        Some(elapsed) => {
+            let elapsed_secs = elapsed.as_secs_f64();
+            let rate = if elapsed_secs > 0.0 {
+                transferred as f64 / elapsed_secs
+            } else {
+                0.0
+            };
+            let (rate, unit) = format_transfer_rate(rate);
+            println!(
+                "{head} in {} ({rate:.2} {unit}/s)",
+                format_duration(elapsed).bold()
+            );
+        }
+        None => println!("{head}"),
+    }
+}
+
 /// Format a duration into a human-readable string
-pub fn format_duration(duration: std::time::Duration) -> String {
+pub fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
     if total_secs < 60 {
         return format!("{}.{:02}s", total_secs, duration.subsec_millis() / 10);
@@ -135,34 +197,119 @@ pub fn format_duration(duration: std::time::Duration) -> String {
     }
 }
 
+/// Picks the human-readable unit (B/KB/MB/GB) for a byte count and returns
+/// the value scaled to that unit
+fn scaled_unit(value: f64) -> (f64, &'static str) {
+    let kb = KB as f64;
+    let mb = MB as f64;
+    let gb = GB as f64;
+
+    if value < kb {
+        (value, "B")
+    } else if value < mb {
+        (value / kb, "KB")
+    } else if value < gb {
+        (value / mb, "MB")
+    } else {
+        (value / gb, "GB")
+    }
+}
+
 /// Format a size in bytes to a human-readable string
 pub fn format_size(size: u64) -> String {
     if size < KB {
         format!("{}B", size)
-    } else if size < MB {
-        format!("{:.2}KB", size as f64 / KB as f64)
-    } else if size < GB {
-        format!("{:.2}MB", size as f64 / MB as f64)
     } else {
-        format!("{:.2}GB", size as f64 / GB as f64)
+        let (value, unit) = scaled_unit(size as f64);
+        format!("{value:.2}{unit}")
     }
 }
 
 /// Format transfer rate to appropriate units
 pub fn format_transfer_rate(bytes_per_sec: f64) -> (f64, &'static str) {
-    let kb = KB as f64;
-    let mb = MB as f64;
-    let gb = GB as f64;
+    scaled_unit(bytes_per_sec)
+}
 
-    if bytes_per_sec < kb {
-        (bytes_per_sec, "B")
-    } else if bytes_per_sec < mb {
-        (bytes_per_sec / kb, "KB")
-    } else if bytes_per_sec < gb {
-        (bytes_per_sec / mb, "MB")
-    } else {
-        (bytes_per_sec / gb, "GB")
+/// Windows reserved device names (case-insensitive). A path component whose
+/// base name matches one of these gets an underscore appended.
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Characters that are invalid in file names on Windows or Unix and are
+/// replaced with underscores
+fn is_invalid_filename_char(ch: char) -> bool {
+    matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\\')
+        || ('\x00'..='\x1F').contains(&ch)
+        || ch == '\x7F'
+}
+
+/// Replaces every invalid character in a path component with an underscore.
+///
+/// Returns the replacement and whether anything was changed.
+fn replace_invalid_chars(component: &str) -> (String, bool) {
+    let mut sanitized = String::with_capacity(component.len());
+    let mut was_modified = false;
+
+    for ch in component.chars() {
+        if is_invalid_filename_char(ch) {
+            sanitized.push('_');
+            was_modified = true;
+        } else {
+            sanitized.push(ch);
+        }
     }
+
+    (sanitized, was_modified)
+}
+
+/// Appends an underscore to a component whose base name (the part before the
+/// first dot) is a Windows reserved name, keeping the extension intact
+/// (`CON.txt` → `CON_.txt`).
+///
+/// Returns whether anything was changed.
+fn mark_reserved_name(component: &mut String) -> bool {
+    let dot_pos = component.find('.');
+    let base_name = dot_pos.map_or(component.as_str(), |pos| &component[..pos]);
+
+    let is_reserved = WINDOWS_RESERVED_NAMES
+        .iter()
+        .any(|reserved| base_name.eq_ignore_ascii_case(reserved));
+
+    if is_reserved {
+        match dot_pos {
+            Some(pos) => component.insert(pos, '_'),
+            None => component.push('_'),
+        }
+    }
+
+    is_reserved
+}
+
+/// Sanitizes a single non-empty path component: replaces invalid characters,
+/// trims surrounding spaces and trailing dots (Windows rejects both),
+/// substitutes a placeholder for components that end up empty, and marks
+/// Windows reserved names.
+///
+/// Returns the sanitized component and whether anything was changed.
+fn sanitize_component(component: &str) -> (String, bool) {
+    let (mut sanitized, mut was_modified) = replace_invalid_chars(component);
+
+    let trimmed = sanitized.trim().trim_end_matches('.');
+    if trimmed.len() != sanitized.len() {
+        sanitized = trimmed.to_string();
+        was_modified = true;
+    }
+
+    if sanitized.is_empty() {
+        sanitized = "_".to_string();
+        was_modified = true;
+    }
+
+    was_modified |= mark_reserved_name(&mut sanitized);
+
+    (sanitized, was_modified)
 }
 
 /// Sanitizes a filename for cross-platform filesystem compatibility
@@ -201,108 +348,30 @@ pub fn format_transfer_rate(bytes_per_sec: f64) -> (f64, &'static str) {
 /// assert!(modified);
 /// ```
 pub fn sanitize_filename(filename: &str) -> (String, bool) {
-    // Windows reserved names (case-insensitive)
-    const RESERVED_NAMES: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-
-    let mut was_modified = false;
-    let mut result = String::with_capacity(filename.len());
-
     // Process each path component separately to preserve directory structure
     let components: Vec<&str> = filename.split('/').collect();
-    let mut first_component = true;
+    let non_empty_count = components.iter().filter(|c| !c.is_empty()).count();
 
-    for component in components.iter() {
-        // Skip empty components (e.g., from leading/trailing slashes or "//" sequences)
+    // Dropped slashes (leading, trailing, doubled) count as a modification,
+    // except for an empty input
+    let mut was_modified = !filename.is_empty() && non_empty_count != components.len();
+
+    let mut result = String::with_capacity(filename.len());
+    let mut emitted = 0;
+
+    for component in &components {
         if component.is_empty() {
-            if !filename.is_empty() {
-                was_modified = true;
-            }
             continue;
         }
 
-        // Add separator before non-first components
-        if !first_component {
+        if emitted > 0 {
             result.push('/');
         }
-        first_component = false;
+        emitted += 1;
 
-        let mut sanitized_component = String::with_capacity(component.len());
-
-        // Replace invalid characters
-        for ch in component.chars() {
-            match ch {
-                // Windows invalid characters
-                '<' | '>' | ':' | '"' | '|' | '?' | '*' => {
-                    sanitized_component.push('_');
-                    was_modified = true;
-                }
-                // Backslash (path separator on Windows, invalid in filenames on Unix)
-                '\\' => {
-                    sanitized_component.push('_');
-                    was_modified = true;
-                }
-                // Control characters (0-31) and DEL (127)
-                '\x00'..='\x1F' | '\x7F' => {
-                    sanitized_component.push('_');
-                    was_modified = true;
-                }
-                // Valid character
-                _ => sanitized_component.push(ch),
-            }
-        }
-
-        // Trim leading/trailing spaces
-        let trimmed = sanitized_component.trim();
-        if trimmed.len() != sanitized_component.len() {
-            was_modified = true;
-            sanitized_component = trimmed.to_string();
-        }
-
-        // Trim trailing dots (Windows doesn't allow filenames ending with dots)
-        let trimmed_dots = sanitized_component.trim_end_matches('.');
-        if trimmed_dots.len() != sanitized_component.len() {
-            was_modified = true;
-            sanitized_component = trimmed_dots.to_string();
-        }
-
-        // Handle empty components after sanitization
-        if sanitized_component.is_empty() {
-            sanitized_component = "_".to_string();
-            was_modified = true;
-        }
-
-        // Check for Windows reserved names
-        // Split by '.' to check the base name (before extension)
-        let dot_pos = sanitized_component.find('.');
-        let base_name = if let Some(pos) = dot_pos {
-            &sanitized_component[..pos]
-        } else {
-            &sanitized_component
-        };
-
-        if RESERVED_NAMES
-            .iter()
-            .any(|&reserved| base_name.eq_ignore_ascii_case(reserved))
-        {
-            // Insert underscore after base name, before extension
-            if let Some(pos) = dot_pos {
-                sanitized_component.insert(pos, '_');
-            } else {
-                sanitized_component.push('_');
-            }
-            was_modified = true;
-        }
-
-        result.push_str(&sanitized_component);
-    }
-
-    // Remove trailing slash if present (unless it's just "/")
-    if result.len() > 1 && result.ends_with('/') {
-        result.pop();
-        was_modified = true;
+        let (sanitized, modified) = sanitize_component(component);
+        was_modified |= modified;
+        result.push_str(&sanitized);
     }
 
     (result, was_modified)
