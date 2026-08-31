@@ -10,14 +10,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use colored::*;
 use digest::Digest;
 use indicatif::ProgressBar;
-use reqwest::header::{HeaderMap, HeaderValue, LAST_MODIFIED, RETRY_AFTER};
+use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderValue, LAST_MODIFIED, RETRY_AFTER};
 use reqwest::{Client, Response, StatusCode};
 
 use crate::Result;
 use crate::error::{IaGetError, io_error_with_path}; // Import IaGetError for explicit error conversion
 use crate::utils::{
-    branch_glyph, create_progress_bar, format_size, last_glyph, print_downloaded_line,
-    print_file_banner, with_cookie,
+    branch_glyph, create_progress_bar, ensure_not_symlink, format_size, last_glyph,
+    print_downloaded_line, print_file_banner, with_cookie,
 }; // Import utility functions
 
 /// Buffer size for file operations (8KB)
@@ -45,9 +45,9 @@ const MAX_DOWNLOAD_ATTEMPTS: u32 = 3;
 const LCG_MULTIPLIER: u64 = 6364136223846793005;
 const LCG_INCREMENT: u64 = 1442695040888963407;
 
-/// How often a retry wait wakes up to check for a Ctrl+C, so a long
-/// server-requested wait (up to 15 min) does not outlive the user's request
-/// to stop
+/// How often interruptible waits (retry backoff, a stalled body read) wake
+/// up to check for a Ctrl+C, so a long server-requested wait (up to 15 min)
+/// or a stalled transfer does not outlive the user's request to stop
 const INTERRUPT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Sets up signal handling for graceful shutdown on Ctrl+C
@@ -194,7 +194,9 @@ fn size_mismatch(file_path: &str, expected_size: Option<u64>) -> Result<Option<(
     }
 }
 
-/// Check if an existing file has the correct hash
+/// Check if an existing file is still valid: the (cheap) size check runs
+/// first so a stale or truncated copy never spends a full-file hash
+/// before being rejected
 fn check_existing_file(
     file_path: &str,
     expected_md5: Option<&str>,
@@ -204,21 +206,28 @@ fn check_existing_file(
     if !Path::new(file_path).exists() {
         return Ok(ExistingFileStatus::Missing);
     }
+    // A directory at the final path can neither be verified as a file nor
+    // safely removed: report it as unreadable and leave it in place.
+    if Path::new(file_path).is_dir() {
+        return Ok(ExistingFileStatus::Unreadable(
+            "a directory occupies the file path".to_string(),
+        ));
+    }
+
+    let mismatch = match size_mismatch(file_path, expected_size) {
+        Ok(mismatch) => mismatch,
+        Err(e) => {
+            return Ok(ExistingFileStatus::Unreadable(format!(
+                "could not read file size: {e}"
+            )));
+        }
+    };
+    if mismatch.is_some() {
+        return Ok(ExistingFileStatus::Invalid);
+    }
 
     let Some(expected_md5) = expected_md5 else {
-        // No hash to compare against: still reject a file whose size does not
-        // match the metadata, so a stale or truncated copy is re-downloaded.
-        let mismatch = match size_mismatch(file_path, expected_size) {
-            Ok(mismatch) => mismatch,
-            Err(e) => {
-                return Ok(ExistingFileStatus::Unreadable(format!(
-                    "could not read file size: {e}"
-                )));
-            }
-        };
-        if mismatch.is_some() {
-            return Ok(ExistingFileStatus::Invalid);
-        }
+        // No hash to compare against and the size matches: verified
         return Ok(ExistingFileStatus::Verified { md5: None });
     };
 
@@ -277,6 +286,10 @@ fn ensure_parent_directories(file_path: &str) -> Result<()> {
 
 /// Prepare a file for download
 fn prepare_file_for_download(file_path: &str) -> Result<File> {
+    // A pre-planted symlink at the .part path would be opened for writing:
+    // every streamed byte would reach the link target instead of the file.
+    ensure_not_symlink(Path::new(file_path))?;
+
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -328,6 +341,27 @@ fn parse_retry_after(value: &str) -> Option<u64> {
         .parse::<u64>()
         .ok()
         .map(|secs| secs.min(MAX_RETRY_AFTER_SECS))
+}
+
+/// Parses the start offset of a `Content-Range` header of the form
+/// `bytes <start>-<end>/<total>` (or `bytes <start>-<end>/*`), which a 206
+/// response must carry.
+///
+/// Returns `Some(true)` when the offset equals `expected_start`,
+/// `Some(false)` when it differs, and `None` when the header is absent or
+/// malformed — in both `None` cases the caller treats the body as untrusted.
+fn partial_content_offset(headers: &HeaderMap, expected_start: u64) -> Option<bool> {
+    headers
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            let range = value.strip_prefix("bytes ")?.split_once('/')?.0;
+            let start = range.split_once('-')?.0;
+            start
+                .parse::<u64>()
+                .ok()
+                .map(|start| start == expected_start)
+        })
 }
 
 /// Returns true for HTTP statuses that are worth retrying (transient server
@@ -479,10 +513,23 @@ impl RetryTracker {
     }
 }
 
+/// Resolves once the batch has been asked to stop, so a stalled body read
+/// can be aborted at the next check instead of waiting for the next chunk
+/// (or the read timeout).
+async fn wait_for_stop(running: &Arc<AtomicBool>) {
+    while running.load(Ordering::SeqCst) {
+        tokio::time::sleep(INTERRUPT_CHECK_INTERVAL).await;
+    }
+}
+
 /// Streams the response body into `file`, updating the progress bar as data
 /// arrives. Returns the number of new bytes written. A user interruption
 /// aborts with `IaGetError::Interrupted`; partial data stays in the file so
 /// the next attempt can resume.
+///
+/// The stop flag is raced against every chunk read: a body that stalls
+/// mid-transfer no longer forces a wait for the next chunk or the read
+/// timeout after a Ctrl+C.
 async fn stream_response_body(
     response: &mut Response,
     file: &mut File,
@@ -492,15 +539,22 @@ async fn stream_response_body(
 ) -> Result<u64> {
     let mut downloaded_bytes: u64 = 0;
 
-    while let Some(chunk) = response.chunk().await? {
-        if !running.load(Ordering::SeqCst) {
-            pb.finish_and_clear();
-            return Err(IaGetError::Interrupted);
+    loop {
+        tokio::select! {
+            chunk = response.chunk() => match chunk {
+                Ok(Some(chunk)) => {
+                    file.write_all(&chunk)?;
+                    downloaded_bytes += chunk.len() as u64;
+                    pb.set_position(base_size + downloaded_bytes);
+                }
+                Ok(None) => break,
+                Err(e) => return Err(e.into()),
+            },
+            _ = wait_for_stop(running) => {
+                pb.finish_and_clear();
+                return Err(IaGetError::Interrupted);
+            }
         }
-
-        file.write_all(&chunk)?;
-        downloaded_bytes += chunk.len() as u64;
-        pb.set_position(base_size + downloaded_bytes);
     }
 
     Ok(downloaded_bytes)
@@ -632,6 +686,17 @@ async fn download_file_content(
         // The server ignored the Range header and is sending the full body:
         // the local prefix is untrusted, so reset the file before streaming.
         if resuming && status == StatusCode::OK {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            download_action = download_action_label(false);
+        }
+        // A 206 must continue exactly where our Range header started. A
+        // missing or mismatched Content-Range offset means the body does
+        // not continue the local prefix, so reset the file before streaming.
+        if resuming
+            && status == StatusCode::PARTIAL_CONTENT
+            && partial_content_offset(response.headers(), current_file_size) != Some(true)
+        {
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
             download_action = download_action_label(false);
@@ -884,13 +949,16 @@ fn handle_existing_file(
 ///
 /// `fs::rename` atomically replaces an existing destination on all
 /// supported platforms, so no separate remove step (and the crash window
-/// it opens) is needed.
+/// it opens) is needed. A symlink planted at the final name is refused,
+/// mirroring the `.part` guard: the verified `.part` stays in place for
+/// the next run.
 fn install_downloaded_file(
     file_path: &str,
     part_path: &str,
     server_mtime: Option<SystemTime>,
     xml_mtime: Option<u64>,
 ) -> Result<()> {
+    ensure_not_symlink(Path::new(file_path))?;
     fs::rename(part_path, file_path).map_err(|e| io_error_with_path(file_path, e))?;
     if let Some(target) = server_mtime.or(mtime_from_xml(xml_mtime)) {
         sync_file_mtime(file_path, target);
@@ -1459,7 +1527,8 @@ mod tests {
                         partial: full[..8].to_vec(),
                     },
                 ),
-                MockResponse::new(206, MockBody::Full(full[8..].to_vec())),
+                MockResponse::new(206, MockBody::Full(full[8..].to_vec()))
+                    .with_header("Content-Range", "bytes 8-19/20"),
             ]),
             MockResponse::new(206, MockBody::Full(vec![])),
         );
@@ -1476,6 +1545,108 @@ mod tests {
         assert_eq!(fs::read(&part).unwrap(), full);
         assert_eq!(server.ranges(), vec![None, Some(8)]);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn partial_content_offset_mismatch_resets_file() {
+        // A 206 whose Content-Range does not continue our prefix must not
+        // be appended: the file is reset and re-downloaded from scratch.
+        let full = b"0123456789"; // 10 bytes
+
+        let (server, dir) = file_server(
+            "cr_mismatch",
+            VecDeque::from(vec![
+                MockResponse::new(206, MockBody::Full(full.to_vec()))
+                    .with_header("Content-Range", "bytes 0-9/10"),
+            ]),
+            ok_empty(),
+        );
+        let part = dir.join("file.bin.part");
+        fs::write(&part, b"XXXX").unwrap(); // 4-byte "partial" file
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(full.len() as u64),
+            &test_running(),
+        )
+        .await;
+
+        result.expect("download should succeed");
+        assert_eq!(
+            fs::read(&part).unwrap(),
+            full,
+            "a mismatched 206 body must replace the local prefix, not append to it"
+        );
+        assert_eq!(server.ranges(), vec![Some(4)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn partial_content_without_range_header_resets_file() {
+        // A 206 without a Content-Range header is malformed (RFC 7233 makes
+        // it mandatory): the body is untrusted, so the file is reset.
+        let full = b"0123456789"; // 10 bytes
+
+        let (server, dir) = file_server(
+            "cr_missing",
+            VecDeque::from(vec![MockResponse::new(206, MockBody::Full(full.to_vec()))]),
+            ok_empty(),
+        );
+        let part = dir.join("file.bin.part");
+        fs::write(&part, b"XXXX").unwrap(); // 4-byte "partial" file
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(full.len() as u64),
+            &test_running(),
+        )
+        .await;
+
+        result.expect("download should succeed");
+        assert_eq!(
+            fs::read(&part).unwrap(),
+            full,
+            "a 206 without Content-Range must replace the local prefix, not append to it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partial_content_offset_parses_matching_and_mismatching_ranges() {
+        fn headers(range: Option<&str>) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            if let Some(range) = range {
+                headers.insert(
+                    CONTENT_RANGE,
+                    HeaderValue::from_str(range).expect("a static test string is a valid header"),
+                );
+            }
+            headers
+        }
+
+        assert_eq!(
+            partial_content_offset(&headers(Some("bytes 8-19/20")), 8),
+            Some(true)
+        );
+        assert_eq!(
+            partial_content_offset(&headers(Some("bytes 0-9/20")), 8),
+            Some(false)
+        );
+        assert_eq!(
+            partial_content_offset(&headers(Some("bytes 8-19/*")), 9),
+            Some(false)
+        );
+        assert_eq!(partial_content_offset(&headers(None), 8), None);
+        // A suffix-form range has no usable start offset: untrusted.
+        assert_eq!(
+            partial_content_offset(&headers(Some("bytes */20")), 8),
+            None
+        );
+        // A range without a total is not what a 206 carries: untrusted.
+        assert_eq!(
+            partial_content_offset(&headers(Some("bytes 8-19")), 8),
+            None
+        );
     }
 
     #[tokio::test]
@@ -2029,10 +2200,38 @@ mod tests {
     }
 
     #[test]
+    fn size_mismatch_short_circuits_before_hashing() {
+        // A copy whose size does not match the metadata must be rejected
+        // as Invalid without spending a full-file hash.
+        let dir = temp_dir_for("size_short_circuit");
+        let path = dir.join("file.bin");
+        fs::write(&path, b"short").unwrap(); // 5 bytes
+
+        let expected = md5_hex(b"totally different content");
+        let status = check_existing_file(
+            path.to_str().unwrap(),
+            Some(expected.as_str()),
+            Some(100),
+            &test_running(),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(status, ExistingFileStatus::Invalid),
+            "got {status:?}"
+        );
+        assert!(
+            path.exists(),
+            "the stale copy is removed by the caller, not by the check"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn unreadable_existing_file_is_reported_not_redownloaded() {
-        // A directory can be opened but not read: the check must yield
-        // Unreadable (per-file failure, the entry is kept), not Invalid,
-        // which would delete it and re-download based on a read failure.
+        // A directory at the file path must yield Unreadable (per-file
+        // failure, the entry is kept), not Invalid, which would delete it
+        // and re-download based on a read failure.
         let dir = temp_dir_for("unreadable_existing");
         let path = dir.join("dirfile.bin");
         fs::create_dir(&path).unwrap();
@@ -2255,8 +2454,14 @@ mod tests {
         );
         let running = Arc::new(AtomicBool::new(true));
         let flag = running.clone();
+        // Simulate the Ctrl+C right after the first 429 has been served (a
+        // fixed timer would race the retry loop on fast machines): the
+        // flag is then guaranteed to be observed inside a retry wait.
+        let watcher = server.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            while watcher.request_count() < 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
             flag.store(false, Ordering::SeqCst);
         });
 
@@ -2271,8 +2476,106 @@ mod tests {
 
         assert!(
             matches!(result, Err(IaGetError::Interrupted)),
-            "an interrupt during the backoff wait must abort the retries, got {:?}",
+            "an interrupt during the backoff wait must abort the retries, got {result:?}"
+        );
+        assert!(
+            (1..=3).contains(&server.request_count()),
+            "at most one extra retry may follow the interrupt, got {}",
+            server.request_count()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_stalled_body_stops_waiting_for_chunks() {
+        // A connection that never delivers its body must not force a
+        // Ctrl+C to wait out the read timeout: the stop flag is raced
+        // against the chunk read.
+        let (server, dir) = file_server(
+            "stalled_body",
+            VecDeque::from(vec![MockResponse::stalled(100)]),
+            ok_empty(),
+        );
+        let running = Arc::new(AtomicBool::new(true));
+        let flag = running.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            flag.store(false, Ordering::SeqCst);
+        });
+
+        let part = dir.join("file.bin.part");
+        let start = Instant::now();
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(10),
+            &running,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(IaGetError::Interrupted)),
+            "a Ctrl+C during a stalled body must abort the download, got {:?}",
             result.ok()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the abort must land within one interrupt check, not the read timeout: {:?}",
+            start.elapsed()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_part_file_is_refused() {
+        // A pre-planted symlink at the .part path must not be opened for
+        // writing: the streamed bytes would reach the link target instead.
+        let dir = temp_dir_for("symlink_part");
+        let target = dir.join("target.bin");
+        fs::write(&target, "do not touch").unwrap();
+        let part = dir.join("file.bin.part");
+        std::os::unix::fs::symlink(&target, &part).unwrap();
+
+        let err = prepare_file_for_download(part.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "do not touch",
+            "the link target must be left untouched"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_refuses_symlinked_final_file() {
+        // A symlink planted at the final name must not shadow the verified
+        // .part: the install fails and the .part is kept for the next run.
+        let dir = temp_dir_for("symlink_install");
+        let target = dir.join("target.bin");
+        fs::write(&target, "do not touch").unwrap();
+        let final_path = dir.join("file.bin");
+        std::os::unix::fs::symlink(&target, &final_path).unwrap();
+        let part = dir.join("file.bin.part");
+        fs::write(&part, "fresh content").unwrap();
+
+        let err = install_downloaded_file(
+            final_path.to_str().unwrap(),
+            part.to_str().unwrap(),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "do not touch",
+            "the link target must be left untouched"
+        );
+        assert!(
+            part.exists(),
+            "the verified .part must be kept for the next run"
         );
         let _ = fs::remove_dir_all(&dir);
     }

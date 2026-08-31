@@ -1,7 +1,7 @@
 use crate::constants::XML_DEBUG_TRUNCATE_LEN;
 use crate::cookie::cookie_header_value;
 use crate::downloader::{parse_last_modified, sync_file_mtime};
-use crate::utils::with_cookie;
+use crate::utils::{ensure_not_symlink, with_cookie};
 use crate::{IaGetError, Result};
 use colored::*;
 use indicatif::ProgressBar;
@@ -75,15 +75,30 @@ fn parse_error_line(error: &str) -> Option<usize> {
 /// Each line is capped at `XML_DEBUG_TRUNCATE_LEN` characters so a
 /// minified multi-megabyte line cannot blow up the error message.
 fn error_context(xml_content: &str, line: Option<usize>) -> String {
-    let lines: Vec<&str> = xml_content.lines().collect();
-    let last_line = lines.len().max(1);
+    // Count the lines without materializing them: the document can be
+    // large, and only the handful of lines around the anchor are shown.
+    let newlines = xml_content.bytes().filter(|&byte| byte == b'\n').count();
+    let line_count = if xml_content.is_empty() {
+        0
+    } else if xml_content.ends_with('\n') {
+        newlines
+    } else {
+        newlines + 1
+    };
+    let last_line = line_count.max(1);
     let anchor = line.unwrap_or(1).min(last_line);
     let first = anchor.saturating_sub(3).max(1);
     let last = (first + 5).min(last_line);
 
+    // Advance to the first line to show; every line is read at most once
+    let mut lines = xml_content.lines();
+    for _ in 0..first.saturating_sub(1) {
+        lines.next();
+    }
+
     let mut out = String::new();
     for number in first..=last {
-        let raw = lines.get(number - 1).copied().unwrap_or("").trim_end();
+        let raw = lines.next().unwrap_or("").trim_end();
         let mut end = XML_DEBUG_TRUNCATE_LEN.min(raw.len());
         while end < raw.len() && !raw.is_char_boundary(end) {
             end -= 1;
@@ -128,12 +143,7 @@ pub fn save_xml_metadata(
 ) -> Result<()> {
     // Refuse to write through a pre-planted symlink named "<id>_files.xml":
     // fs::write would silently truncate whatever the link points at.
-    if std::fs::symlink_metadata(path).is_ok_and(|existing| existing.file_type().is_symlink()) {
-        return Err(IaGetError::FileSystem {
-            detail: format!("refusing to overwrite a symlink: {}", path.display()),
-            source: None,
-        });
-    }
+    ensure_not_symlink(path)?;
     std::fs::write(path, content).map_err(|e| crate::error::io_error_with_path(path, e))?;
 
     if let Some(target) = last_modified {
@@ -430,6 +440,31 @@ mod tests {
         let ctx = error_context(xml, Some(999));
         assert!(ctx.contains("2"), "the anchor must clamp to the last line");
         assert!(ctx.contains("»"), "the clamped line must be marked");
+    }
+
+    #[test]
+    fn error_context_counts_lines_with_trailing_newline() {
+        // "a\nb\n" is two lines, not three: an anchor past the end must
+        // clamp to line 2, and no phantom line 3 may appear.
+        let ctx = error_context("a\nb\n", Some(99));
+        assert!(
+            ctx.contains("»     2"),
+            "the anchor must clamp to the last line: {ctx}"
+        );
+        assert!(!ctx.contains('3'), "no phantom third line: {ctx}");
+    }
+
+    #[test]
+    fn error_context_on_empty_document_keeps_the_marker() {
+        let ctx = error_context("", Some(1));
+        assert!(
+            ctx.contains("»"),
+            "the marker must survive an empty document: {ctx}"
+        );
+        assert!(
+            ctx.contains("     1"),
+            "the head line number must survive: {ctx}"
+        );
     }
 
     #[test]

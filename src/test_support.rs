@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::StatusCode;
 
@@ -50,6 +50,9 @@ pub enum MockBody {
         announced_len: u64,
         partial: Vec<u8>,
     },
+    /// Announce `announced_len` bytes via Content-Length, then hold the
+    /// connection open without ever sending the body (a stalled server)
+    Stalled { announced_len: u64 },
 }
 
 /// A scripted response: status, body and extra headers
@@ -74,6 +77,16 @@ impl MockResponse {
             .push((name.to_string(), value.to_string()));
         self
     }
+
+    /// A 200 that announces `announced_len` bytes via Content-Length but
+    /// never delivers the body: simulates a stalled server connection
+    pub fn stalled(announced_len: u64) -> Self {
+        Self {
+            status: 200,
+            body: MockBody::Stalled { announced_len },
+            extra_headers: vec![],
+        }
+    }
 }
 
 struct ServerState {
@@ -90,7 +103,8 @@ struct ServerState {
 ///
 /// Each request pops one response from the path's script queue; `HEAD`
 /// requests get the response's status and headers but no body, as a real
-/// server would send.
+/// server would send. Cloning shares the same listener and request log.
+#[derive(Clone)]
 pub struct MockServer {
     base_url: String,
     state: Arc<Mutex<ServerState>>,
@@ -212,18 +226,21 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
             .unwrap_or_else(|| st.fallback.clone())
     };
 
-    // A HEAD response carries the status and headers but no body
-    let (announced_len, body_bytes) = match (&response.body, method.eq_ignore_ascii_case("HEAD")) {
-        (_, true) => (0, Vec::new()),
-        (MockBody::Full(data), false) => (data.len() as u64, data.clone()),
-        (
-            MockBody::Truncated {
-                announced_len,
-                partial,
-            },
-            false,
-        ) => (*announced_len, partial.clone()),
-    };
+    // A HEAD response carries the status and headers but no body; a
+    // Stalled body holds the connection open after the headers
+    let (announced_len, body_bytes, stalled) =
+        match (&response.body, method.eq_ignore_ascii_case("HEAD")) {
+            (_, true) => (0, Vec::new(), false),
+            (MockBody::Full(data), false) => (data.len() as u64, data.clone(), false),
+            (
+                MockBody::Truncated {
+                    announced_len,
+                    partial,
+                },
+                false,
+            ) => (*announced_len, partial.clone(), false),
+            (MockBody::Stalled { announced_len }, false) => (*announced_len, Vec::new(), true),
+        };
 
     let reason = StatusCode::from_u16(response.status)
         .ok()
@@ -238,6 +255,11 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
     out.push_str("Connection: close\r\n\r\n");
 
     let _ = stream.write_all(out.as_bytes());
+    if stalled {
+        // Hold the connection open without delivering the body: a stalled
+        // server. The sleep is far longer than any test may run.
+        thread::sleep(Duration::from_secs(3_600));
+    }
     // The stream is dropped here: for Truncated bodies this closes the
     // connection before the announced Content-Length has been delivered.
     let _ = stream.write_all(&body_bytes);

@@ -7,6 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
 use reqwest::RequestBuilder;
 use reqwest::header::{COOKIE, HeaderValue};
+use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -17,6 +18,25 @@ pub fn with_cookie(mut request: RequestBuilder, cookie: Option<&HeaderValue>) ->
         request = request.header(COOKIE, cookie);
     }
     request
+}
+
+/// Refuses to write through a pre-planted symlink at `path`: opening or
+/// replacing such a path would silently reach the link target, which may
+/// live outside the working directory. A missing path passes, so the
+/// caller may still create it.
+pub fn ensure_not_symlink(path: &Path) -> Result<()> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(IaGetError::FileSystem {
+            detail: format!(
+                "{} is a symlink; refusing to write through it",
+                path.display()
+            ),
+            source: None,
+        });
+    }
+    Ok(())
 }
 
 /// Spinner tick interval in milliseconds

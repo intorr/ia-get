@@ -53,7 +53,7 @@ src/
 
 ## Platform Support
 
-Must build on: `x86_64-linux`, `aarch64-linux`, `x86_64-darwin`, `aarch64-darwin`
+Must build on: `x86_64-linux`, `aarch64-linux`, `x86_64-darwin`, `aarch64-darwin`, `x86_64-pc-windows-msvc`
 
 Use `nix build` to verify cross-platform compatibility.
 
