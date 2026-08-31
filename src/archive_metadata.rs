@@ -55,6 +55,10 @@ pub struct XmlFile {
 /// Extracts the 1-based line number from a `serde-xml-rs` error, whose
 /// display carries the position as `Reader: line:column message`.
 ///
+/// The layout is parser-specific: if `serde-xml-rs` ever changes its
+/// display format, this yields `None` and the preview falls back to the
+/// document head, so a dependency update degrades gracefully.
+///
 /// Returns `None` when the parser reported no position; the preview then
 /// falls back to the document head.
 fn parse_error_line(error: &str) -> Option<usize> {
@@ -124,13 +128,11 @@ pub fn save_xml_metadata(
 ) -> Result<()> {
     // Refuse to write through a pre-planted symlink named "<id>_files.xml":
     // fs::write would silently truncate whatever the link points at.
-    if let Ok(existing) = std::fs::symlink_metadata(path) {
-        if existing.file_type().is_symlink() {
-            return Err(IaGetError::FileSystem {
-                detail: format!("refusing to overwrite a symlink: {}", path.display()),
-                source: None,
-            });
-        }
+    if std::fs::symlink_metadata(path).is_ok_and(|existing| existing.file_type().is_symlink()) {
+        return Err(IaGetError::FileSystem {
+            detail: format!("refusing to overwrite a symlink: {}", path.display()),
+            source: None,
+        });
     }
     std::fs::write(path, content).map_err(|e| crate::error::io_error_with_path(path, e))?;
 
@@ -340,7 +342,7 @@ pub async fn fetch_and_parse_xml(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{mtime_of, temp_dir_for, MockBody, MockResponse, MockServer};
+    use crate::test_support::{MockBody, MockResponse, MockServer, mtime_of, temp_dir_for};
     use crate::utils::create_spinner;
     use std::collections::{HashMap, VecDeque};
     use std::time::{Duration, UNIX_EPOCH};
@@ -445,6 +447,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("item1_files.xml"));
         assert_eq!(mtime_of(&path), Some(1_545_586_142));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -456,6 +459,7 @@ mod tests {
         save_xml_metadata(&path, "<files/>", None).unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "<files/>");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -495,6 +499,7 @@ mod tests {
             mtime.abs_diff(now) < 60,
             "mtime {mtime} should be within 60s of now {now}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

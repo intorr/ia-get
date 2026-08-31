@@ -88,10 +88,28 @@ fn parse_netscape_cookie(line: &str) -> Option<NetscapeCookie> {
     })
 }
 
+/// The only host this tool ever talks to: URL validation restricts every
+/// request to archive.org.
+const COOKIE_HOST: &str = "archive.org";
+
+/// True when `domain` (already lower-cased, see `parse_netscape_cookie`)
+/// is archive.org itself or one of its subdomains.
+fn is_archive_org_domain(domain: &str) -> bool {
+    domain == COOKIE_HOST || domain.ends_with(&format!(".{COOKIE_HOST}"))
+}
+
 fn cookie_domain_matches(cookie: &NetscapeCookie, url: &Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
+
+    // A cookie scoped to any other domain can never apply: every request
+    // goes to archive.org, and a bare RFC 6265 domain match would wrongly
+    // treat a public-suffix cookie (e.g. ".com" with TRUE) as applicable
+    // without a public-suffix list.
+    if !is_archive_org_domain(&cookie.domain) {
+        return false;
+    }
 
     let host = host.to_ascii_lowercase();
     host == cookie.domain
@@ -113,10 +131,8 @@ fn cookie_path_matches(cookie: &NetscapeCookie, url: &Url) -> bool {
 }
 
 fn cookie_applies_to_url(cookie: &NetscapeCookie, url: &Url, now: u64) -> bool {
-    if let Some(expires) = cookie.expires {
-        if expires <= now {
-            return false;
-        }
+    if cookie.expires.is_some_and(|expires| expires <= now) {
+        return false;
     }
 
     if cookie.secure && url.scheme() != "https" {
@@ -176,10 +192,8 @@ pub fn cookie_header_value(cookie_input: Option<&str>, url: &Url) -> Result<Opti
         return Ok(None);
     }
 
-    let value = HeaderValue::from_str(&cookie_header).map_err(|e| IaGetError::Network {
-        detail: format!("Invalid cookie header: {e}"),
-        source: Some(Box::new(e)),
-    })?;
+    let value = HeaderValue::from_str(&cookie_header)
+        .map_err(|e| IaGetError::InvalidCookie(e.to_string()))?;
     Ok(Some(value))
 }
 
@@ -240,6 +254,27 @@ archive.org\tFALSE\t/download/private\tFALSE\t2145916800\tprivate-only\tsecret\n
             )
             .unwrap(),
             "download-root=yes; private-only=secret"
+        );
+    }
+
+    #[test]
+    fn cookie_header_never_matches_foreign_or_wildcard_domains() {
+        // A public-suffix cookie (".com" with TRUE) must not match
+        // archive.org, a lookalike host must not either, and a
+        // subdomain-scoped cookie must not apply to the parent host.
+        let cookies = "# Netscape HTTP Cookie File\n\
+.com\tTRUE\t/\tFALSE\t2145916800\twildcard\tvalue\n\
+evilarchive.org\tFALSE\t/\tFALSE\t2145916800\tlookalike\tvalue\n\
+www.archive.org\tTRUE\t/\tFALSE\t2145916800\tsub-scoped\tvalue\n";
+
+        assert_eq!(
+            cookie_header_from_netscape_file(
+                cookies,
+                &cookie_test_url("/download/item/item_files.xml"),
+            )
+            .unwrap(),
+            "",
+            "none of these cookies may reach the request"
         );
     }
 

@@ -7,9 +7,10 @@
 
 use clap::Parser;
 use colored::*;
+use ia_get::Result;
 use ia_get::archive_metadata::{
-    encode_download_path, fetch_and_parse_xml, get_xml_url, is_url_accessible, save_xml_metadata,
-    xml_file_name_of, XmlFile, XmlFiles, XmlMetadata,
+    XmlFile, XmlFiles, XmlMetadata, encode_download_path, fetch_and_parse_xml, get_xml_url,
+    is_url_accessible, save_xml_metadata, xml_file_name_of,
 };
 use ia_get::constants::USER_AGENT;
 use ia_get::cookie::cookie_header_value;
@@ -18,7 +19,6 @@ use ia_get::utils::{
     create_spinner, finish_spinner, format_size, last_glyph, print_downloaded_line,
     print_file_banner, sanitize_filename, validate_archive_url,
 };
-use ia_get::Result;
 use indicatif::ProgressBar;
 use reqwest::{Client, Url};
 use std::collections::HashMap;
@@ -65,29 +65,23 @@ fn build_client() -> Result<Client> {
 /// Persists the freshly fetched `_files.xml` (overwriting any previous copy)
 /// and prints its "#1" file block.
 ///
-/// Returns the total file count: the archive's files plus the saved
-/// `_files.xml`, which archive.org lists as the first file, so the
-/// downloaded files are numbered from #2. If the metadata lacks its own
-/// entry, the saved copy is still counted.
+/// `total_files` is the "#1 of N" denominator, computed by the caller from
+/// the planned tasks plus this saved copy.
 fn save_and_announce_xml(
-    files: &XmlFiles,
     base_url: &Url,
     content: &str,
     last_modified: Option<SystemTime>,
-) -> Result<usize> {
+    total_files: usize,
+) -> Result<()> {
     let xml_file_name = xml_file_name_of(base_url);
     save_xml_metadata(Path::new(xml_file_name), content, last_modified)?;
 
-    // The archive lists its own _files.xml as a file: count it once, either
-    // from the metadata or from the saved copy above.
-    let already_listed = files.files.iter().any(|f| f.name == xml_file_name);
-    let total_files = files.files.len() + usize::from(!already_listed);
     println!(" ");
     print_file_banner(xml_file_name, XML_FILE_NUMBER, total_files);
     // The file never crossed the network, so its line carries no time/rate
     print_downloaded_line(last_glyph(), content.len() as u64, None);
 
-    Ok(total_files)
+    Ok(())
 }
 
 /// Filters out the archive's self-referencing `_files.xml` entry, whose
@@ -115,8 +109,18 @@ fn local_path_key(path: &str) -> String {
     }
 }
 
+/// The download plan: the tasks that will actually run, how many file
+/// names were sanitized, and the warning lines (sanitized, collided and
+/// skipped entries) that the caller prints.
+struct DownloadPlan {
+    tasks: Vec<DownloadTask>,
+    sanitized_count: usize,
+    warnings: Vec<String>,
+}
+
 /// Converts the parsed metadata into download tasks: builds each file's
-/// absolute URL and its sanitized local path, warning about every rename.
+/// absolute URL and its sanitized local path, collecting a warning line
+/// for every rename, collision or skip.
 ///
 /// Entries whose name encodes to an empty URL path (an empty name, or
 /// slashes only) are skipped: joining `""` would resolve to the metadata
@@ -126,12 +130,12 @@ fn local_path_key(path: &str) -> String {
 /// filesystems (Windows, default macOS), where "a.pdf" and "A.pdf" are the
 /// same path.
 ///
-/// Returns the tasks and how many filenames were sanitized. A failed URL
-/// join aborts the run: silently keeping the base URL would download the
-/// metadata file under the file's name.
-fn build_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<(Vec<DownloadTask>, usize)> {
+/// A failed URL join aborts the run: silently keeping the base URL would
+/// download the metadata file under the file's name.
+fn plan_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<DownloadPlan> {
     let mut sanitized_count = 0;
     let mut tasks: Vec<DownloadTask> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     // Normalised local path -> original name, so a collision can be
     // reported with both sides of the clash.
     let mut taken_paths: HashMap<String, String> = HashMap::new();
@@ -148,12 +152,12 @@ fn build_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<(Vec<Down
         let encoded_name = encode_download_path(&file.name);
 
         if encoded_name.is_empty() {
-            println!(
+            warnings.push(format!(
                 "{} {} {} (empty name)",
                 "⚠".yellow().bold(),
                 "Skipped:".yellow(),
                 file.name.dimmed()
-            );
+            ));
             continue;
         }
 
@@ -162,15 +166,15 @@ fn build_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<(Vec<Down
         // Sanitize filename for filesystem compatibility
         let (sanitized_name, was_modified) = sanitize_filename(&file.name);
 
-        // Warn user if filename was modified
+        // Collect a warning line if the filename was modified
         if was_modified {
-            println!(
+            warnings.push(format!(
                 "{} {} {} → {}",
                 "⚠".yellow().bold(),
                 "Sanitized:".yellow(),
                 file.name.dimmed(),
                 sanitized_name.bold()
-            );
+            ));
             sanitized_count += 1;
         }
 
@@ -182,14 +186,14 @@ fn build_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<(Vec<Down
         // "Report.PDF" and "report.pdf" collide there but not on Linux.
         let path_key = local_path_key(&sanitized_name);
         if let Some(first_name) = taken_paths.get(&path_key) {
-            println!(
+            warnings.push(format!(
                 "{} {} {} collides with {} at {} — the later entry is skipped",
                 "⚠".yellow().bold(),
                 "Collision:".yellow(),
                 file.name.dimmed(),
                 first_name.dimmed(),
                 sanitized_name.bold()
-            );
+            ));
             continue;
         }
         taken_paths.insert(path_key, file.name.clone());
@@ -203,7 +207,11 @@ fn build_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<(Vec<Down
         });
     }
 
-    Ok((tasks, sanitized_count))
+    Ok(DownloadPlan {
+        tasks,
+        sanitized_count,
+        warnings,
+    })
 }
 
 /// Return formatted file rows for `--list` output.
@@ -334,14 +342,27 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Fetch and parse XML metadata in one operation
+    // Fetch and parse XML metadata in one operation. Every failure is on
+    // screen before the exit: the accessibility pre-check inside the fetch
+    // finishes the spinner with a context-rich message, and any other
+    // failure (a failed GET, an unparseable document) finishes it here.
     let XmlMetadata {
         files,
         base_url,
         cookie_header,
         content,
         last_modified,
-    } = fetch_and_parse_xml(&xml_url, &client, &spinner, cookie_header.as_ref()).await?;
+    } = match fetch_and_parse_xml(&xml_url, &client, &spinner, cookie_header.as_ref()).await {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            if !spinner.is_finished() {
+                spinner.finish_with_message(format!("{} {}", "✘".red().bold(), e));
+            }
+            // The error is already on screen: exit without letting the
+            // runtime print it a second time.
+            std::process::exit(1);
+        }
+    };
 
     // If requested, list parsed filenames and exit: a read-only preview,
     // nothing is written to the working directory
@@ -350,11 +371,35 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Convert the metadata into the download plan before anything is
+    // announced, so the counts below only include the tasks that will
+    // actually run (entries skipped for empty names or path collisions
+    // never appear in the numbering).
+    let plan = match plan_download_tasks(
+        files_to_download(files.files, xml_file_name_of(&base_url)),
+        &base_url,
+    ) {
+        Ok(plan) => plan,
+        Err(e) => {
+            spinner.finish_with_message(format!("{} {}", "✘".red().bold(), e));
+            // The error is already on screen: exit without letting the
+            // runtime print it a second time.
+            std::process::exit(1);
+        }
+    };
+
+    // The saved _files.xml occupies file #1; the planned tasks follow
+    // right after it.
+    let total_files = plan.tasks.len() + 1;
+
     // Persist the freshly fetched _files.xml (overwriting any previous copy)
     // with the server's Last-Modified time, and announce it as file #1
-    let total_files = save_and_announce_xml(&files, &base_url, &content, last_modified)?;
-
-    let files = files_to_download(files.files, xml_file_name_of(&base_url));
+    if let Err(e) = save_and_announce_xml(&base_url, &content, last_modified, total_files) {
+        spinner.finish_with_message(format!("{} {}", "✘".red().bold(), e));
+        // The error is already on screen: exit without letting the
+        // runtime print it a second time.
+        std::process::exit(1);
+    }
 
     // Successfully finished initialization; separate the banner from the
     // saved-metadata block above.
@@ -365,22 +410,25 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "{} {} to download {} files from archive.org {}",
             "✔".green().bold(),
             "Ready".bold(),
-            files.len().to_string().bold(),
+            plan.tasks.len().to_string().bold(),
             "★".yellow()
         ),
     );
 
-    // Prepare download data for batch processing
-    let (download_tasks, sanitized_count) = build_download_tasks(files, &base_url)?;
+    // The plan's warnings (sanitized, collided and skipped entries)
+    // print after the Ready line.
+    for warning in &plan.warnings {
+        println!("{warning}");
+    }
 
     // Show summary if any files were sanitized
-    if sanitized_count > 0 {
+    if plan.sanitized_count > 0 {
         println!(
             "\n{} {} {} file{} for filesystem compatibility",
             "✓".green().bold(),
             "Sanitized".bold(),
-            sanitized_count.to_string().bold(),
-            if sanitized_count == 1 { "" } else { "s" }
+            plan.sanitized_count.to_string().bold(),
+            if plan.sanitized_count == 1 { "" } else { "s" }
         );
     }
 
@@ -388,7 +436,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // right after the _files.xml saved above.
     downloader::download_files(
         &client,
-        download_tasks,
+        plan.tasks,
         total_files,
         XML_FILE_NUMBER + 1,
         cookie_header.as_ref(),
@@ -492,27 +540,35 @@ mod tests {
     }
 
     #[test]
-    fn build_download_tasks_skips_entries_with_empty_names() {
+    fn plan_download_tasks_skips_entries_with_empty_names() {
         let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
         let files = vec![
             xml_file("", Some(10)),
             xml_file("//", None),
             xml_file("ok.bin", Some(5)),
         ];
-        let (tasks, sanitized) = build_download_tasks(files, &base).expect("tasks must build");
+        let plan = plan_download_tasks(files, &base).expect("plan must build");
 
-        assert_eq!(sanitized, 0);
+        assert_eq!(plan.sanitized_count, 0);
         assert_eq!(
-            tasks.len(),
+            plan.tasks.len(),
             1,
             "empty-name entries must be skipped, not joined to the base URL"
         );
-        assert_eq!(tasks[0].file_path, "ok.bin");
-        assert_eq!(tasks[0].url, "https://archive.org/download/item1/ok.bin");
+        assert_eq!(plan.tasks[0].file_path, "ok.bin");
+        assert_eq!(
+            plan.tasks[0].url,
+            "https://archive.org/download/item1/ok.bin"
+        );
+        assert_eq!(
+            plan.warnings.len(),
+            2,
+            "each skipped entry must leave a warning line"
+        );
     }
 
     #[test]
-    fn build_download_tasks_skips_sanitized_name_collisions() {
+    fn plan_download_tasks_skips_sanitized_name_collisions() {
         let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
         // Both names sanitize to "file_1.mp4"; the later entry must not
         // overwrite the earlier file.
@@ -520,19 +576,19 @@ mod tests {
             xml_file("file:1.mp4", Some(1)),
             xml_file("file_1.mp4", Some(2)),
         ];
-        let (tasks, sanitized) = build_download_tasks(files, &base).expect("tasks must build");
+        let plan = plan_download_tasks(files, &base).expect("plan must build");
 
-        assert_eq!(sanitized, 1, "only the colon name is sanitized");
-        assert_eq!(tasks.len(), 1, "the colliding entry must be skipped");
+        assert_eq!(plan.sanitized_count, 1, "only the colon name is sanitized");
+        assert_eq!(plan.tasks.len(), 1, "the colliding entry must be skipped");
         assert_eq!(
-            tasks[0].url,
+            plan.tasks[0].url,
             "https://archive.org/download/item1/file%3A1.mp4"
         );
-        assert_eq!(tasks[0].file_path, "file_1.mp4");
+        assert_eq!(plan.tasks[0].file_path, "file_1.mp4");
     }
 
     #[test]
-    fn build_download_tasks_case_collision_follows_filesystem() {
+    fn plan_download_tasks_case_collision_follows_filesystem() {
         // Names differing only by case: on case-insensitive filesystems
         // (Windows, default macOS) the later entry must be skipped, on
         // case-sensitive ones (Linux) both names are distinct paths.
@@ -541,25 +597,29 @@ mod tests {
             xml_file("Report.PDF", Some(1)),
             xml_file("report.pdf", Some(2)),
         ];
-        let (tasks, _) = build_download_tasks(files, &base).expect("tasks must build");
+        let plan = plan_download_tasks(files, &base).expect("plan must build");
 
         #[cfg(target_os = "linux")]
         {
             assert_eq!(
-                tasks.len(),
+                plan.tasks.len(),
                 2,
                 "differing case must stay two files on Linux"
             );
         }
         #[cfg(not(target_os = "linux"))]
         {
-            assert_eq!(tasks.len(), 1, "the case-colliding entry must be skipped");
-            assert_eq!(tasks[0].file_path, "Report.PDF");
+            assert_eq!(
+                plan.tasks.len(),
+                1,
+                "the case-colliding entry must be skipped"
+            );
+            assert_eq!(plan.tasks[0].file_path, "Report.PDF");
         }
     }
 
     #[test]
-    fn build_download_tasks_protects_saved_xml_name() {
+    fn plan_download_tasks_protects_saved_xml_name() {
         // "<id>_files.xml" is saved locally as file #1: an entry that
         // sanitizes to the same name must not overwrite the metadata.
         let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
@@ -567,22 +627,22 @@ mod tests {
             xml_file("Item1_Files.XML", Some(1)),
             xml_file("scan.jpg", Some(2)),
         ];
-        let (tasks, _) = build_download_tasks(files, &base).expect("tasks must build");
+        let plan = plan_download_tasks(files, &base).expect("plan must build");
 
         #[cfg(target_os = "linux")]
         assert_eq!(
-            tasks.len(),
+            plan.tasks.len(),
             2,
             "differing case stays distinct on case-sensitive filesystems"
         );
         #[cfg(not(target_os = "linux"))]
         {
             assert_eq!(
-                tasks.len(),
+                plan.tasks.len(),
                 1,
                 "the xml-name-colliding entry must be skipped"
             );
-            assert_eq!(tasks[0].file_path, "scan.jpg");
+            assert_eq!(plan.tasks[0].file_path, "scan.jpg");
         }
     }
 

@@ -27,23 +27,35 @@ pub enum IaGetError {
     },
 
     /// URL format or parsing errors
-    #[error("Invalid archive.org URL: {0}. Expected format: https://archive.org/details/<identifier>[/]")]
+    #[error(
+        "Invalid archive.org URL: {0}. Expected format: https://archive.org/details/<identifier>[/]"
+    )]
     UrlFormat(String),
 
     /// XML parsing errors
     #[error("Failed to parse XML: {0}")]
     XmlParsing(String),
 
+    /// The supplied cookie input cannot be turned into a valid HTTP header
+    #[error("Invalid cookie header: {0}")]
+    InvalidCookie(String),
+
     /// Server rejected the resume offset (HTTP 416): the local partial file is not a valid prefix
-    #[error("Server rejected the resume offset (HTTP 416); the partial file must be re-downloaded from scratch")]
+    #[error(
+        "Server rejected the resume offset (HTTP 416); the partial file must be re-downloaded from scratch"
+    )]
     RangeNotSatisfiable,
 
     /// The run was interrupted by the user (Ctrl+C)
     #[error("Interrupted by user")]
     Interrupted,
 
-    /// One or more files in a batch could not be downloaded
-    #[error("{count} of {total} file(s) failed to download. {details}")]
+    /// One or more files in a batch could not be downloaded.
+    ///
+    /// The per-file reasons stay out of the display: the batch loop already
+    /// printed them, and the runtime prints this error once more on a
+    /// non-zero exit. `details` remains available for structured access.
+    #[error("{count} of {total} file(s) failed to download")]
     BatchFailed {
         count: usize,
         total: usize,

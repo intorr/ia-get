@@ -5,8 +5,8 @@ use crate::{IaGetError, Result};
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
-use reqwest::header::{HeaderValue, COOKIE};
 use reqwest::RequestBuilder;
+use reqwest::header::{COOKIE, HeaderValue};
 use std::sync::LazyLock;
 use std::time::Duration;
 

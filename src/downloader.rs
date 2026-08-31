@@ -3,8 +3,8 @@
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use colored::*;
@@ -13,12 +13,12 @@ use indicatif::ProgressBar;
 use reqwest::header::{HeaderMap, HeaderValue, LAST_MODIFIED, RETRY_AFTER};
 use reqwest::{Client, Response, StatusCode};
 
-use crate::error::{io_error_with_path, IaGetError}; // Import IaGetError for explicit error conversion
+use crate::Result;
+use crate::error::{IaGetError, io_error_with_path}; // Import IaGetError for explicit error conversion
 use crate::utils::{
     branch_glyph, create_progress_bar, format_size, last_glyph, print_downloaded_line,
     print_file_banner, with_cookie,
-};
-use crate::Result; // Import utility functions
+}; // Import utility functions
 
 /// Buffer size for file operations (8KB)
 const BUFFER_SIZE: usize = 8192;
@@ -213,7 +213,7 @@ fn check_existing_file(
             Err(e) => {
                 return Ok(ExistingFileStatus::Unreadable(format!(
                     "could not read file size: {e}"
-                )))
+                )));
             }
         };
         if mismatch.is_some() {
@@ -266,10 +266,11 @@ fn print_verified_hash(md5: Option<&str>) {
 
 /// Ensure parent directories exist for a file
 fn ensure_parent_directories(file_path: &str) -> Result<()> {
-    if let Some(path) = Path::new(file_path).parent() {
-        if path.file_name().is_some() && !path.exists() {
-            fs::create_dir_all(path).map_err(|e| io_error_with_path(path, e))?;
-        }
+    if let Some(path) = Path::new(file_path).parent()
+        && path.file_name().is_some()
+        && !path.exists()
+    {
+        fs::create_dir_all(path).map_err(|e| io_error_with_path(path, e))?;
     }
     Ok(())
 }
@@ -375,8 +376,13 @@ pub fn sync_file_mtime(file_path: impl AsRef<Path>, target: SystemTime) -> bool 
         return false;
     }
 
-    let file_time =
-        filetime::FileTime::from_unix_time(i64::try_from(target_secs).unwrap_or(i64::MAX), 0);
+    // u64 seconds only overflow i64 for dates around the year 292 million
+    // AD; nothing representable exists there, so leave the time as is.
+    let Ok(target_secs) = i64::try_from(target_secs) else {
+        return false;
+    };
+
+    let file_time = filetime::FileTime::from_unix_time(target_secs, 0);
 
     if let Err(e) = filetime::set_file_mtime(&file_path, file_time) {
         println!(
@@ -486,13 +492,12 @@ async fn stream_response_body(
 ) -> Result<u64> {
     let mut downloaded_bytes: u64 = 0;
 
-    while let Some(chunk_result) = response.chunk().await.transpose() {
+    while let Some(chunk) = response.chunk().await? {
         if !running.load(Ordering::SeqCst) {
             pb.finish_and_clear();
             return Err(IaGetError::Interrupted);
         }
 
-        let chunk = chunk_result?;
         file.write_all(&chunk)?;
         downloaded_bytes += chunk.len() as u64;
         pb.set_position(base_size + downloaded_bytes);
@@ -665,20 +670,20 @@ async fn download_file_content(
 
                 // The body ended before the announced size: the transfer was
                 // truncated, so resume from where we stopped.
-                if let Some(expected) = expected_size {
-                    if total_bytes < expected {
-                        retry_open_file(
-                            file,
-                            &pb,
-                            &mut retry,
-                            "Incomplete body",
-                            &format!("received {total_bytes} of {expected} bytes"),
-                            None,
-                            running,
-                        )
-                        .await?;
-                        continue;
-                    }
+                if let Some(expected) = expected_size
+                    && total_bytes < expected
+                {
+                    retry_open_file(
+                        file,
+                        &pb,
+                        &mut retry,
+                        "Incomplete body",
+                        &format!("received {total_bytes} of {expected} bytes"),
+                        None,
+                        running,
+                    )
+                    .await?;
+                    continue;
                 }
 
                 pb.finish_and_clear();
@@ -1011,7 +1016,7 @@ async fn run_download_attempts(
             return Ok(DownloadOutcome::Failed {
                 reason: format!("could not prepare .part file: {e}"),
                 discard_part: false,
-            })
+            });
         }
     };
 
@@ -1043,7 +1048,7 @@ async fn run_download_attempts(
                     break DownloadOutcome::Failed {
                         reason: format!("could not prepare .part file: {e}"),
                         discard_part: false,
-                    }
+                    };
                 }
             };
             println!(
@@ -1082,7 +1087,7 @@ async fn run_download_attempts(
                         break DownloadOutcome::Failed {
                             reason: format!("could not verify downloaded file: {e}"),
                             discard_part: false,
-                        }
+                        };
                     }
                 }
             }
@@ -1113,7 +1118,7 @@ async fn run_download_attempts(
                             break DownloadOutcome::Failed {
                                 reason: format!("could not verify complete .part file: {e}"),
                                 discard_part: false,
-                            }
+                            };
                         }
                     }
                 }
@@ -1126,7 +1131,7 @@ async fn run_download_attempts(
                 break DownloadOutcome::Failed {
                     reason: e.to_string(),
                     discard_part,
-                }
+                };
             }
         }
     };
@@ -1225,7 +1230,7 @@ fn batch_failed(failed_files: &[(String, String)], total: usize) -> IaGetError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{mtime_of, temp_dir_for, MockBody, MockResponse, MockServer};
+    use crate::test_support::{MockBody, MockResponse, MockServer, mtime_of, temp_dir_for};
     use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
     use std::time::Instant;
@@ -1715,11 +1720,10 @@ mod tests {
         let mut scripts = HashMap::new();
         scripts.insert(
             "/file.bin".to_string(),
-            VecDeque::from(vec![MockResponse::new(
-                200,
-                MockBody::Full(content.to_vec()),
-            )
-            .with_header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")]),
+            VecDeque::from(vec![
+                MockResponse::new(200, MockBody::Full(content.to_vec()))
+                    .with_header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+            ]),
         );
         let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
 
@@ -1788,11 +1792,10 @@ mod tests {
 
         let (server, dir) = file_server(
             "server_mtime",
-            VecDeque::from(vec![MockResponse::new(
-                200,
-                MockBody::Full(content.to_vec()),
-            )
-            .with_header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")]),
+            VecDeque::from(vec![
+                MockResponse::new(200, MockBody::Full(content.to_vec()))
+                    .with_header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+            ]),
             ok_empty(),
         );
         let files = vec![file_task(

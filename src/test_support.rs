@@ -12,8 +12,9 @@ use reqwest::StatusCode;
 
 /// Creates a unique temp directory for a test.
 ///
-/// Directories are not cleaned up, mirroring the existing test style:
-/// leftovers under the OS temp dir are harmless.
+/// Callers clean the directory up at the end of the test with
+/// `let _ = fs::remove_dir_all(&dir);`; a leftover under the OS temp dir
+/// is harmless, but a long test run should not accumulate them.
 pub fn temp_dir_for(test_name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

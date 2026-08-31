@@ -7,7 +7,7 @@ authors = ["Martin Wimpress <code@wimpress.io>"]
 repository = "https://github.com/wimpysworld/ia-get"
 readme = "README.md"
 version = "0.1.4"
-edition = "2021"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
