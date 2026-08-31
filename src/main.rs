@@ -21,6 +21,7 @@ use ia_get::utils::{
 use ia_get::Result;
 use indicatif::ProgressBar;
 use reqwest::{Client, Url};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -99,43 +100,78 @@ fn files_to_download(files: Vec<XmlFile>, xml_file_name: &str) -> Vec<XmlFile> {
 /// Converts the parsed metadata into download tasks: builds each file's
 /// absolute URL and its sanitized local path, warning about every rename.
 ///
+/// Entries whose name encodes to an empty URL path (an empty name, or
+/// slashes only) are skipped: joining `""` would resolve to the metadata
+/// URL itself. Likewise, an entry whose sanitized local path collides with
+/// an earlier entry's is skipped, so one file never overwrites another.
+///
 /// Returns the tasks and how many filenames were sanitized. A failed URL
 /// join aborts the run: silently keeping the base URL would download the
 /// metadata file under the file's name.
 fn build_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<(Vec<DownloadTask>, usize)> {
     let mut sanitized_count = 0;
-    let tasks = files
-        .into_iter()
-        .map(|file| {
-            // Percent-encode the name first so '?' / '#' / '%' characters in
-            // it cannot split the URL into query or fragment components.
-            let encoded_name = encode_download_path(&file.name);
-            let absolute_url = base_url.join(&encoded_name)?;
+    let mut tasks: Vec<DownloadTask> = Vec::new();
+    // Sanitized local path -> original name, so a collision can be
+    // reported with both sides of the clash.
+    let mut taken_paths: HashMap<String, String> = HashMap::new();
 
-            // Sanitize filename for filesystem compatibility
-            let (sanitized_name, was_modified) = sanitize_filename(&file.name);
+    for file in files {
+        // Percent-encode the name first so '?' / '#' / '%' characters in
+        // it cannot split the URL into query or fragment components.
+        let encoded_name = encode_download_path(&file.name);
 
-            // Warn user if filename was modified
-            if was_modified {
-                println!(
-                    "{} {} {} → {}",
-                    "⚠".yellow().bold(),
-                    "Sanitized:".yellow(),
-                    file.name.dimmed(),
-                    sanitized_name.bold()
-                );
-                sanitized_count += 1;
-            }
+        if encoded_name.is_empty() {
+            println!(
+                "{} {} {} (empty name)",
+                "⚠".yellow().bold(),
+                "Skipped:".yellow(),
+                format!("{:?}", file.name).dimmed()
+            );
+            continue;
+        }
 
-            Ok(DownloadTask {
-                url: absolute_url.to_string(),
-                file_path: sanitized_name,
-                expected_md5: file.md5,
-                expected_size: file.size,
-                expected_mtime: file.mtime,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+        let absolute_url = base_url.join(&encoded_name)?;
+
+        // Sanitize filename for filesystem compatibility
+        let (sanitized_name, was_modified) = sanitize_filename(&file.name);
+
+        // Warn user if filename was modified
+        if was_modified {
+            println!(
+                "{} {} {} → {}",
+                "⚠".yellow().bold(),
+                "Sanitized:".yellow(),
+                file.name.dimmed(),
+                sanitized_name.bold()
+            );
+            sanitized_count += 1;
+        }
+
+        // Two different remote names may sanitize to the same local path
+        // (e.g. "file:1.mp4" and "file_1.mp4"); downloading both would
+        // overwrite the earlier file, so keep the first entry and skip the
+        // rest.
+        if let Some(first_name) = taken_paths.get(&sanitized_name) {
+            println!(
+                "{} {} {} collides with {} at {} — the later entry is skipped",
+                "⚠".yellow().bold(),
+                "Collision:".yellow(),
+                format!("{:?}", file.name).dimmed(),
+                format!("{first_name:?}").dimmed(),
+                sanitized_name.bold()
+            );
+            continue;
+        }
+        taken_paths.insert(sanitized_name.clone(), file.name.clone());
+
+        tasks.push(DownloadTask {
+            url: absolute_url.to_string(),
+            file_path: sanitized_name,
+            expected_md5: file.md5,
+            expected_size: file.size,
+            expected_mtime: file.mtime,
+        });
+    }
 
     Ok((tasks, sanitized_count))
 }
@@ -412,5 +448,45 @@ mod tests {
         let result = files_to_download(files, "item1_files.xml");
 
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn build_download_tasks_skips_entries_with_empty_names() {
+        let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
+        let files = vec![
+            xml_file("", Some(10)),
+            xml_file("//", None),
+            xml_file("ok.bin", Some(5)),
+        ];
+        let (tasks, sanitized) = build_download_tasks(files, &base).expect("tasks must build");
+
+        assert_eq!(sanitized, 0);
+        assert_eq!(
+            tasks.len(),
+            1,
+            "empty-name entries must be skipped, not joined to the base URL"
+        );
+        assert_eq!(tasks[0].file_path, "ok.bin");
+        assert_eq!(tasks[0].url, "https://archive.org/download/item1/ok.bin");
+    }
+
+    #[test]
+    fn build_download_tasks_skips_sanitized_name_collisions() {
+        let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
+        // Both names sanitize to "file_1.mp4"; the later entry must not
+        // overwrite the earlier file.
+        let files = vec![
+            xml_file("file:1.mp4", Some(1)),
+            xml_file("file_1.mp4", Some(2)),
+        ];
+        let (tasks, sanitized) = build_download_tasks(files, &base).expect("tasks must build");
+
+        assert_eq!(sanitized, 1, "only the colon name is sanitized");
+        assert_eq!(tasks.len(), 1, "the colliding entry must be skipped");
+        assert_eq!(
+            tasks[0].url,
+            "https://archive.org/download/item1/file%3A1.mp4"
+        );
+        assert_eq!(tasks[0].file_path, "file_1.mp4");
     }
 }

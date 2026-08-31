@@ -892,7 +892,8 @@ enum DownloadOutcome {
 }
 
 /// Runs the download+verification attempts for one file, re-downloading from
-/// scratch after a failed verification or a rejected resume offset.
+/// scratch after a failed verification or a rejected resume offset (a `.part`
+/// that already holds the whole file is verified in place instead).
 async fn run_download_attempts(
     client: &Client,
     url: &str,
@@ -956,8 +957,27 @@ async fn run_download_attempts(
             }
             Err(e) if matches!(e, IaGetError::Interrupted) => return Err(e),
             // The server rejected our offset: the .part file is not a valid
-            // prefix, so it must not be kept if the attempts end here
+            // prefix, so it must not be kept if the attempts end here. One
+            // exception: a 416 for `bytes=N-` also fires when the part
+            // already holds the whole file (a previous run was interrupted
+            // after the body finished but before verification) — a part of
+            // exactly the expected size that also hashes correctly is
+            // verified in place instead of being discarded and re-downloaded.
             Err(IaGetError::RangeNotSatisfiable) => {
+                let complete_part = expected_size.is_some_and(|expected| {
+                    file.metadata().is_ok_and(|meta| meta.len() == expected)
+                });
+                if complete_part && expected_md5.is_some() {
+                    println!(
+                        "{} {}       {} the .part file is already complete, verifying it in place",
+                        branch_glyph(),
+                        "Resume".white(),
+                        "↻".green().bold()
+                    );
+                    if verify_downloaded_file(part_path, expected_md5, expected_size, running)? {
+                        break DownloadOutcome::Verified { server_mtime: None };
+                    }
+                }
                 last_reason = IaGetError::RangeNotSatisfiable.to_string();
                 discard_part = true;
             }
@@ -1007,7 +1027,9 @@ where
                 "\n{} Download interrupted. Run the command again to resume remaining files.",
                 "✘".red().bold()
             );
-            break;
+            // An interrupted batch is not a successful one: fail with a
+            // non-zero exit exactly like an interrupt mid-file does.
+            return Err(IaGetError::Interrupted);
         }
 
         let outcome = process_file(
@@ -1825,6 +1847,98 @@ mod tests {
         assert!(
             blocked.exists(),
             "unremovable stale file must stay in place"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn complete_part_416_is_verified_in_place() {
+        // A .part that already holds the whole file (a previous run was
+        // interrupted after the body finished but before verification) must
+        // be verified in place, not discarded and re-downloaded.
+        let full = b"complete-part-content";
+        let md5 = format!("{:x}", md5::compute(full));
+
+        let (server, dir) = file_server(
+            "complete_part_416",
+            VecDeque::from(vec![MockResponse::new(416, MockBody::Full(vec![]))]),
+            MockResponse::new(200, MockBody::Full(full.to_vec())),
+        );
+        let part = dir.join("file.bin.part");
+        fs::write(&part, full).unwrap();
+        let outcome = run_download_attempts(
+            &Client::new(),
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            &test_running(),
+            None,
+            Some(&md5),
+            Some(full.len() as u64),
+        )
+        .await
+        .expect("a complete .part must verify in place");
+
+        assert!(matches!(outcome, DownloadOutcome::Verified { .. }));
+        assert_eq!(
+            server.request_count(),
+            1,
+            "a complete .part must not trigger a re-download"
+        );
+        assert_eq!(server.ranges(), vec![Some(full.len() as u64)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn complete_part_416_with_wrong_hash_is_redownloaded() {
+        // A complete .part whose content does not match the expected hash is
+        // still discarded and re-downloaded: size alone is not proof.
+        let stale = b"stale-content-0001";
+        let fresh = b"fresh-content-0001"; // same length, different content
+        let md5 = format!("{:x}", md5::compute(fresh));
+
+        let (server, dir) = file_server(
+            "complete_part_416_stale",
+            VecDeque::from(vec![MockResponse::new(416, MockBody::Full(vec![]))]),
+            MockResponse::new(200, MockBody::Full(fresh.to_vec())),
+        );
+        let part = dir.join("file.bin.part");
+        fs::write(&part, stale).unwrap();
+        let outcome = run_download_attempts(
+            &Client::new(),
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            &test_running(),
+            None,
+            Some(&md5),
+            Some(fresh.len() as u64),
+        )
+        .await
+        .expect("the re-download must succeed");
+
+        assert!(matches!(outcome, DownloadOutcome::Verified { .. }));
+        assert_eq!(
+            server.request_count(),
+            2,
+            "a complete .part with a wrong hash must be re-downloaded"
+        );
+        assert_eq!(server.ranges(), vec![Some(stale.len() as u64), None]);
+        assert_eq!(fs::read(&part).unwrap(), fresh);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn interrupt_between_files_is_an_error() {
+        // An interrupt detected between files must not exit as a success.
+        let (_server, dir, files, _) = missing_and_ok_batch("interrupt_between_files");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let total = files.len();
+        let err =
+            download_files_with_signal(&Client::new(), files, total, 1, None, false, &stopped)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err, IaGetError::Interrupted),
+            "an interrupted batch must fail, got {err:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }

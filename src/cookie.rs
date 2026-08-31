@@ -21,13 +21,27 @@ struct NetscapeCookie {
 }
 
 /// Builds an HTTP Cookie header value from a raw cookie string or cookies.txt path.
+///
+/// The input is only treated as a file when it names an existing file that
+/// either holds at least one recognizable Netscape cookie line or does not
+/// look like a raw cookie pair (no `=`): a raw cookie string that merely
+/// collides with a filename in the working directory is kept as a cookie
+/// string instead of being silently swallowed as an empty cookies.txt.
 pub fn cookie_header_from_input(input: &str, url: &Url) -> Result<String> {
     if Path::new(input).is_file() {
         let cookie_file = fs::read_to_string(input)?;
-        cookie_header_from_netscape_file(&cookie_file, url)
-    } else {
-        Ok(input.trim().to_string())
+        if has_netscape_cookie_line(&cookie_file) || !input.contains('=') {
+            return cookie_header_from_netscape_file(&cookie_file, url);
+        }
     }
+    Ok(input.trim().to_string())
+}
+
+/// True when the content holds at least one recognizable Netscape cookies.txt line.
+fn has_netscape_cookie_line(content: &str) -> bool {
+    content
+        .lines()
+        .any(|line| parse_netscape_cookie(line).is_some())
 }
 
 fn parse_netscape_cookie(line: &str) -> Option<NetscapeCookie> {
@@ -205,5 +219,51 @@ archive.org\tFALSE\t/\tFALSE\t2145916800\tcurrent\tvalue\n";
             .unwrap(),
             "current=value"
         );
+    }
+
+    fn unique_temp_file(name: &str, content: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "{name}-{}-{}.txt",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, content).expect("failed to write temp cookie file");
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn cookie_header_file_with_cookie_lines_is_parsed() {
+        // A real cookies.txt (even when the path itself contains '=') is
+        // still parsed, not treated as a raw cookie string.
+        let input = unique_temp_file(
+            "ia-get-cookie-review=1",
+            "archive.org\tFALSE\t/\tFALSE\t2145916800\tsession\tvalue\n",
+        );
+
+        let header = cookie_header_from_input(&input, &cookie_test_url("/download/item/f.xml"))
+            .expect("cookies.txt must parse");
+        assert_eq!(header, "session=value");
+
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn cookie_header_colliding_filename_is_kept_as_raw_string() {
+        // A file that holds no recognizable cookie line must not swallow a
+        // cookie-looking input: the raw cookie string wins.
+        let input = unique_temp_file("ia-get-cookie-collide=1", "not a cookie file\n");
+
+        let header = cookie_header_from_input(&input, &cookie_test_url("/download/item/f.xml"))
+            .expect("input must be kept as a cookie string");
+        assert_eq!(
+            header,
+            input.trim(),
+            "the cookie-looking input must survive"
+        );
+
+        let _ = fs::remove_file(&input);
     }
 }

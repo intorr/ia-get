@@ -73,7 +73,7 @@ So I co-authored `ia-get` to automate the download process.
 ### Sharing is caring 🤝
 
 You can use `ia-get` to download files from archive.org, including all the metadata and the `.torrent` file, if there is one.
-You can the start seeding the torrent using a pristine copy of the archive, and a complete file set.
+You can start seeding the torrent using a pristine copy of the archive, and a complete file set.
 
 # Demo 🧑‍💻
 
