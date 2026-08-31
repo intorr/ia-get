@@ -49,14 +49,10 @@ static URL_REGEX: LazyLock<Regex> =
 /// assert!(validate_archive_url("https://example.com/invalid").is_err());
 /// ```
 pub fn validate_archive_url(url: &str) -> Result<()> {
+    // The anchored pattern already requires a non-empty identifier right
+    // after "details/" and nothing after it.
     if URL_REGEX.is_match(url) {
-        // Further check: ensure there's an identifier after "details/"
-        // and that the identifier is not empty.
-        if let Some(path_segment) = url.split("/details/").nth(1) {
-            if !path_segment.trim_end_matches('/').is_empty() {
-                return Ok(());
-            }
-        }
+        return Ok(());
     }
     Err(IaGetError::UrlFormat(url.to_string()))
 }
@@ -335,7 +331,8 @@ fn sanitize_component(component: &str) -> (String, bool) {
 /// - Both: leading/trailing spaces, trailing dots in path components
 ///
 /// Also handles Windows reserved names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
-/// by appending an underscore.
+/// by appending an underscore, and drops `.`/`..` path components: kept,
+/// they would let a server-controlled name escape the working directory.
 ///
 /// # Arguments
 /// * `filename` - The original filename (may include path components separated by `/`)
@@ -362,17 +359,22 @@ fn sanitize_component(component: &str) -> (String, bool) {
 pub fn sanitize_filename(filename: &str) -> (String, bool) {
     // Process each path component separately to preserve directory structure
     let components: Vec<&str> = filename.split('/').collect();
-    let non_empty_count = components.iter().filter(|c| !c.is_empty()).count();
+    // "." and ".." are dropped like empty components: kept, they would let
+    // a name escape the working directory
+    let kept_count = components
+        .iter()
+        .filter(|c| !c.is_empty() && **c != "." && **c != "..")
+        .count();
 
-    // Dropped slashes (leading, trailing, doubled) count as a modification,
+    // Dropped components (empty, "." or "..") count as a modification,
     // except for an empty input
-    let mut was_modified = !filename.is_empty() && non_empty_count != components.len();
+    let mut was_modified = !filename.is_empty() && kept_count != components.len();
 
     let mut result = String::with_capacity(filename.len());
     let mut emitted = 0;
 
     for component in &components {
-        if component.is_empty() {
+        if component.is_empty() || *component == "." || *component == ".." {
             continue;
         }
 
@@ -496,6 +498,23 @@ mod tests {
         let (result, modified) = sanitize_filename("folder/ spaces /file.txt");
         assert_eq!(result, "folder/spaces/file.txt");
         assert!(modified);
+    }
+
+    #[test]
+    fn test_sanitize_drops_dot_segments() {
+        // "." and ".." must not survive: kept, a server-controlled name
+        // could escape the working directory.
+        let (result, modified) = sanitize_filename("../../etc/passwd");
+        assert_eq!(result, "etc/passwd");
+        assert!(modified);
+
+        let (result, modified) = sanitize_filename("a/./b/c.txt");
+        assert_eq!(result, "a/b/c.txt");
+        assert!(modified);
+
+        let (result, modified) = sanitize_filename("a/b.txt");
+        assert_eq!(result, "a/b.txt");
+        assert!(!modified);
     }
 
     #[test]

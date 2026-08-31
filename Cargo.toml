@@ -14,7 +14,11 @@ edition = "2021"
 [dependencies]
 httpdate = "1.0.2"
 indicatif = "0.18.4"
-md5 = "0.8.0"
+# RustCrypto's md-5 (with the digest trait for incremental hashing): the old
+# unmaintained md5 crate is replaced; the hash is used for integrity checks
+# only, never for security.
+md-5 = "0.11.0"
+digest = "0.11.3"
 regex = "1.12.4"
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls"] }
 # Only the features ia-get itself uses: the multi-thread runtime for

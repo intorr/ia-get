@@ -81,6 +81,7 @@ struct ServerState {
     request_count: usize,
     methods: Vec<String>,
     ranges: Vec<Option<u64>>,
+    cookies: Vec<Option<String>>,
 }
 
 /// A mock HTTP server on 127.0.0.1 that serves scripted responses per path
@@ -106,6 +107,7 @@ impl MockServer {
             request_count: 0,
             methods: Vec::new(),
             ranges: Vec::new(),
+            cookies: Vec::new(),
         }));
         let handler_state = state.clone();
         thread::spawn(move || {
@@ -137,6 +139,12 @@ impl MockServer {
     /// Parsed `Range` header start offsets, in order (`None` when absent)
     pub fn ranges(&self) -> Vec<Option<u64>> {
         self.state.lock().unwrap().ranges.clone()
+    }
+
+    /// `Cookie` header values of the received requests, in order
+    /// (`None` when the header was absent)
+    pub fn cookies(&self) -> Vec<Option<String>> {
+        self.state.lock().unwrap().cookies.clone()
     }
 }
 
@@ -183,12 +191,20 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
                 .parse::<u64>()
                 .ok()
         });
+    let cookie = head
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("cookie:"))
+        .and_then(|line| {
+            line.split_once(':')
+                .map(|(_, value)| value.trim().to_string())
+        });
 
     let response = {
         let mut st = state.lock().unwrap();
         st.request_count += 1;
         st.methods.push(method.clone());
         st.ranges.push(range);
+        st.cookies.push(cookie);
         st.scripts
             .get_mut(&path)
             .and_then(|q| q.pop_front())

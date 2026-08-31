@@ -34,7 +34,8 @@ struct NetscapeCookie {
 /// printed so an unauthenticated-looking 401/403 has an obvious cause.
 pub fn cookie_header_from_input(input: &str, url: &Url) -> Result<String> {
     if Path::new(input).is_file() {
-        let cookie_file = fs::read_to_string(input)?;
+        let cookie_file =
+            fs::read_to_string(input).map_err(|e| crate::error::io_error_with_path(input, e))?;
         if has_netscape_cookie_line(&cookie_file) || !input.contains('=') {
             let header = cookie_header_from_netscape_file(&cookie_file, url)?;
             if header.is_empty() {
@@ -135,14 +136,31 @@ pub fn cookie_header_from_netscape_file(content: &str, url: &Url) -> Result<Stri
         })?
         .as_secs();
 
-    let cookies = content
+    // A cookie whose name or value cannot become an HTTP header value
+    // (a control character or DEL, e.g. from a corrupted browser export)
+    // is dropped with a warning instead of failing the whole run: the
+    // remaining cookies still authenticate the request.
+    let mut header_parts: Vec<String> = Vec::new();
+    for cookie in content
         .lines()
         .filter_map(parse_netscape_cookie)
         .filter(|cookie| cookie_applies_to_url(cookie, url, now))
-        .map(|cookie| format!("{}={}", cookie.name, cookie.value))
-        .collect::<Vec<_>>();
+    {
+        let pair = format!("{}={}", cookie.name, cookie.value);
+        match HeaderValue::from_str(&pair) {
+            Ok(_) => header_parts.push(pair),
+            Err(_) => {
+                println!(
+                    "{} {} {}: the cookie value cannot be encoded as an HTTP header",
+                    "⚠".yellow().bold(),
+                    "Skipped cookie".yellow(),
+                    cookie.name.dimmed()
+                );
+            }
+        }
+    }
 
-    Ok(cookies.join("; "))
+    Ok(header_parts.join("; "))
 }
 
 /// Resolves the `--cookies` CLI input (raw string or cookies.txt path) into
@@ -222,6 +240,24 @@ archive.org\tFALSE\t/download/private\tFALSE\t2145916800\tprivate-only\tsecret\n
             )
             .unwrap(),
             "download-root=yes; private-only=secret"
+        );
+    }
+
+    #[test]
+    fn cookie_header_skips_non_encodable_cookie_and_keeps_others() {
+        // A control character cannot become an HTTP header value; the
+        // cookie must be dropped with a warning, not fail the whole run.
+        let cookies = "archive.org\tFALSE\t/\tFALSE\t2145916800\tsession\tabc123\n\
+archive.org\tFALSE\t/\tFALSE\t2145916800\tbinary\tbad\x01value\n";
+
+        assert_eq!(
+            cookie_header_from_netscape_file(
+                cookies,
+                &cookie_test_url("/download/item/item_files.xml")
+            )
+            .unwrap(),
+            "session=abc123",
+            "the encodable cookie must survive"
         );
     }
 

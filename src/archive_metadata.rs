@@ -52,20 +52,42 @@ pub struct XmlFile {
     pub original: Option<String>,
 }
 
-/// Builds a truncated preview of XML content for error messages: at most
-/// `XML_DEBUG_TRUNCATE_LEN` bytes, stepped back to a char boundary when a
-/// multi-byte character straddles the cut, and suffixed with `...`.
-fn content_preview(xml_content: &str) -> String {
-    if xml_content.len() <= XML_DEBUG_TRUNCATE_LEN {
-        return xml_content.to_string();
-    }
+/// Extracts the 1-based line number from a `serde-xml-rs` error, whose
+/// display carries the position as `Reader: line:column message`.
+///
+/// Returns `None` when the parser reported no position; the preview then
+/// falls back to the document head.
+fn parse_error_line(error: &str) -> Option<usize> {
+    let rest = error.strip_prefix("Reader: ")?;
+    let position = rest.split_once(' ')?.0;
+    let line = position.split_once(':')?.0;
+    line.parse().ok().filter(|line: &usize| *line >= 1)
+}
 
-    let mut end = XML_DEBUG_TRUNCATE_LEN;
-    while !xml_content.is_char_boundary(end) {
-        end -= 1;
-    }
+/// Builds the numbered line preview shown when a parse fails: the few
+/// lines around the reported error line (marked with `»`) when the
+/// parser names one, otherwise the document head.
+///
+/// Each line is capped at `XML_DEBUG_TRUNCATE_LEN` characters so a
+/// minified multi-megabyte line cannot blow up the error message.
+fn error_context(xml_content: &str, line: Option<usize>) -> String {
+    let lines: Vec<&str> = xml_content.lines().collect();
+    let last_line = lines.len().max(1);
+    let anchor = line.unwrap_or(1).min(last_line);
+    let first = anchor.saturating_sub(3).max(1);
+    let last = (first + 5).min(last_line);
 
-    format!("{}...", &xml_content[..end])
+    let mut out = String::new();
+    for number in first..=last {
+        let raw = lines.get(number - 1).copied().unwrap_or("").trim_end();
+        let mut end = XML_DEBUG_TRUNCATE_LEN.min(raw.len());
+        while end < raw.len() && !raw.is_char_boundary(end) {
+            end -= 1;
+        }
+        let marker = if number == anchor { "»" } else { " " };
+        out.push_str(&format!("{marker}{number:>6}  {}\n", &raw[..end]));
+    }
+    out
 }
 
 /// Parses XML content into XmlFiles structure with improved error context
@@ -75,13 +97,15 @@ fn content_preview(xml_content: &str) -> String {
 ///
 /// # Returns
 /// * `Ok(XmlFiles)` if parsing succeeds
-/// * `Err(IaGetError)` with context if parsing fails
+/// * `Err(IaGetError)` naming the failing line and showing the lines
+///   around it, so a late entry in a large document is locatable
 pub fn parse_xml_files(xml_content: &str) -> Result<XmlFiles> {
     from_str(xml_content).map_err(|e| {
+        let message = e.to_string();
         IaGetError::XmlParsing(format!(
-            "Failed to parse _files.xml metadata: {}. Content preview: {}",
-            e,
-            content_preview(xml_content)
+            "Failed to parse _files.xml metadata: {}. Context:\n{}",
+            message,
+            error_context(xml_content, parse_error_line(&message))
         ))
     })
 }
@@ -98,7 +122,17 @@ pub fn save_xml_metadata(
     content: &str,
     last_modified: Option<SystemTime>,
 ) -> Result<()> {
-    std::fs::write(path, content)?;
+    // Refuse to write through a pre-planted symlink named "<id>_files.xml":
+    // fs::write would silently truncate whatever the link points at.
+    if let Ok(existing) = std::fs::symlink_metadata(path) {
+        if existing.file_type().is_symlink() {
+            return Err(IaGetError::FileSystem {
+                detail: format!("refusing to overwrite a symlink: {}", path.display()),
+                source: None,
+            });
+        }
+    }
+    std::fs::write(path, content).map_err(|e| crate::error::io_error_with_path(path, e))?;
 
     if let Some(target) = last_modified {
         sync_file_mtime(path, target);
@@ -169,6 +203,12 @@ pub fn get_xml_url(original_url: &str) -> String {
 pub fn encode_download_path(name: &str) -> String {
     let mut out = String::new();
     for segment in name.split('/') {
+        // Dot segments would be silently resolved by Url::join (a "../"
+        // name would escape the item directory); drop them up front so
+        // the encoded reference matches what is actually requested.
+        if segment == "." || segment == ".." {
+            continue;
+        }
         if !out.is_empty() {
             out.push('/');
         }
@@ -238,25 +278,30 @@ pub async fn fetch_xml_metadata(
         "⚙".blue(),
         xml_url.bold()
     ));
-    fetch_and_parse_xml(&xml_url, client, spinner, cookie_input).await
+    // The header is scoped to the download URL: every file of the archive
+    // lives under it, so this is the scope the file downloads reuse
+    let download_url = Url::parse(&xml_url)?;
+    let cookie_header = cookie_header_value(cookie_input, &download_url)?;
+    fetch_and_parse_xml(&xml_url, client, spinner, cookie_header.as_ref()).await
 }
 
 /// Fetches, downloads and parses a `_files.xml` document from an explicit URL.
 ///
-/// Split out of `fetch_xml_metadata` so tests can point it at a local mock
-/// server instead of the fixed archive.org download URL.
+/// The `Cookie` header (if any) is precomputed by the caller against the
+/// download URL, so the metadata fetch and the file downloads of one run
+/// share a single header. Split out of `fetch_xml_metadata` so tests can
+/// point it at a local mock server instead of the fixed archive.org download URL.
 pub async fn fetch_and_parse_xml(
     xml_url: &str,
     client: &Client,
     spinner: &ProgressBar,
-    cookie_input: Option<&str>,
+    cookie_header: Option<&HeaderValue>,
 ) -> Result<XmlMetadata> {
     // Parse base URL and fetch XML content
     let base_url = Url::parse(xml_url)?;
-    let cookie_header = cookie_header_value(cookie_input, &base_url)?;
 
     // Check XML URL accessibility
-    if let Err(e) = is_url_accessible(&base_url, client, cookie_header.as_ref()).await {
+    if let Err(e) = is_url_accessible(&base_url, client, cookie_header).await {
         spinner.finish_with_message(format!(
             "{} XML metadata not accessible: {}",
             "✘".red().bold(),
@@ -271,7 +316,7 @@ pub async fn fetch_and_parse_xml(
         "Parsing archive metadata...".bold()
     ));
 
-    let request = with_cookie(client.get(base_url.clone()), cookie_header.as_ref());
+    let request = with_cookie(client.get(base_url.clone()), cookie_header);
 
     // The HEAD check above can pass while the GET still fails (throttling,
     // transient edge errors): surface it as a network error instead of
@@ -286,7 +331,7 @@ pub async fn fetch_and_parse_xml(
     Ok(XmlMetadata {
         files,
         base_url,
-        cookie_header,
+        cookie_header: cookie_header.cloned(),
         content: xml_content,
         last_modified,
     })
@@ -320,24 +365,69 @@ mod tests {
     }
 
     #[test]
-    fn content_preview_keeps_short_content_untouched() {
-        assert_eq!(content_preview("<files/>"), "<files/>");
+    fn parse_error_line_reads_the_parser_position() {
+        assert_eq!(
+            parse_error_line("Reader: 12:34 Unexpected closing tag: a != b"),
+            Some(12)
+        );
+        assert_eq!(parse_error_line("Reader: 1:44 EOF"), Some(1));
+        assert_eq!(parse_error_line("no position here"), None);
     }
 
     #[test]
-    fn content_preview_truncates_long_content() {
-        let xml = format!("<files>{}</files>", "x".repeat(2000));
-        let preview = content_preview(&xml);
-        assert!(preview.ends_with("..."));
-        assert_eq!(preview.len(), XML_DEBUG_TRUNCATE_LEN + 3);
+    fn xml_parse_error_shows_context_around_failing_line() {
+        // 40 filler entries, then a stray closing tag on line 42: the
+        // error must name that line and show its neighbourhood, not the
+        // document head.
+        let filler = (0..40)
+            .map(|i| format!("  <file name=\"filler{i}\"/>"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let xml = format!("<files>\n{filler}\n</strange>\n</files>");
+        let msg = parse_xml_files(&xml).unwrap_err().to_string();
+
+        assert!(msg.contains("42:"), "must name the failing line: {msg}");
+        assert!(
+            msg.contains("»    42"),
+            "the failing line must be marked: {msg}"
+        );
+        assert!(
+            msg.contains("strange"),
+            "the context must include the failing line: {msg}"
+        );
+        assert!(
+            !msg.contains("filler0"),
+            "the context must not start at the document head: {msg}"
+        );
     }
 
     #[test]
-    fn content_preview_steps_back_to_char_boundary() {
-        // 334 CJK chars (3 bytes each): byte 1000 lands mid-character,
-        // so the cut must step back to byte 999
-        let xml = format!("{}{}", "字".repeat(334), "x".repeat(1000));
-        assert_eq!(content_preview(&xml), format!("{}...", "字".repeat(333)));
+    fn error_context_without_position_shows_document_head() {
+        let xml = format!("{}\n<files/>", "x".repeat(100));
+        let ctx = error_context(&xml, None);
+        assert!(ctx.contains(&"x".repeat(100)));
+        assert!(ctx.contains("1"), "head context starts at line 1");
+    }
+
+    #[test]
+    fn error_context_caps_very_long_lines() {
+        // A minified document: one line far beyond the cap. The preview
+        // must stay bounded and cut on a char boundary.
+        let line = "字".repeat(3 * XML_DEBUG_TRUNCATE_LEN);
+        let ctx = error_context(&line, Some(1));
+        assert!(
+            ctx.chars().count() <= XML_DEBUG_TRUNCATE_LEN + 16,
+            "the preview must stay bounded, got {} chars",
+            ctx.chars().count()
+        );
+    }
+
+    #[test]
+    fn error_context_clamps_anchor_past_the_end() {
+        let xml = "<files>\n<file/>\n";
+        let ctx = error_context(xml, Some(999));
+        assert!(ctx.contains("2"), "the anchor must clamp to the last line");
+        assert!(ctx.contains("»"), "the clamped line must be marked");
     }
 
     #[test]
@@ -366,6 +456,27 @@ mod tests {
         save_xml_metadata(&path, "<files/>", None).unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "<files/>");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_xml_metadata_refuses_to_write_through_symlink() {
+        // A symlink named "<id>_files.xml" must not have its target
+        // silently truncated by the metadata save.
+        let dir = temp_dir_for("save_xml_symlink");
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "do not touch").unwrap();
+        let link = dir.join("item1_files.xml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = save_xml_metadata(&link, "<files/>", None).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "do not touch",
+            "the link target must be left untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -423,6 +534,20 @@ mod tests {
         assert_eq!(
             encode_download_path("plain-file_v2.0.tar.gz"),
             "plain-file_v2.0.tar.gz"
+        );
+    }
+
+    #[test]
+    fn encode_download_path_drops_dot_segments() {
+        // A "../" entry must not escape the item directory once Url::join
+        // removes dot segments; dropping them up front keeps the reference
+        // relative and honest.
+        assert_eq!(encode_download_path("../outside.mp4"), "outside.mp4");
+        assert_eq!(encode_download_path("a/./b.mp4"), "a/b.mp4");
+        assert_eq!(
+            encode_download_path(".."),
+            "",
+            "a dot-segment-only name encodes to nothing and is skipped"
         );
     }
 
@@ -523,5 +648,37 @@ mod tests {
         assert_eq!(meta.files.files.len(), 2);
         assert_eq!(meta.files.files[1].name, "scan.jpg");
         assert_eq!(meta.content, xml);
+    }
+
+    #[tokio::test]
+    async fn precomputed_cookie_header_reaches_the_xml_fetch() {
+        let xml = "<files><file name=\"item1_files.xml\"/></files>";
+        let mut scripts = HashMap::new();
+        scripts.insert(
+            "/download/item1/item1_files.xml".to_string(),
+            VecDeque::from(vec![
+                MockResponse::new(200, MockBody::Full(vec![])), // HEAD check
+                MockResponse::new(200, MockBody::Full(xml.as_bytes().to_vec())),
+            ]),
+        );
+        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+        let url = server.url("/download/item1/item1_files.xml");
+        let client = Client::new();
+        let spinner = create_spinner("mock");
+        let header = HeaderValue::from_static("session=abc123");
+
+        let meta = fetch_and_parse_xml(&url, &client, &spinner, Some(&header))
+            .await
+            .expect("metadata fetch should succeed");
+
+        assert_eq!(meta.cookie_header.as_ref(), Some(&header));
+        assert_eq!(
+            server.cookies(),
+            vec![
+                Some("session=abc123".to_string()),
+                Some("session=abc123".to_string()),
+            ],
+            "both the HEAD check and the GET must carry the precomputed header"
+        );
     }
 }

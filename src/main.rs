@@ -8,7 +8,7 @@
 use clap::Parser;
 use colored::*;
 use ia_get::archive_metadata::{
-    encode_download_path, fetch_xml_metadata, is_url_accessible, save_xml_metadata,
+    encode_download_path, fetch_and_parse_xml, get_xml_url, is_url_accessible, save_xml_metadata,
     xml_file_name_of, XmlFile, XmlFiles, XmlMetadata,
 };
 use ia_get::constants::USER_AGENT;
@@ -135,6 +135,12 @@ fn build_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<(Vec<Down
     // Normalised local path -> original name, so a collision can be
     // reported with both sides of the clash.
     let mut taken_paths: HashMap<String, String> = HashMap::new();
+
+    // The locally saved "<id>_files.xml" occupies the item root too: an
+    // entry that sanitizes to that name (differing only by case on
+    // case-insensitive filesystems) would silently overwrite the metadata.
+    let xml_file_name = xml_file_name_of(base_url);
+    taken_paths.insert(local_path_key(xml_file_name), xml_file_name.to_string());
 
     for file in files {
         // Percent-encode the name first so '?' / '#' / '%' characters in
@@ -301,20 +307,31 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Validate URL format using consolidated function
     if let Err(e) = validate_archive_url(&cli.url) {
         spinner.finish_with_message(format!("{} {}", "✘".red().bold(), e));
-        return Err(e.into());
+        // The error is already on screen: exit without letting the runtime
+        // print it a second time.
+        std::process::exit(1);
     }
 
     let details_url = Url::parse(&cli.url)?;
-    let cookie_header = cookie_header_value(cli.cookies.as_deref(), &details_url)?;
+    // The cookie header is computed once against the download URL — the
+    // scope every metadata and file request uses — and reused for the
+    // details pre-check, so a path-scoped cookie never leaves the pre-check
+    // unauthenticated while the real requests carry it.
+    let xml_url = get_xml_url(&cli.url);
+    let download_url = Url::parse(&xml_url)?;
+    let cookie_header = cookie_header_value(cli.cookies.as_deref(), &download_url)?;
 
     // Check URL accessibility
     if let Err(e) = is_url_accessible(&details_url, &client, cookie_header.as_ref()).await {
         spinner.finish_with_message(format!(
-            "{} Archive.org URL not accessible: {}",
+            "{} Archive.org URL not accessible: {} ({})",
             "✘".red().bold(),
-            cli.url.bold()
+            cli.url.bold(),
+            e.to_string().dimmed()
         ));
-        return Err(e.into()); // Propagate error
+        // The error is already on screen: exit without letting the runtime
+        // print it a second time.
+        std::process::exit(1);
     }
 
     // Fetch and parse XML metadata in one operation
@@ -324,7 +341,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         cookie_header,
         content,
         last_modified,
-    } = fetch_xml_metadata(&cli.url, &client, &spinner, cli.cookies.as_deref()).await?;
+    } = fetch_and_parse_xml(&xml_url, &client, &spinner, cookie_header.as_ref()).await?;
 
     // If requested, list parsed filenames and exit: a read-only preview,
     // nothing is written to the working directory
@@ -538,6 +555,34 @@ mod tests {
         {
             assert_eq!(tasks.len(), 1, "the case-colliding entry must be skipped");
             assert_eq!(tasks[0].file_path, "Report.PDF");
+        }
+    }
+
+    #[test]
+    fn build_download_tasks_protects_saved_xml_name() {
+        // "<id>_files.xml" is saved locally as file #1: an entry that
+        // sanitizes to the same name must not overwrite the metadata.
+        let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
+        let files = vec![
+            xml_file("Item1_Files.XML", Some(1)),
+            xml_file("scan.jpg", Some(2)),
+        ];
+        let (tasks, _) = build_download_tasks(files, &base).expect("tasks must build");
+
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            tasks.len(),
+            2,
+            "differing case stays distinct on case-sensitive filesystems"
+        );
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(
+                tasks.len(),
+                1,
+                "the xml-name-colliding entry must be skipped"
+            );
+            assert_eq!(tasks[0].file_path, "scan.jpg");
         }
     }
 

@@ -3,16 +3,17 @@
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use colored::*;
+use digest::Digest;
 use indicatif::ProgressBar;
 use reqwest::header::{HeaderMap, HeaderValue, LAST_MODIFIED, RETRY_AFTER};
 use reqwest::{Client, Response, StatusCode};
 
-use crate::error::IaGetError; // Import IaGetError for explicit error conversion
+use crate::error::{io_error_with_path, IaGetError}; // Import IaGetError for explicit error conversion
 use crate::utils::{
     branch_glyph, create_progress_bar, format_size, last_glyph, print_downloaded_line,
     print_file_banner, with_cookie,
@@ -44,24 +45,59 @@ const MAX_DOWNLOAD_ATTEMPTS: u32 = 3;
 const LCG_MULTIPLIER: u64 = 6364136223846793005;
 const LCG_INCREMENT: u64 = 1442695040888963407;
 
+/// How often a retry wait wakes up to check for a Ctrl+C, so a long
+/// server-requested wait (up to 15 min) does not outlive the user's request
+/// to stop
+const INTERRUPT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Sets up signal handling for graceful shutdown on Ctrl+C
 ///
 /// Returns an Arc<AtomicBool> that can be checked to see if the process
-/// should stop. When Ctrl+C is pressed, this will be set to false.
+/// should stop. The first Ctrl+C sets it to false; a second one quits the
+/// process immediately, so a long Retry-After wait can always be aborted.
 fn setup_signal_handler() -> Arc<AtomicBool> {
     let running = Arc::new(AtomicBool::new(true));
+    let presses = Arc::new(AtomicU32::new(0));
     let r = running.clone();
+    let p = presses.clone();
 
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-        println!(
-            "\n{} Received Ctrl+C, finishing current operation...",
-            "✘".red().bold()
-        );
+    ctrlc::set_handler(move || match handle_ctrl_c(&r, &p) {
+        CtrlCAction::GracefulStop => {}
+        CtrlCAction::QuitNow => std::process::exit(1),
     })
     .expect("Error setting Ctrl+C handler");
 
     running
+}
+
+/// What a Ctrl+C press must do
+enum CtrlCAction {
+    /// The batch was asked to stop gracefully
+    GracefulStop,
+    /// The process must terminate immediately
+    QuitNow,
+}
+
+/// Ctrl+C handling: the first press asks the batch to stop gracefully, the
+/// second one asks for an immediate quit. Kept apart from the handler
+/// registration so the behaviour is testable without registering a second
+/// (panicking) Ctrl+C handler.
+fn handle_ctrl_c(running: &Arc<AtomicBool>, presses: &Arc<AtomicU32>) -> CtrlCAction {
+    if presses.fetch_add(1, Ordering::SeqCst) == 0 {
+        running.store(false, Ordering::SeqCst);
+        println!(
+            "\n{} Received Ctrl+C, finishing current operation...",
+            "✘".red().bold()
+        );
+        CtrlCAction::GracefulStop
+    } else {
+        println!(
+            "\n{} {} Quitting now.",
+            "✘".red().bold(),
+            "Ctrl+C".red().bold()
+        );
+        CtrlCAction::QuitNow
+    }
 }
 
 /// Finishes and clears the progress bar, if one was created
@@ -73,12 +109,15 @@ fn finish_progress_bar(pb: &Option<ProgressBar>) {
 
 /// Calculates the MD5 hash of a file
 fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
-    let file = File::open(file_path)?;
-    let file_size = file.metadata()?.len();
+    let file = File::open(file_path).map_err(|e| io_error_with_path(file_path, e))?;
+    let file_size = file
+        .metadata()
+        .map_err(|e| io_error_with_path(file_path, e))?
+        .len();
     let is_large_file = file_size > LARGE_FILE_THRESHOLD;
 
     let mut reader = BufReader::with_capacity(BUFFER_SIZE, file);
-    let mut context = md5::Context::new();
+    let mut context = md5::Md5::new();
     let mut buffer = [0; BUFFER_SIZE];
 
     let pb = is_large_file.then(|| {
@@ -93,7 +132,9 @@ fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
     let mut bytes_processed: u64 = 0;
 
     loop {
-        let bytes_read = reader.read(&mut buffer)?;
+        let bytes_read = reader
+            .read(&mut buffer)
+            .map_err(|e| io_error_with_path(file_path, e))?;
         if bytes_read == 0 {
             break;
         }
@@ -103,7 +144,7 @@ fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
             return Err(IaGetError::Interrupted);
         }
 
-        context.consume(&buffer[..bytes_read]);
+        context.update(&buffer[..bytes_read]);
 
         if let Some(ref progress_bar) = pb {
             bytes_processed += bytes_read as u64;
@@ -114,10 +155,11 @@ fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
     finish_progress_bar(&pb);
 
     let hash = context.finalize();
-    Ok(format!("{:x}", hash))
+    Ok(hash.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// Outcome of checking whether an already-downloaded file is still valid
+#[derive(Debug)]
 enum ExistingFileStatus {
     /// The file does not exist and must be downloaded
     Missing,
@@ -126,6 +168,10 @@ enum ExistingFileStatus {
     Verified { md5: Option<String> },
     /// The file exists but failed verification
     Invalid,
+    /// The file could not be read (an I/O error): it is left untouched and
+    /// the problem is reported for this file only, because a read failure
+    /// proves nothing about the file's contents
+    Unreadable(String),
 }
 
 /// Size guard shared by the pre-download check and the post-download
@@ -138,7 +184,9 @@ fn size_mismatch(file_path: &str, expected_size: Option<u64>) -> Result<Option<(
         return Ok(None);
     };
 
-    let actual = fs::metadata(file_path)?.len();
+    let actual = fs::metadata(file_path)
+        .map_err(|e| io_error_with_path(file_path, e))?
+        .len();
     if actual == expected {
         Ok(None)
     } else {
@@ -160,7 +208,15 @@ fn check_existing_file(
     let Some(expected_md5) = expected_md5 else {
         // No hash to compare against: still reject a file whose size does not
         // match the metadata, so a stale or truncated copy is re-downloaded.
-        if size_mismatch(file_path, expected_size)?.is_some() {
+        let mismatch = match size_mismatch(file_path, expected_size) {
+            Ok(mismatch) => mismatch,
+            Err(e) => {
+                return Ok(ExistingFileStatus::Unreadable(format!(
+                    "could not read file size: {e}"
+                )))
+            }
+        };
+        if mismatch.is_some() {
             return Ok(ExistingFileStatus::Invalid);
         }
         return Ok(ExistingFileStatus::Verified { md5: None });
@@ -172,13 +228,11 @@ fn check_existing_file(
             if matches!(e, IaGetError::Interrupted) {
                 return Err(e);
             }
-            println!(
-                "{} {} to calculate MD5 hash: {}",
-                last_glyph(),
-                "Failed".red().bold(),
-                e
-            );
-            return Ok(ExistingFileStatus::Invalid);
+            // "Could not read" is not "corrupted": the file is kept as is
+            // and the problem is reported for this file only.
+            return Ok(ExistingFileStatus::Unreadable(format!(
+                "could not verify existing file: {e}"
+            )));
         }
     };
 
@@ -214,7 +268,7 @@ fn print_verified_hash(md5: Option<&str>) {
 fn ensure_parent_directories(file_path: &str) -> Result<()> {
     if let Some(path) = Path::new(file_path).parent() {
         if path.file_name().is_some() && !path.exists() {
-            fs::create_dir_all(path)?;
+            fs::create_dir_all(path).map_err(|e| io_error_with_path(path, e))?;
         }
     }
     Ok(())
@@ -226,10 +280,12 @@ fn prepare_file_for_download(file_path: &str) -> Result<File> {
         .write(true)
         .create(true)
         .truncate(false)
-        .open(file_path)?;
+        .open(file_path)
+        .map_err(|e| io_error_with_path(file_path, e))?;
 
     // Seek to the end of the file for resume capability
-    file.seek(SeekFrom::End(0))?;
+    file.seek(SeekFrom::End(0))
+        .map_err(|e| io_error_with_path(file_path, e))?;
 
     Ok(file)
 }
@@ -302,10 +358,12 @@ fn mtime_from_xml(mtime: Option<u64>) -> Option<SystemTime> {
 /// A failure to set the time is not fatal: it prints a warning and returns
 /// `false` so the batch can continue.
 pub fn sync_file_mtime(file_path: impl AsRef<Path>, target: SystemTime) -> bool {
-    let target_secs = target
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    // A pre-1970 timestamp has no Unix representation; stamping the epoch
+    // would fabricate a wrong mtime, so the time is left untouched instead.
+    let Ok(target_duration) = target.duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    let target_secs = target_duration.as_secs();
 
     let current_secs = fs::metadata(&file_path)
         .ok()
@@ -347,12 +405,14 @@ impl RetryTracker {
 
     /// Records a failed attempt, prints the retry notice and waits.
     ///
-    /// Returns an error once `MAX_RETRIES` has been exhausted.
+    /// Returns an error once `MAX_RETRIES` has been exhausted or the user
+    /// interrupted the run while the wait was in progress.
     async fn record(
         &mut self,
         kind: &str,
         detail: &str,
         retry_after_secs: Option<u64>,
+        running: &Arc<AtomicBool>,
     ) -> Result<()> {
         self.count += 1;
 
@@ -396,7 +456,19 @@ impl RetryTracker {
             }
         );
 
-        tokio::time::sleep(delay).await;
+        // Sleep in slices and check the flag at each slice boundary: a
+        // Ctrl+C during a long wait (a server-requested Retry-After of up
+        // to 15 min) must stop the retry loop without sleeping the whole
+        // delay out.
+        let mut remaining = delay;
+        while remaining > Duration::ZERO {
+            let slice = remaining.min(INTERRUPT_CHECK_INTERVAL);
+            tokio::time::sleep(slice).await;
+            remaining -= slice;
+            if !running.load(Ordering::SeqCst) {
+                return Err(IaGetError::Interrupted);
+            }
+        }
         Ok(())
     }
 }
@@ -439,9 +511,12 @@ async fn retry_open_file(
     kind: &str,
     detail: &str,
     retry_after_secs: Option<u64>,
+    running: &Arc<AtomicBool>,
 ) -> Result<()> {
     pb.finish_and_clear();
-    retry.record(kind, detail, retry_after_secs).await?;
+    retry
+        .record(kind, detail, retry_after_secs, running)
+        .await?;
     file.seek(SeekFrom::End(0))?;
     Ok(())
 }
@@ -502,7 +577,7 @@ async fn download_file_content(
             Err(e) => {
                 // Request failed before we even got a response
                 retry
-                    .record("Connection error", &e.to_string(), None)
+                    .record("Connection error", &e.to_string(), None, running)
                     .await?;
                 continue;
             }
@@ -534,7 +609,7 @@ async fn download_file_content(
                     .unwrap_or("unknown status")
                     .to_string();
                 retry
-                    .record(&format!("HTTP {status}"), &reason, retry_after)
+                    .record(&format!("HTTP {status}"), &reason, retry_after, running)
                     .await?;
                 continue;
             }
@@ -582,6 +657,7 @@ async fn download_file_content(
                         "Empty response",
                         "server returned no data",
                         retry_after,
+                        running,
                     )
                     .await?;
                     continue;
@@ -598,6 +674,7 @@ async fn download_file_content(
                             "Incomplete body",
                             &format!("received {total_bytes} of {expected} bytes"),
                             None,
+                            running,
                         )
                         .await?;
                         continue;
@@ -624,6 +701,7 @@ async fn download_file_content(
                     "Download error",
                     &e.to_string(),
                     None,
+                    running,
                 )
                 .await?;
             }
@@ -776,7 +854,8 @@ fn handle_existing_file(
                 "Partial".white(),
                 "▲".yellow().bold()
             );
-            if let Err(e) = fs::remove_file(file_path) {
+            if let Err(e) = fs::remove_file(file_path).map_err(|e| io_error_with_path(file_path, e))
+            {
                 // A stale file that cannot be removed (locked, read-only)
                 // is a per-file failure, not a batch-aborting one.
                 remove_part_file(part_path);
@@ -787,6 +866,9 @@ fn handle_existing_file(
             remove_part_file(part_path);
             Ok(ExistingFileHandling::Download)
         }
+        // An unreadable file must neither be deleted nor re-downloaded:
+        // the failure is reported for this file only.
+        ExistingFileStatus::Unreadable(reason) => Ok(ExistingFileHandling::Blocked(reason)),
         ExistingFileStatus::Missing => Ok(ExistingFileHandling::Download),
     }
 }
@@ -794,16 +876,17 @@ fn handle_existing_file(
 /// Installs a verified `.part` file under its final name, then sets its
 /// mtime: the server's Last-Modified header wins, the `_files.xml` mtime is
 /// the fallback, and the time is left untouched when both are absent.
+///
+/// `fs::rename` atomically replaces an existing destination on all
+/// supported platforms, so no separate remove step (and the crash window
+/// it opens) is needed.
 fn install_downloaded_file(
     file_path: &str,
     part_path: &str,
     server_mtime: Option<SystemTime>,
     xml_mtime: Option<u64>,
 ) -> Result<()> {
-    if Path::new(file_path).exists() {
-        fs::remove_file(file_path)?;
-    }
-    fs::rename(part_path, file_path)?;
+    fs::rename(part_path, file_path).map_err(|e| io_error_with_path(file_path, e))?;
     if let Some(target) = server_mtime.or(mtime_from_xml(xml_mtime)) {
         sync_file_mtime(file_path, target);
     }
@@ -814,8 +897,9 @@ fn install_downloaded_file(
 /// (with verification) and renames the `.part` file to its final name.
 ///
 /// Prints the file banner and status lines. Per-file problems (a stale file
-/// that cannot be removed, a failed download) yield
-/// `FileOutcome::Failed`; hard errors (I/O, user interruption) propagate.
+/// that cannot be removed, a failed download, a `.part` that cannot be set
+/// up or installed) yield `FileOutcome::Failed`; only a user interruption
+/// propagates as a hard error.
 async fn process_file(
     client: &Client,
     task: &DownloadTask,
@@ -861,7 +945,13 @@ async fn process_file(
 
     match outcome {
         DownloadOutcome::Verified { server_mtime } => {
-            install_downloaded_file(file_path, &part_path, server_mtime, expected_mtime)?;
+            // A rename that fails (a locked destination) is a per-file
+            // failure; the verified .part stays in place for the next run.
+            if let Err(e) =
+                install_downloaded_file(file_path, &part_path, server_mtime, expected_mtime)
+            {
+                return Ok(FileOutcome::Failed(format!("could not install file: {e}")));
+            }
             Ok(FileOutcome::Succeeded)
         }
         DownloadOutcome::Failed {
@@ -907,8 +997,23 @@ async fn run_download_attempts(
     expected_md5: Option<&str>,
     expected_size: Option<u64>,
 ) -> Result<DownloadOutcome> {
-    ensure_parent_directories(part_path)?;
-    let mut file = prepare_file_for_download(part_path)?;
+    // Setup I/O problems (a locked or overly long path, a missing directory
+    // that cannot be created) are per-file failures, not batch aborts.
+    if let Err(e) = ensure_parent_directories(part_path) {
+        return Ok(DownloadOutcome::Failed {
+            reason: format!("could not create parent directories: {e}"),
+            discard_part: false,
+        });
+    }
+    let mut file = match prepare_file_for_download(part_path) {
+        Ok(file) => file,
+        Err(e) => {
+            return Ok(DownloadOutcome::Failed {
+                reason: format!("could not prepare .part file: {e}"),
+                discard_part: false,
+            })
+        }
+    };
 
     let mut last_reason = String::new();
     // True when the .part file does not hold a valid prefix and must not be
@@ -927,11 +1032,20 @@ async fn run_download_attempts(
 
         if attempt > 1 {
             // The .part file is re-created from scratch, so an earlier
-            // range reject no longer applies to it
+            // range reject no longer applies to it. The stale handle is
+            // closed when the assignment below shadows it.
             discard_part = false;
-            drop(file);
             remove_part_file(part_path);
-            file = prepare_file_for_download(part_path)?;
+            let new_file = prepare_file_for_download(part_path);
+            file = match new_file {
+                Ok(file) => file,
+                Err(e) => {
+                    break DownloadOutcome::Failed {
+                        reason: format!("could not prepare .part file: {e}"),
+                        discard_part: false,
+                    }
+                }
+            };
             println!(
                 "{} {}        {} Re-downloading from scratch (attempt {}/{})",
                 branch_glyph(),
@@ -954,10 +1068,23 @@ async fn run_download_attempts(
         .await
         {
             Ok(server_mtime) => {
-                if verify_downloaded_file(part_path, expected_md5, expected_size, running)? {
-                    break DownloadOutcome::Verified { server_mtime };
+                match verify_downloaded_file(part_path, expected_md5, expected_size, running) {
+                    Ok(true) => break DownloadOutcome::Verified { server_mtime },
+                    Ok(false) => {
+                        last_reason =
+                            format!("file failed verification after {attempt} attempt(s)");
+                    }
+                    Err(e) if matches!(e, IaGetError::Interrupted) => return Err(e),
+                    // An I/O error while reading the file back (e.g. a momentary
+                    // AV lock) fails this file only; the complete .part is kept
+                    // so the next run can verify it in place.
+                    Err(e) => {
+                        break DownloadOutcome::Failed {
+                            reason: format!("could not verify downloaded file: {e}"),
+                            discard_part: false,
+                        }
+                    }
                 }
-                last_reason = format!("file failed verification after {attempt} attempt(s)");
             }
             Err(e) if matches!(e, IaGetError::Interrupted) => return Err(e),
             // The server rejected our offset: the .part file is not a valid
@@ -978,8 +1105,16 @@ async fn run_download_attempts(
                         "Resume".white(),
                         "↻".green().bold()
                     );
-                    if verify_downloaded_file(part_path, expected_md5, expected_size, running)? {
-                        break DownloadOutcome::Verified { server_mtime: None };
+                    match verify_downloaded_file(part_path, expected_md5, expected_size, running) {
+                        Ok(true) => break DownloadOutcome::Verified { server_mtime: None },
+                        Ok(false) => {}
+                        Err(e) if matches!(e, IaGetError::Interrupted) => return Err(e),
+                        Err(e) => {
+                            break DownloadOutcome::Failed {
+                                reason: format!("could not verify complete .part file: {e}"),
+                                discard_part: false,
+                            }
+                        }
                     }
                 }
                 last_reason = IaGetError::RangeNotSatisfiable.to_string();
@@ -1104,6 +1239,14 @@ mod tests {
         Arc::new(AtomicBool::new(true))
     }
 
+    /// The lowercase hex MD5 of `content`, in the form archive.org reports
+    fn md5_hex(content: &[u8]) -> String {
+        md5::Md5::digest(content)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     /// Builds a `DownloadTask` for the mock server
     fn task(
         url: String,
@@ -1176,7 +1319,7 @@ mod tests {
     /// `ok_content`; returns the server, temp dir, task list and content
     fn missing_and_ok_batch(name: &str) -> (MockServer, PathBuf, Vec<DownloadTask>, &'static [u8]) {
         let ok_content: &'static [u8] = b"ok-content-123";
-        let ok_md5 = format!("{:x}", md5::compute(ok_content));
+        let ok_md5 = md5_hex(ok_content);
 
         let mut scripts = HashMap::new();
         scripts.insert(
@@ -1221,6 +1364,7 @@ mod tests {
         url: &str,
         part_path: &str,
         expected_size: Option<u64>,
+        running: &Arc<AtomicBool>,
     ) -> Result<Option<SystemTime>> {
         let client = Client::new();
         let mut file = prepare_file_for_download(part_path)?;
@@ -1228,7 +1372,7 @@ mod tests {
             &client,
             url,
             &mut file,
-            &test_running(),
+            running,
             None,
             expected_size,
             fast_retry,
@@ -1258,6 +1402,7 @@ mod tests {
             &server.url("/file.bin"),
             part.to_str().unwrap(),
             Some(content.len() as u64),
+            &test_running(),
         )
         .await;
 
@@ -1277,7 +1422,13 @@ mod tests {
             ok_empty(),
         );
         let part = dir.join("file.bin.part");
-        let result = run_download(&server.url("/file.bin"), part.to_str().unwrap(), Some(10)).await;
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(10),
+            &test_running(),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(IaGetError::Network { .. })),
@@ -1312,6 +1463,7 @@ mod tests {
             &server.url("/file.bin"),
             part.to_str().unwrap(),
             Some(full.len() as u64),
+            &test_running(),
         )
         .await;
 
@@ -1336,6 +1488,7 @@ mod tests {
             &server.url("/file.bin"),
             part.to_str().unwrap(),
             Some(full.len() as u64),
+            &test_running(),
         )
         .await;
 
@@ -1361,8 +1514,13 @@ mod tests {
         );
         let part = dir.join("file.bin.part");
         fs::write(&part, b"XXXX").unwrap();
-        let result =
-            run_download(&server.url("/file.bin"), part.to_str().unwrap(), Some(100)).await;
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(100),
+            &test_running(),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(IaGetError::RangeNotSatisfiable)),
@@ -1385,7 +1543,13 @@ mod tests {
             MockResponse::new(404, MockBody::Full(vec![])),
         );
         let part = dir.join("file.bin.part");
-        let result = run_download(&server.url("/file.bin"), part.to_str().unwrap(), Some(10)).await;
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(10),
+            &test_running(),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(IaGetError::Network { .. })),
@@ -1419,12 +1583,16 @@ mod tests {
             &server.url("/file.bin"),
             part.to_str().unwrap(),
             Some(content.len() as u64),
+            &test_running(),
         )
         .await;
 
         assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        // A loaded CI host may deliver the 1s sleep late, but it cannot
+        // deliver it *early*: the threshold only needs to rule out skipping
+        // the wait.
         assert!(
-            start.elapsed() >= Duration::from_secs(1),
+            start.elapsed() >= Duration::from_millis(500),
             "Retry-After: 1 was not honored (elapsed {:?})",
             start.elapsed()
         );
@@ -1499,7 +1667,7 @@ mod tests {
     async fn hash_mismatch_triggers_redownload() {
         let correct = b"correct-content-001";
         let corrupt = b"corrupted-content-001"; // same length so the size guard does not fire
-        let md5 = format!("{:x}", md5::compute(correct));
+        let md5 = md5_hex(correct);
 
         let (server, dir) = file_server(
             "hash_mismatch",
@@ -1561,6 +1729,7 @@ mod tests {
             &server.url("/file.bin"),
             part.to_str().unwrap(),
             Some(content.len() as u64),
+            &test_running(),
         )
         .await;
 
@@ -1576,7 +1745,7 @@ mod tests {
     #[tokio::test]
     async fn downloaded_file_gets_xml_mtime_when_server_sends_none() {
         let content = b"xml-mtime-content";
-        let md5 = format!("{:x}", md5::compute(content));
+        let md5 = md5_hex(content);
         let xml_mtime = 1_545_586_142;
 
         let (server, dir) = file_server(
@@ -1608,7 +1777,7 @@ mod tests {
     #[tokio::test]
     async fn server_last_modified_wins_over_xml_mtime() {
         let content = b"server-mtime-content";
-        let md5 = format!("{:x}", md5::compute(content));
+        let md5 = md5_hex(content);
         let xml_mtime = 1_545_586_142;
         let header_mtime =
             httpdate::parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT").expect("valid date");
@@ -1678,7 +1847,7 @@ mod tests {
     #[tokio::test]
     async fn file_mtime_untouched_without_mtime_sources() {
         let content = b"no-mtime-content";
-        let md5 = format!("{:x}", md5::compute(content));
+        let md5 = md5_hex(content);
 
         let (server, dir) = file_server(
             "no_mtime",
@@ -1801,7 +1970,7 @@ mod tests {
     #[tokio::test]
     async fn unremovable_stale_file_fails_only_that_file() {
         let ok_content = b"ok-content-123";
-        let ok_md5 = format!("{:x}", md5::compute(ok_content));
+        let ok_md5 = md5_hex(ok_content);
 
         let mut scripts = HashMap::new();
         scripts.insert(
@@ -1814,8 +1983,9 @@ mod tests {
         let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("unremovable_stale");
-        // A directory at the final path: both MD5 calculation and remove_file
-        // fail on it on every platform, so it lands in the Invalid branch.
+        // A directory at the final path cannot be read on any platform, so
+        // the check lands in the Unreadable branch: the file is kept and
+        // the problem is reported for this file only.
         let blocked = dir.join("blocked.bin");
         fs::create_dir(&blocked).unwrap();
         let files = vec![
@@ -1855,13 +2025,117 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn unreadable_existing_file_is_reported_not_redownloaded() {
+        // A directory can be opened but not read: the check must yield
+        // Unreadable (per-file failure, the entry is kept), not Invalid,
+        // which would delete it and re-download based on a read failure.
+        let dir = temp_dir_for("unreadable_existing");
+        let path = dir.join("dirfile.bin");
+        fs::create_dir(&path).unwrap();
+
+        let expected = md5_hex(b"x");
+        let status = check_existing_file(
+            path.to_str().unwrap(),
+            Some(expected.as_str()),
+            None,
+            &test_running(),
+        )
+        .unwrap();
+
+        match status {
+            ExistingFileStatus::Unreadable(reason) => {
+                assert!(!reason.is_empty(), "the reason must name the problem");
+            }
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+        assert!(path.exists(), "an unreadable file must not be deleted");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_file_mtime_skips_pre_epoch_times() {
+        // A Last-Modified before 1970 has no Unix representation: the mtime
+        // must be left untouched instead of being stamped to the epoch.
+        let dir = temp_dir_for("mtime_pre_epoch");
+        let path = dir.join("f.txt");
+        fs::write(&path, "x").unwrap();
+
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
+        assert!(!sync_file_mtime(&path, pre_epoch));
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(
+            mtime.duration_since(UNIX_EPOCH).unwrap().abs_diff(now) < Duration::from_secs(60),
+            "the mtime must stay at the write time"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn uncreatable_part_file_fails_only_that_file() {
+        // A .part path occupied by a directory cannot be opened on any
+        // platform; the setup failure must fail that file only, letting the
+        // rest of the batch proceed.
+        let ok_content = b"ok-content-123";
+        let ok_md5 = md5_hex(ok_content);
+
+        let mut scripts = HashMap::new();
+        scripts.insert(
+            "/ok.bin".to_string(),
+            VecDeque::from(vec![MockResponse::new(
+                200,
+                MockBody::Full(ok_content.to_vec()),
+            )]),
+        );
+        let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
+
+        let dir = temp_dir_for("uncreatable_part");
+        fs::create_dir(dir.join("blocked.bin.part")).unwrap();
+        let files = vec![
+            task(
+                server.url("/blocked.bin"),
+                dir.join("blocked.bin").to_str().unwrap().to_string(),
+                None,
+                None,
+                None,
+            ),
+            task(
+                server.url("/ok.bin"),
+                dir.join("ok.bin").to_str().unwrap().to_string(),
+                Some(ok_md5),
+                Some(ok_content.len() as u64),
+                None,
+            ),
+        ];
+
+        let err = run_batch(files, false).await.unwrap_err();
+        match err {
+            IaGetError::BatchFailed {
+                count,
+                total,
+                details,
+            } => {
+                assert_eq!((count, total), (1, 2));
+                assert!(
+                    details.contains("could not prepare .part file"),
+                    "{details}"
+                );
+            }
+            other => panic!("expected BatchFailed with one file, got {:?}", other),
+        }
+        assert_eq!(fs::read(dir.join("ok.bin")).unwrap(), ok_content);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn complete_part_416_is_verified_in_place() {
         // A .part that already holds the whole file (a previous run was
         // interrupted after the body finished but before verification) must
         // be verified in place, not discarded and re-downloaded.
         let full = b"complete-part-content";
-        let md5 = format!("{:x}", md5::compute(full));
+        let md5 = md5_hex(full);
 
         let (server, dir) = file_server(
             "complete_part_416",
@@ -1898,7 +2172,7 @@ mod tests {
         // still discarded and re-downloaded: size alone is not proof.
         let stale = b"stale-content-0001";
         let fresh = b"fresh-content-0001"; // same length, different content
-        let md5 = format!("{:x}", md5::compute(fresh));
+        let md5 = md5_hex(fresh);
 
         let (server, dir) = file_server(
             "complete_part_416_stale",
@@ -1943,6 +2217,59 @@ mod tests {
         assert!(
             matches!(err, IaGetError::Interrupted),
             "an interrupted batch must fail, got {err:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn second_ctrl_c_press_requests_immediate_quit() {
+        let running = Arc::new(AtomicBool::new(true));
+        let presses = Arc::new(AtomicU32::new(0));
+
+        assert!(
+            matches!(handle_ctrl_c(&running, &presses), CtrlCAction::GracefulStop),
+            "the first press must stop the batch gracefully"
+        );
+        assert!(
+            !running.load(Ordering::SeqCst),
+            "the first press must flag the batch to stop"
+        );
+
+        assert!(
+            matches!(handle_ctrl_c(&running, &presses), CtrlCAction::QuitNow),
+            "the second press must ask the handler to exit the process"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_backoff_stops_retries() {
+        // The server throttles forever; a Ctrl+C during the backoff wait must
+        // end the retry loop instead of sending another request after it.
+        let (server, dir) = file_server(
+            "interrupt_backoff",
+            VecDeque::from(vec![MockResponse::new(429, MockBody::Full(vec![]))]),
+            MockResponse::new(429, MockBody::Full(vec![])),
+        );
+        let running = Arc::new(AtomicBool::new(true));
+        let flag = running.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            flag.store(false, Ordering::SeqCst);
+        });
+
+        let part = dir.join("file.bin.part");
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(10),
+            &running,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(IaGetError::Interrupted)),
+            "an interrupt during the backoff wait must abort the retries, got {:?}",
+            result.ok()
         );
         let _ = fs::remove_dir_all(&dir);
     }

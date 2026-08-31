@@ -75,13 +75,14 @@ impl From<reqwest::Error> for IaGetError {
 
 impl From<std::io::Error> for IaGetError {
     fn from(err: std::io::Error) -> Self {
-        if err.kind() == std::io::ErrorKind::Interrupted {
-            IaGetError::Interrupted
-        } else {
-            IaGetError::FileSystem {
-                detail: err.to_string(),
-                source: Some(Box::new(err)),
-            }
+        // An OS-level Interrupted (a syscall interrupted by a signal) is a
+        // transient I/O problem, not a user request to stop the run: map it
+        // to FileSystem so the retry loop can treat it as retryable. The
+        // user's Ctrl+C reaches the code through the running flag, never
+        // through an io::Error.
+        IaGetError::FileSystem {
+            detail: err.to_string(),
+            source: Some(Box::new(err)),
         }
     }
 }
@@ -95,5 +96,33 @@ impl From<url::ParseError> for IaGetError {
 impl From<serde_xml_rs::Error> for IaGetError {
     fn from(err: serde_xml_rs::Error) -> Self {
         IaGetError::XmlParsing(err.to_string())
+    }
+}
+
+/// Converts an `io::Error` into an `IaGetError` naming the file the
+/// operation touched. A bare message ("File operation failed: Access is
+/// denied") cannot be located in a multi-hundred-file batch; the path can.
+pub fn io_error_with_path(path: impl AsRef<std::path::Path>, err: std::io::Error) -> IaGetError {
+    IaGetError::FileSystem {
+        detail: format!("{}: {}", path.as_ref().display(), err),
+        source: Some(Box::new(err)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn os_interrupted_maps_to_filesystem_error() {
+        // A syscall interrupted by a signal must not be mistaken for the
+        // user's Ctrl+C.
+        let io_err = std::io::Error::from(ErrorKind::Interrupted);
+        let err = IaGetError::from(io_err);
+        assert!(
+            matches!(err, IaGetError::FileSystem { .. }),
+            "an OS-level Interrupted must stay a file system error, got {err:?}"
+        );
     }
 }
