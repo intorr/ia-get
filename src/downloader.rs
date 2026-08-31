@@ -14,7 +14,8 @@ use reqwest::{Client, Response, StatusCode};
 
 use crate::error::IaGetError; // Import IaGetError for explicit error conversion
 use crate::utils::{
-    create_progress_bar, format_size, print_downloaded_line, print_file_banner, with_cookie,
+    branch_glyph, create_progress_bar, format_size, last_glyph, print_downloaded_line,
+    print_file_banner, with_cookie,
 };
 use crate::Result; // Import utility functions
 
@@ -83,7 +84,7 @@ fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
     let pb = is_large_file.then(|| {
         create_progress_bar(
             file_size,
-            &format!("{} {}    ", "╰╼".cyan().dimmed(), "Verifying".white()),
+            &format!("{} {}    ", last_glyph(), "Verifying".white()),
             Some("blue/blue"),
             false,
         )
@@ -173,7 +174,7 @@ fn check_existing_file(
             }
             println!(
                 "{} {} to calculate MD5 hash: {}",
-                "╰╼".cyan().dimmed(),
+                last_glyph(),
                 "Failed".red().bold(),
                 e
             );
@@ -196,7 +197,7 @@ fn print_verified_hash(md5: Option<&str>) {
     match md5 {
         Some(hash) => println!(
             "{} {}         {} {}",
-            "╰╼".cyan().dimmed(),
+            last_glyph(),
             "Hash".white(),
             "✔".green().bold(),
             format!("({})", hash).dimmed()
@@ -358,7 +359,7 @@ impl RetryTracker {
         if self.count > MAX_RETRIES {
             println!(
                 "{} {}       {} Maximum retries ({}) exceeded",
-                "├╼".cyan().dimmed(),
+                branch_glyph(),
                 "Failed".red().bold(),
                 "✘".red().bold(),
                 MAX_RETRIES
@@ -374,7 +375,7 @@ impl RetryTracker {
 
         println!(
             "{} {}        {} {} (attempt {}/{}): {}",
-            "├╼".cyan().dimmed(),
+            branch_glyph(),
             "Retry".yellow().bold(),
             "⟳".yellow().bold(),
             kind,
@@ -384,7 +385,7 @@ impl RetryTracker {
         );
         println!(
             "{} {}         Waiting {:.1}s before retry{}",
-            "├╼".cyan().dimmed(),
+            branch_glyph(),
             "Wait".white(),
             delay.as_secs_f64(),
             if retry_after_secs.is_some() {
@@ -449,9 +450,9 @@ async fn retry_open_file(
 /// request continues an existing `.part` file, "Downloading" otherwise.
 fn download_action_label(resuming: bool) -> String {
     if resuming {
-        format!("{} {}     ", "╰╼".cyan().dimmed(), "Resuming".white())
+        format!("{} {}     ", last_glyph(), "Resuming".white())
     } else {
-        format!("{} {}  ", "╰╼".cyan().dimmed(), "Downloading".white())
+        format!("{} {}  ", last_glyph(), "Downloading".white())
     }
 }
 
@@ -600,11 +601,7 @@ async fn download_file_content(
                 }
 
                 pb.finish_and_clear();
-                print_downloaded_line(
-                    "├╼".cyan().dimmed(),
-                    downloaded_bytes,
-                    Some(start_time.elapsed()),
-                );
+                print_downloaded_line(branch_glyph(), downloaded_bytes, Some(start_time.elapsed()));
 
                 return Ok(last_modified);
             }
@@ -640,7 +637,7 @@ fn verify_downloaded_file(
     if let Some((actual_size, expected_size)) = size_mismatch(file_path, expected_size)? {
         println!(
             "{} {}         {} {} (expected {})",
-            "╰╼".cyan().dimmed(),
+            last_glyph(),
             "Size".white(),
             "✘".red().bold(),
             format_size(actual_size).red(),
@@ -649,23 +646,24 @@ fn verify_downloaded_file(
         return Ok(false);
     }
 
-    if expected_md5.is_none() {
+    let Some(expected_md5) = expected_md5 else {
+        // No hash to check against, consider it verified
         print_verified_hash(None);
-        return Ok(true); // No hash to check against, consider it verified
-    }
-    let expected_md5_str = expected_md5.unwrap();
+        return Ok(true);
+    };
+
     let local_md5 = calculate_md5(file_path, running)?;
-    if local_md5 == expected_md5_str {
+    if local_md5 == expected_md5 {
         print_verified_hash(Some(&local_md5));
         Ok(true)
     } else {
         println!(
             "{} {}         {} ({}) Expected ({})",
-            "╰╼".cyan().dimmed(),
+            last_glyph(),
             "Hash".white(),
             "✘".red().bold(),
             local_md5.red(),
-            expected_md5_str.dimmed()
+            expected_md5.dimmed()
         );
         Ok(false)
     }
@@ -770,7 +768,7 @@ fn handle_existing_file(
         ExistingFileStatus::Invalid => {
             println!(
                 "{} {}      {} the existing file failed verification, re-downloading",
-                "├╼".cyan().dimmed(),
+                branch_glyph(),
                 "Partial".white(),
                 "▲".yellow().bold()
             );
@@ -931,7 +929,7 @@ async fn run_download_attempts(
             file = prepare_file_for_download(part_path)?;
             println!(
                 "{} {}        {} Re-downloading from scratch (attempt {}/{})",
-                "├╼".cyan().dimmed(),
+                branch_glyph(),
                 "Retry".yellow().bold(),
                 "⟳".yellow().bold(),
                 attempt,
@@ -1046,21 +1044,16 @@ where
     Ok(())
 }
 
-/// Formats the failure list for `IaGetError::BatchFailed` details
-fn batch_failure_details(failed: &[(String, String)]) -> String {
-    failed
-        .iter()
-        .map(|(path, reason)| format!("{}: {}", path, reason))
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
 /// Builds the terminal `IaGetError::BatchFailed` from the accumulated failures
 fn batch_failed(failed_files: &[(String, String)], total: usize) -> IaGetError {
     IaGetError::BatchFailed {
         count: failed_files.len(),
         total,
-        details: batch_failure_details(failed_files),
+        details: failed_files
+            .iter()
+            .map(|(path, reason)| format!("{path}: {reason}"))
+            .collect::<Vec<_>>()
+            .join("; "),
     }
 }
 
@@ -1069,6 +1062,7 @@ mod tests {
     use super::*;
     use crate::test_support::{mtime_of, temp_dir_for, MockBody, MockResponse, MockServer};
     use std::collections::{HashMap, VecDeque};
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
 
     /// Near-instant retry delay so tests do not wait for real backoff
@@ -1095,6 +1089,100 @@ mod tests {
             expected_size: size,
             expected_mtime: mtime,
         }
+    }
+
+    /// A 200 response with an empty body — the fallback for most scripts
+    fn ok_empty() -> MockResponse {
+        MockResponse::new(200, MockBody::Full(vec![]))
+    }
+
+    /// Mock server serving "/file.bin" from `responses`, plus a fresh temp
+    /// dir; the file under test is `dir.join("file.bin")`
+    fn file_server(
+        name: &str,
+        responses: VecDeque<MockResponse>,
+        fallback: MockResponse,
+    ) -> (MockServer, PathBuf) {
+        let mut scripts = HashMap::new();
+        scripts.insert("/file.bin".to_string(), responses);
+        let server = MockServer::start(scripts, fallback);
+        (server, temp_dir_for(name))
+    }
+
+    /// A single-file batch task for "/file.bin" in `dir`
+    fn file_task(
+        server: &MockServer,
+        dir: &Path,
+        md5: Option<String>,
+        size: Option<u64>,
+        mtime: Option<u64>,
+    ) -> DownloadTask {
+        task(
+            server.url("/file.bin"),
+            dir.join("file.bin").to_str().unwrap().to_string(),
+            md5,
+            size,
+            mtime,
+        )
+    }
+
+    /// Runs a batch with a fresh client and a live "running" flag, mirroring
+    /// the production call minus the Ctrl+C handler
+    async fn run_batch(files: Vec<DownloadTask>, stop_on_error: bool) -> Result<()> {
+        let total_files = files.len();
+        download_files_with_signal(
+            &Client::new(),
+            files,
+            total_files,
+            1,
+            None,
+            stop_on_error,
+            &test_running(),
+        )
+        .await
+    }
+
+    /// Two-file batch fixture: "/missing.bin" always 404s, "/ok.bin" serves
+    /// `ok_content`; returns the server, temp dir, task list and content
+    fn missing_and_ok_batch(name: &str) -> (MockServer, PathBuf, Vec<DownloadTask>, &'static [u8]) {
+        let ok_content: &'static [u8] = b"ok-content-123";
+        let ok_md5 = format!("{:x}", md5::compute(ok_content));
+
+        let mut scripts = HashMap::new();
+        scripts.insert(
+            "/missing.bin".to_string(),
+            VecDeque::from(vec![MockResponse::new(
+                404,
+                MockBody::Full(b"gone".to_vec()),
+            )]),
+        );
+        scripts.insert(
+            "/ok.bin".to_string(),
+            VecDeque::from(vec![MockResponse::new(
+                200,
+                MockBody::Full(ok_content.to_vec()),
+            )]),
+        );
+        let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
+
+        let dir = temp_dir_for(name);
+        let files = vec![
+            task(
+                server.url("/missing.bin"),
+                dir.join("missing.bin").to_str().unwrap().to_string(),
+                None,
+                Some(5),
+                None,
+            ),
+            task(
+                server.url("/ok.bin"),
+                dir.join("ok.bin").to_str().unwrap().to_string(),
+                Some(ok_md5),
+                Some(ok_content.len() as u64),
+                None,
+            ),
+        ];
+        (server, dir, files, ok_content)
     }
 
     /// Runs a single download against the mock server and returns the
@@ -1126,18 +1214,15 @@ mod tests {
         let nginx_error =
             b"<html><head><title>500 Internal Server Error</title></head><body>nginx</body></html>";
 
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/file.bin".to_string(),
+        let (server, dir) = file_server(
+            "http_500",
             VecDeque::from(vec![
                 MockResponse::new(500, MockBody::Full(nginx_error.to_vec())),
                 MockResponse::new(500, MockBody::Full(nginx_error.to_vec())),
                 MockResponse::new(200, MockBody::Full(content.to_vec())),
             ]),
+            ok_empty(),
         );
-        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
-
-        let dir = temp_dir_for("http_500");
         let part = dir.join("file.bin.part");
         let result = run_download(
             &server.url("/file.bin"),
@@ -1155,15 +1240,12 @@ mod tests {
 
     #[tokio::test]
     async fn empty_response_retries_then_fails() {
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/file.bin".to_string(),
-            VecDeque::from(vec![MockResponse::new(200, MockBody::Full(vec![]))]),
-        );
         // Fallback also returns an empty 200 so every retry sees the same
-        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
-
-        let dir = temp_dir_for("empty_response");
+        let (server, dir) = file_server(
+            "empty_response",
+            VecDeque::from(vec![MockResponse::new(200, MockBody::Full(vec![]))]),
+            ok_empty(),
+        );
         let part = dir.join("file.bin.part");
         let result = run_download(&server.url("/file.bin"), part.to_str().unwrap(), Some(10)).await;
 
@@ -1181,9 +1263,8 @@ mod tests {
     async fn resume_after_mid_stream_disconnect() {
         let full = b"01234567890123456789"; // 20 bytes
 
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/file.bin".to_string(),
+        let (server, dir) = file_server(
+            "mid_stream",
             VecDeque::from(vec![
                 MockResponse::new(
                     200,
@@ -1194,10 +1275,8 @@ mod tests {
                 ),
                 MockResponse::new(206, MockBody::Full(full[8..].to_vec())),
             ]),
+            MockResponse::new(206, MockBody::Full(vec![])),
         );
-        let server = MockServer::start(scripts, MockResponse::new(206, MockBody::Full(vec![])));
-
-        let dir = temp_dir_for("mid_stream");
         let part = dir.join("file.bin.part");
         let result = run_download(
             &server.url("/file.bin"),
@@ -1216,14 +1295,11 @@ mod tests {
     async fn full_200_response_resets_untrusted_prefix() {
         let full = b"0123456789"; // 10 bytes
 
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/file.bin".to_string(),
+        let (server, dir) = file_server(
+            "range_ignored",
             VecDeque::from(vec![MockResponse::new(200, MockBody::Full(full.to_vec()))]),
+            ok_empty(),
         );
-        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
-
-        let dir = temp_dir_for("range_ignored");
         let part = dir.join("file.bin.part");
         fs::write(&part, b"XXXXXX").unwrap(); // 6-byte "partial" file
         let result = run_download(
@@ -1245,17 +1321,14 @@ mod tests {
 
     #[tokio::test]
     async fn http_416_yields_range_not_satisfiable() {
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/file.bin".to_string(),
+        let (server, dir) = file_server(
+            "http_416",
             VecDeque::from(vec![MockResponse::new(
                 416,
                 MockBody::Full(b"Range not satisfiable".to_vec()),
             )]),
+            MockResponse::new(416, MockBody::Full(vec![])),
         );
-        let server = MockServer::start(scripts, MockResponse::new(416, MockBody::Full(vec![])));
-
-        let dir = temp_dir_for("http_416");
         let part = dir.join("file.bin.part");
         fs::write(&part, b"XXXX").unwrap();
         let result =
@@ -1273,17 +1346,14 @@ mod tests {
 
     #[tokio::test]
     async fn http_404_fails_immediately() {
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/file.bin".to_string(),
+        let (server, dir) = file_server(
+            "http_404",
             VecDeque::from(vec![MockResponse::new(
                 404,
                 MockBody::Full(b"not found".to_vec()),
             )]),
+            MockResponse::new(404, MockBody::Full(vec![])),
         );
-        let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
-
-        let dir = temp_dir_for("http_404");
         let part = dir.join("file.bin.part");
         let result = run_download(&server.url("/file.bin"), part.to_str().unwrap(), Some(10)).await;
 
@@ -1305,17 +1375,14 @@ mod tests {
     async fn retry_after_header_is_respected() {
         let content = b"retry-after-content";
 
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/file.bin".to_string(),
+        let (server, dir) = file_server(
+            "retry_after",
             VecDeque::from(vec![
                 MockResponse::new(429, MockBody::Full(vec![])).with_header("Retry-After", "1"),
                 MockResponse::new(200, MockBody::Full(content.to_vec())),
             ]),
+            MockResponse::new(429, MockBody::Full(vec![])),
         );
-        let server = MockServer::start(scripts, MockResponse::new(429, MockBody::Full(vec![])));
-
-        let dir = temp_dir_for("retry_after");
         let part = dir.join("file.bin.part");
         let start = Instant::now();
         let result = run_download(
@@ -1337,51 +1404,8 @@ mod tests {
 
     #[tokio::test]
     async fn batch_continues_after_file_failure() {
-        let ok_content = b"ok-content-123";
-        let ok_md5 = format!("{:x}", md5::compute(ok_content));
-
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/missing.bin".to_string(),
-            VecDeque::from(vec![MockResponse::new(
-                404,
-                MockBody::Full(b"gone".to_vec()),
-            )]),
-        );
-        scripts.insert(
-            "/ok.bin".to_string(),
-            VecDeque::from(vec![MockResponse::new(
-                200,
-                MockBody::Full(ok_content.to_vec()),
-            )]),
-        );
-        let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
-
-        let dir = temp_dir_for("batch_continue");
-        let missing_path = dir.join("missing.bin").to_str().unwrap().to_string();
-        let ok_path = dir.join("ok.bin").to_str().unwrap().to_string();
-        let files = vec![
-            task(
-                server.url("/missing.bin"),
-                missing_path,
-                None,
-                Some(5),
-                None,
-            ),
-            task(
-                server.url("/ok.bin"),
-                ok_path,
-                Some(ok_md5),
-                Some(ok_content.len() as u64),
-                None,
-            ),
-        ];
-        let client = Client::new();
-        let running = test_running();
-
-        let err = download_files_with_signal(&client, files, 2, 1, None, false, &running)
-            .await
-            .unwrap_err();
+        let (_server, dir, files, ok_content) = missing_and_ok_batch("batch_continue");
+        let err = run_batch(files, false).await.unwrap_err();
         match err {
             IaGetError::BatchFailed { count, total, .. } => {
                 assert_eq!((count, total), (1, 2));
@@ -1395,51 +1419,8 @@ mod tests {
 
     #[tokio::test]
     async fn stop_on_error_aborts_batch() {
-        let ok_content = b"ok-content-123";
-        let ok_md5 = format!("{:x}", md5::compute(ok_content));
-
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/missing.bin".to_string(),
-            VecDeque::from(vec![MockResponse::new(
-                404,
-                MockBody::Full(b"gone".to_vec()),
-            )]),
-        );
-        scripts.insert(
-            "/ok.bin".to_string(),
-            VecDeque::from(vec![MockResponse::new(
-                200,
-                MockBody::Full(ok_content.to_vec()),
-            )]),
-        );
-        let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
-
-        let dir = temp_dir_for("stop_on_error");
-        let missing_path = dir.join("missing.bin").to_str().unwrap().to_string();
-        let ok_path = dir.join("ok.bin").to_str().unwrap().to_string();
-        let files = vec![
-            task(
-                server.url("/missing.bin"),
-                missing_path,
-                None,
-                Some(5),
-                None,
-            ),
-            task(
-                server.url("/ok.bin"),
-                ok_path,
-                Some(ok_md5),
-                Some(ok_content.len() as u64),
-                None,
-            ),
-        ];
-        let client = Client::new();
-        let running = test_running();
-
-        let err = download_files_with_signal(&client, files, 2, 1, None, true, &running)
-            .await
-            .unwrap_err();
+        let (server, dir, files, _ok_content) = missing_and_ok_batch("stop_on_error");
+        let err = run_batch(files, true).await.unwrap_err();
         assert!(
             matches!(err, IaGetError::BatchFailed { count: 1, .. }),
             "expected BatchFailed with one file, got {:?}",
@@ -1460,29 +1441,23 @@ mod tests {
         let corrupt = b"corrupted-content-001"; // same length so the size guard does not fire
         let md5 = format!("{:x}", md5::compute(correct));
 
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/file.bin".to_string(),
+        let (server, dir) = file_server(
+            "hash_mismatch",
             VecDeque::from(vec![
                 MockResponse::new(200, MockBody::Full(corrupt.to_vec())),
                 MockResponse::new(200, MockBody::Full(correct.to_vec())),
             ]),
+            ok_empty(),
         );
-        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
-
-        let dir = temp_dir_for("hash_mismatch");
-        let file_path = dir.join("file.bin").to_str().unwrap().to_string();
-        let files = vec![task(
-            server.url("/file.bin"),
-            file_path,
+        let files = vec![file_task(
+            &server,
+            &dir,
             Some(md5),
             Some(correct.len() as u64),
             None,
         )];
-        let client = Client::new();
-        let running = test_running();
 
-        download_files_with_signal(&client, files, 1, 1, None, false, &running)
+        run_batch(files, false)
             .await
             .expect("batch should succeed after re-download");
 
@@ -1544,31 +1519,23 @@ mod tests {
         let md5 = format!("{:x}", md5::compute(content));
         let xml_mtime = 1_545_586_142;
 
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/file.bin".to_string(),
+        let (server, dir) = file_server(
+            "xml_mtime",
             VecDeque::from(vec![MockResponse::new(
                 200,
                 MockBody::Full(content.to_vec()),
             )]),
+            ok_empty(),
         );
-        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
-
-        let dir = temp_dir_for("xml_mtime");
-        let file_path = dir.join("file.bin").to_str().unwrap().to_string();
-        let files = vec![task(
-            server.url("/file.bin"),
-            file_path,
+        let files = vec![file_task(
+            &server,
+            &dir,
             Some(md5),
             Some(content.len() as u64),
             Some(xml_mtime),
         )];
-        let client = Client::new();
-        let running = test_running();
 
-        download_files_with_signal(&client, files, 1, 1, None, false, &running)
-            .await
-            .expect("batch should succeed");
+        run_batch(files, false).await.expect("batch should succeed");
 
         assert_eq!(
             mtime_of(&dir.join("file.bin")),
@@ -1590,32 +1557,24 @@ mod tests {
             .expect("valid date")
             .as_secs();
 
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/file.bin".to_string(),
+        let (server, dir) = file_server(
+            "server_mtime",
             VecDeque::from(vec![MockResponse::new(
                 200,
                 MockBody::Full(content.to_vec()),
             )
             .with_header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")]),
+            ok_empty(),
         );
-        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
-
-        let dir = temp_dir_for("server_mtime");
-        let file_path = dir.join("file.bin").to_str().unwrap().to_string();
-        let files = vec![task(
-            server.url("/file.bin"),
-            file_path,
+        let files = vec![file_task(
+            &server,
+            &dir,
             Some(md5),
             Some(content.len() as u64),
             Some(xml_mtime),
         )];
-        let client = Client::new();
-        let running = test_running();
 
-        download_files_with_signal(&client, files, 1, 1, None, false, &running)
-            .await
-            .expect("batch should succeed");
+        run_batch(files, false).await.expect("batch should succeed");
 
         assert_eq!(
             mtime_of(&dir.join("file.bin")),
@@ -1630,27 +1589,17 @@ mod tests {
         let content = b"already-verified-content";
         let xml_mtime = 1_545_586_142;
 
-        let server = MockServer::start(
-            HashMap::new(),
-            MockResponse::new(200, MockBody::Full(vec![])),
-        );
-
-        let dir = temp_dir_for("verified_mtime");
-        let file_path = dir.join("file.bin");
-        fs::write(&file_path, content).expect("failed to write test file");
-        let files = vec![task(
-            server.url("/file.bin"),
-            file_path.to_str().unwrap().to_string(),
+        let (server, dir) = file_server("verified_mtime", VecDeque::new(), ok_empty());
+        fs::write(dir.join("file.bin"), content).expect("failed to write test file");
+        let files = vec![file_task(
+            &server,
+            &dir,
             None,
             Some(content.len() as u64),
             Some(xml_mtime),
         )];
-        let client = Client::new();
-        let running = test_running();
 
-        download_files_with_signal(&client, files, 1, 1, None, false, &running)
-            .await
-            .expect("batch should succeed");
+        run_batch(files, false).await.expect("batch should succeed");
 
         assert_eq!(
             server.request_count(),
@@ -1658,11 +1607,11 @@ mod tests {
             "verified file must not be re-downloaded"
         );
         assert_eq!(
-            mtime_of(&file_path),
+            mtime_of(&dir.join("file.bin")),
             Some(xml_mtime),
             "already-verified file must still get the _files.xml mtime"
         );
-        assert_eq!(fs::read(&file_path).unwrap(), content);
+        assert_eq!(fs::read(dir.join("file.bin")).unwrap(), content);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1671,31 +1620,23 @@ mod tests {
         let content = b"no-mtime-content";
         let md5 = format!("{:x}", md5::compute(content));
 
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/file.bin".to_string(),
+        let (server, dir) = file_server(
+            "no_mtime",
             VecDeque::from(vec![MockResponse::new(
                 200,
                 MockBody::Full(content.to_vec()),
             )]),
+            ok_empty(),
         );
-        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
-
-        let dir = temp_dir_for("no_mtime");
-        let file_path = dir.join("file.bin").to_str().unwrap().to_string();
-        let files = vec![task(
-            server.url("/file.bin"),
-            file_path,
+        let files = vec![file_task(
+            &server,
+            &dir,
             Some(md5),
             Some(content.len() as u64),
             None,
         )];
-        let client = Client::new();
-        let running = test_running();
 
-        download_files_with_signal(&client, files, 1, 1, None, false, &running)
-            .await
-            .expect("batch should succeed");
+        run_batch(files, false).await.expect("batch should succeed");
 
         let secs = mtime_of(&dir.join("file.bin")).expect("file must exist");
         let now = SystemTime::now()
@@ -1765,32 +1706,26 @@ mod tests {
     async fn existing_file_with_wrong_size_and_no_md5_is_redownloaded() {
         let content = b"fresh-content-001";
 
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/file.bin".to_string(),
+        let (server, dir) = file_server(
+            "size_mismatch_skip",
             VecDeque::from(vec![MockResponse::new(
                 200,
                 MockBody::Full(content.to_vec()),
             )]),
+            ok_empty(),
         );
-        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
-
-        let dir = temp_dir_for("size_mismatch_skip");
-        let file_path = dir.join("file.bin").to_str().unwrap().to_string();
         // A stale copy with the wrong size and no MD5 in the metadata: the
         // skip path must re-download instead of accepting it.
-        fs::write(&file_path, b"stale").unwrap();
-        let files = vec![task(
-            server.url("/file.bin"),
-            file_path,
+        fs::write(dir.join("file.bin"), b"stale").unwrap();
+        let files = vec![file_task(
+            &server,
+            &dir,
             None,
             Some(content.len() as u64),
             None,
         )];
-        let client = Client::new();
-        let running = test_running();
 
-        download_files_with_signal(&client, files, 1, 1, None, false, &running)
+        run_batch(files, false)
             .await
             .expect("batch should succeed after re-download");
 
@@ -1823,30 +1758,24 @@ mod tests {
         // fail on it on every platform, so it lands in the Invalid branch.
         let blocked = dir.join("blocked.bin");
         fs::create_dir(&blocked).unwrap();
-        let blocked_path = blocked.to_str().unwrap().to_string();
-        let ok_path = dir.join("ok.bin").to_str().unwrap().to_string();
         let files = vec![
             task(
                 server.url("/blocked.bin"),
-                blocked_path,
+                blocked.to_str().unwrap().to_string(),
                 Some("00000000000000000000000000000000".to_string()),
                 None,
                 None,
             ),
             task(
                 server.url("/ok.bin"),
-                ok_path,
+                dir.join("ok.bin").to_str().unwrap().to_string(),
                 Some(ok_md5),
                 Some(ok_content.len() as u64),
                 None,
             ),
         ];
-        let client = Client::new();
-        let running = test_running();
 
-        let err = download_files_with_signal(&client, files, 2, 1, None, false, &running)
-            .await
-            .unwrap_err();
+        let err = run_batch(files, false).await.unwrap_err();
         match err {
             IaGetError::BatchFailed {
                 count,

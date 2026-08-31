@@ -99,6 +99,16 @@ pub fn create_progress_bar(
     pb
 }
 
+/// Tree glyph for a line with more lines following in the file's block.
+pub fn branch_glyph() -> ColoredString {
+    "├╼".cyan().dimmed()
+}
+
+/// Tree glyph for the last line of a file's block.
+pub fn last_glyph() -> ColoredString {
+    "╰╼".cyan().dimmed()
+}
+
 /// Print the "Filename / Count" banner for one file of a numbered list
 pub fn print_file_banner(file_path: &str, number: usize, total: usize) {
     println!(
@@ -109,7 +119,7 @@ pub fn print_file_banner(file_path: &str, number: usize, total: usize) {
     );
     println!(
         "{} {}        {} {} of {}",
-        "├╼".cyan().dimmed(),
+        branch_glyph(),
         "Count".white(),
         "#".blue().bold(),
         number.to_string().bold(),

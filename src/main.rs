@@ -15,10 +15,11 @@ use ia_get::constants::USER_AGENT;
 use ia_get::cookie::cookie_header_value;
 use ia_get::downloader::{self, DownloadTask};
 use ia_get::utils::{
-    create_spinner, finish_spinner, format_size, print_downloaded_line, print_file_banner,
-    sanitize_filename, validate_archive_url,
+    create_spinner, finish_spinner, format_size, last_glyph, print_downloaded_line,
+    print_file_banner, sanitize_filename, validate_archive_url,
 };
 use ia_get::Result;
+use indicatif::ProgressBar;
 use reqwest::{Client, Url};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -30,6 +31,33 @@ const CONNECTION_TIMEOUT_SECS: u64 = 600;
 /// after a successful one, so a stalled mid-transfer becomes a retryable
 /// mid-stream error (resumed later) instead of an infinite hang.
 const READ_TIMEOUT_SECS: u64 = 300;
+
+/// Idle timeout for a pooled connection
+const POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+
+/// Maximum number of idle connections kept per host
+const POOL_MAX_IDLE_PER_HOST: usize = 1;
+
+/// Interval between TCP keepalive probes
+const TCP_KEEPALIVE_SECS: u64 = 60;
+
+/// Number assigned to the saved `_files.xml` in the per-file listing; the
+/// archive's files are numbered right after it.
+const XML_FILE_NUMBER: usize = 1;
+
+/// HTTP client for the download session: an extended connection timeout,
+/// plus a per-read idle timeout that resets after each successful read, so
+/// a stalled mid-transfer becomes a retryable error instead of a hang.
+fn build_client() -> Result<Client> {
+    Ok(Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(CONNECTION_TIMEOUT_SECS))
+        .read_timeout(Duration::from_secs(READ_TIMEOUT_SECS))
+        .pool_idle_timeout(Duration::from_secs(POOL_IDLE_TIMEOUT_SECS))
+        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+        .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_SECS))
+        .build()?)
+}
 
 /// Persists the freshly fetched `_files.xml` (overwriting any previous copy)
 /// and prints its "#1" file block.
@@ -52,9 +80,9 @@ fn save_and_announce_xml(
     let already_listed = files.files.iter().any(|f| f.name == xml_file_name);
     let total_files = files.files.len() + usize::from(!already_listed);
     println!(" ");
-    print_file_banner(xml_file_name, 1, total_files);
+    print_file_banner(xml_file_name, XML_FILE_NUMBER, total_files);
     // The file never crossed the network, so its line carries no time/rate
-    print_downloaded_line("╰╼".cyan().dimmed(), content.len() as u64, None);
+    print_downloaded_line(last_glyph(), content.len() as u64, None);
 
     Ok(total_files)
 }
@@ -163,7 +191,7 @@ fn list_summary(files: &XmlFiles) -> String {
 }
 
 /// Lists parsed filenames from XML metadata when --list/-l is used
-fn list_files(files: &XmlFiles, spinner: &indicatif::ProgressBar) {
+fn list_files(files: &XmlFiles, spinner: &ProgressBar) {
     finish_spinner(
         spinner,
         &format!(
@@ -205,17 +233,7 @@ struct Cli {
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Extended timeouts for large file downloads: a long connection timeout,
-    // plus a per-read idle timeout that resets after each successful read,
-    // so a stalled mid-transfer becomes a retryable error instead of a hang
-    let client = Client::builder()
-        .user_agent(USER_AGENT)
-        .connect_timeout(Duration::from_secs(CONNECTION_TIMEOUT_SECS))
-        .read_timeout(Duration::from_secs(READ_TIMEOUT_SECS))
-        .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(1)
-        .tcp_keepalive(Duration::from_secs(60))
-        .build()?;
+    let client = build_client()?;
 
     // Start a single spinner for the entire initialization process
     let spinner = create_spinner(&format!("Processing archive.org URL: {}", cli.url.bold()));
@@ -288,13 +306,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Download all files with integrated signal handling. File numbering
-    // starts at #2: #1 is the _files.xml saved above.
+    // Download all files with integrated signal handling; numbering starts
+    // right after the _files.xml saved above.
     downloader::download_files(
         &client,
         download_tasks,
         total_files,
-        2,
+        XML_FILE_NUMBER + 1,
         cookie_header.as_ref(),
         cli.stop_on_error,
     )

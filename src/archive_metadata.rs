@@ -53,13 +53,19 @@ pub struct XmlFile {
 }
 
 /// Builds a truncated preview of XML content for error messages: at most
-/// `XML_DEBUG_TRUNCATE_LEN` characters, suffixed with `...` when truncated.
+/// `XML_DEBUG_TRUNCATE_LEN` bytes, stepped back to a char boundary when a
+/// multi-byte character straddles the cut, and suffixed with `...`.
 fn content_preview(xml_content: &str) -> String {
-    if xml_content.len() > XML_DEBUG_TRUNCATE_LEN {
-        format!("{}...", &xml_content[..XML_DEBUG_TRUNCATE_LEN])
-    } else {
-        xml_content.to_string()
+    if xml_content.len() <= XML_DEBUG_TRUNCATE_LEN {
+        return xml_content.to_string();
     }
+
+    let mut end = XML_DEBUG_TRUNCATE_LEN;
+    while !xml_content.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    format!("{}...", &xml_content[..end])
 }
 
 /// Parses XML content into XmlFiles structure with improved error context
@@ -309,6 +315,27 @@ mod tests {
         )
         .expect("valid metadata must parse");
         assert_eq!(files.files[0].source.as_deref(), Some("original"));
+    }
+
+    #[test]
+    fn content_preview_keeps_short_content_untouched() {
+        assert_eq!(content_preview("<files/>"), "<files/>");
+    }
+
+    #[test]
+    fn content_preview_truncates_long_content() {
+        let xml = format!("<files>{}</files>", "x".repeat(2000));
+        let preview = content_preview(&xml);
+        assert!(preview.ends_with("..."));
+        assert_eq!(preview.len(), XML_DEBUG_TRUNCATE_LEN + 3);
+    }
+
+    #[test]
+    fn content_preview_steps_back_to_char_boundary() {
+        // 334 CJK chars (3 bytes each): byte 1000 lands mid-character,
+        // so the cut must step back to byte 999
+        let xml = format!("{}{}", "字".repeat(334), "x".repeat(1000));
+        assert_eq!(content_preview(&xml), format!("{}...", "字".repeat(333)));
     }
 
     #[test]
