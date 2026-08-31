@@ -2,6 +2,7 @@
 //! file, so every authenticated request carries the right cookies.
 
 use crate::{IaGetError, Result};
+use colored::*;
 use reqwest::header::HeaderValue;
 use std::fs;
 use std::path::Path;
@@ -27,11 +28,24 @@ struct NetscapeCookie {
 /// look like a raw cookie pair (no `=`): a raw cookie string that merely
 /// collides with a filename in the working directory is kept as a cookie
 /// string instead of being silently swallowed as an empty cookies.txt.
+///
+/// A file that holds cookies but none of them apply to `url` (all expired,
+/// or scoped to another domain/path) yields an empty header; a warning is
+/// printed so an unauthenticated-looking 401/403 has an obvious cause.
 pub fn cookie_header_from_input(input: &str, url: &Url) -> Result<String> {
     if Path::new(input).is_file() {
         let cookie_file = fs::read_to_string(input)?;
         if has_netscape_cookie_line(&cookie_file) || !input.contains('=') {
-            return cookie_header_from_netscape_file(&cookie_file, url);
+            let header = cookie_header_from_netscape_file(&cookie_file, url)?;
+            if header.is_empty() {
+                println!(
+                    "{} {} {}",
+                    "⚠".yellow().bold(),
+                    "No applicable cookies found in".yellow(),
+                    input.dimmed()
+                );
+            }
+            return Ok(header);
         }
     }
     Ok(input.trim().to_string())
@@ -115,7 +129,10 @@ fn cookie_applies_to_url(cookie: &NetscapeCookie, url: &Url, now: u64) -> bool {
 pub fn cookie_header_from_netscape_file(content: &str, url: &Url) -> Result<String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| IaGetError::FileSystem(e.to_string()))?
+        .map_err(|e| IaGetError::FileSystem {
+            detail: e.to_string(),
+            source: Some(Box::new(e)),
+        })?
         .as_secs();
 
     let cookies = content
@@ -141,8 +158,10 @@ pub fn cookie_header_value(cookie_input: Option<&str>, url: &Url) -> Result<Opti
         return Ok(None);
     }
 
-    let value = HeaderValue::from_str(&cookie_header)
-        .map_err(|e| IaGetError::Network(format!("Invalid cookie header: {e}")))?;
+    let value = HeaderValue::from_str(&cookie_header).map_err(|e| IaGetError::Network {
+        detail: format!("Invalid cookie header: {e}"),
+        source: Some(Box::new(e)),
+    })?;
     Ok(Some(value))
 }
 
@@ -246,6 +265,22 @@ archive.org\tFALSE\t/\tFALSE\t2145916800\tcurrent\tvalue\n";
         let header = cookie_header_from_input(&input, &cookie_test_url("/download/item/f.xml"))
             .expect("cookies.txt must parse");
         assert_eq!(header, "session=value");
+
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn cookie_header_file_with_only_expired_cookies_is_empty() {
+        // A recognizable-but-expired cookie file must yield an empty header
+        // (with a warning), not the file name or the stale cookie.
+        let input = unique_temp_file(
+            "ia-get-cookie-expired-only",
+            "archive.org\tFALSE\t/\tFALSE\t1\told\tvalue\n",
+        );
+
+        let header = cookie_header_from_input(&input, &cookie_test_url("/download/item/f.xml"))
+            .expect("an expired-cookies file must still parse");
+        assert_eq!(header, "", "expired cookies must not reach the header");
 
         let _ = fs::remove_file(&input);
     }

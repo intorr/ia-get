@@ -490,7 +490,7 @@ mod tests {
             .expect_err("an HTTP error on the metadata GET must fail the fetch");
 
         match err {
-            IaGetError::Network(detail) => {
+            IaGetError::Network { detail, .. } => {
                 assert!(
                     detail.contains("500"),
                     "expected the status code in the error, got: {detail}"

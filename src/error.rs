@@ -9,12 +9,22 @@ pub type Result<T> = std::result::Result<T, IaGetError>;
 #[derive(Error, Debug)]
 pub enum IaGetError {
     /// Network-related errors including connection failures, timeouts, and HTTP errors
-    #[error("Network error: {0}")]
-    Network(String),
+    #[error("Network error: {detail}")]
+    Network {
+        detail: String,
+        /// The underlying error (e.g. the reqwest error), when one exists
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
 
     /// File system errors during download operations
-    #[error("File operation failed: {0}")]
-    FileSystem(String),
+    #[error("File operation failed: {detail}")]
+    FileSystem {
+        detail: String,
+        /// The underlying error (e.g. the std::io::Error), when one exists
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
 
     /// URL format or parsing errors
     #[error("Invalid archive.org URL: {0}. Expected format: https://archive.org/details/<identifier>[/]")]
@@ -44,12 +54,21 @@ pub enum IaGetError {
 impl From<reqwest::Error> for IaGetError {
     fn from(err: reqwest::Error) -> Self {
         if err.is_connect() || err.is_timeout() {
-            IaGetError::Network(format!("Connection failed: {}", err))
+            IaGetError::Network {
+                detail: format!("Connection failed: {err}"),
+                source: Some(Box::new(err)),
+            }
         } else if err.is_status() {
             let status = err.status().map(|s| s.to_string()).unwrap_or_default();
-            IaGetError::Network(format!("HTTP error {}: {}", status, err))
+            IaGetError::Network {
+                detail: format!("HTTP error {status}: {err}"),
+                source: Some(Box::new(err)),
+            }
         } else {
-            IaGetError::Network(err.to_string())
+            IaGetError::Network {
+                detail: err.to_string(),
+                source: Some(Box::new(err)),
+            }
         }
     }
 }
@@ -59,7 +78,10 @@ impl From<std::io::Error> for IaGetError {
         if err.kind() == std::io::ErrorKind::Interrupted {
             IaGetError::Interrupted
         } else {
-            IaGetError::FileSystem(err.to_string())
+            IaGetError::FileSystem {
+                detail: err.to_string(),
+                source: Some(Box::new(err)),
+            }
         }
     }
 }

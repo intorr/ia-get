@@ -17,7 +17,9 @@ indicatif = "0.18.4"
 md5 = "0.8.0"
 regex = "1.12.4"
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls"] }
-tokio = { version = "1.50.0", features = ["full"] }
+# Only the features ia-get itself uses: the multi-thread runtime for
+# #[tokio::main] (macros, rt-multi-thread) and timers for retry backoff.
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "time"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde-xml-rs = "0.8.2"
 thiserror = "2.0.17"

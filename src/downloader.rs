@@ -364,9 +364,10 @@ impl RetryTracker {
                 "✘".red().bold(),
                 MAX_RETRIES
             );
-            return Err(IaGetError::Network(format!(
-                "{kind}: {detail} (maximum retries {MAX_RETRIES} exceeded)"
-            )));
+            return Err(IaGetError::Network {
+                detail: format!("{kind}: {detail} (maximum retries {MAX_RETRIES} exceeded)"),
+                source: None,
+            });
         }
 
         let delay = retry_after_secs
@@ -441,7 +442,6 @@ async fn retry_open_file(
 ) -> Result<()> {
     pb.finish_and_clear();
     retry.record(kind, detail, retry_after_secs).await?;
-    file.flush()?;
     file.seek(SeekFrom::End(0))?;
     Ok(())
 }
@@ -489,7 +489,10 @@ async fn download_file_content(
             request = request.header(
                 reqwest::header::RANGE,
                 HeaderValue::from_str(&format!("bytes={}-", current_file_size)).map_err(|e| {
-                    IaGetError::Network(format!("Invalid range header value: {}", e))
+                    IaGetError::Network {
+                        detail: format!("Invalid range header value: {e}"),
+                        source: Some(Box::new(e)),
+                    }
                 })?,
             );
         }
@@ -536,11 +539,14 @@ async fn download_file_content(
                 continue;
             }
 
-            return Err(IaGetError::Network(format!(
-                "Server responded with HTTP {} {}",
-                status,
-                status.canonical_reason().unwrap_or("unknown status")
-            )));
+            return Err(IaGetError::Network {
+                detail: format!(
+                    "Server responded with HTTP {} {}",
+                    status,
+                    status.canonical_reason().unwrap_or("unknown status")
+                ),
+                source: None,
+            });
         }
 
         // The server ignored the Range header and is sending the full body:
@@ -565,8 +571,6 @@ async fn download_file_content(
         match stream_response_body(&mut response, file, base_size, &pb, running).await {
             Ok(downloaded_bytes) => {
                 let total_bytes = base_size + downloaded_bytes;
-                // Ensure data is written to disk
-                file.flush()?;
 
                 // A 2xx body with zero bytes is a server malfunction (unless
                 // the server explicitly announced a zero-byte file).
@@ -1276,7 +1280,7 @@ mod tests {
         let result = run_download(&server.url("/file.bin"), part.to_str().unwrap(), Some(10)).await;
 
         assert!(
-            matches!(result, Err(IaGetError::Network(_))),
+            matches!(result, Err(IaGetError::Network { .. })),
             "expected a Network error, got {:?}",
             result.ok()
         );
@@ -1384,7 +1388,7 @@ mod tests {
         let result = run_download(&server.url("/file.bin"), part.to_str().unwrap(), Some(10)).await;
 
         assert!(
-            matches!(result, Err(IaGetError::Network(_))),
+            matches!(result, Err(IaGetError::Network { .. })),
             "expected a Network error, got {:?}",
             result.ok()
         );

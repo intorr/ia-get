@@ -25,8 +25,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-/// Extended timeout for large file downloads (10 minutes for connection)
-const CONNECTION_TIMEOUT_SECS: u64 = 600;
+/// Timeout for establishing a single TCP+TLS connection. Stalled or
+/// unreachable hosts must fail fast enough for the retry loop to kick in;
+/// slow transfers mid-body are covered by READ_TIMEOUT_SECS instead.
+const CONNECTION_TIMEOUT_SECS: u64 = 60;
 
 /// Idle timeout for reading the response body. Applies to each read and resets
 /// after a successful one, so a stalled mid-transfer becomes a retryable
@@ -46,7 +48,7 @@ const TCP_KEEPALIVE_SECS: u64 = 60;
 /// archive's files are numbered right after it.
 const XML_FILE_NUMBER: usize = 1;
 
-/// HTTP client for the download session: an extended connection timeout,
+/// HTTP client for the download session: a bounded connection timeout,
 /// plus a per-read idle timeout that resets after each successful read, so
 /// a stalled mid-transfer becomes a retryable error instead of a hang.
 fn build_client() -> Result<Client> {
@@ -97,6 +99,22 @@ fn files_to_download(files: Vec<XmlFile>, xml_file_name: &str) -> Vec<XmlFile> {
         .collect()
 }
 
+/// Normalised key for local-path collision detection.
+///
+/// On case-insensitive filesystems (Windows, default macOS) "a.pdf" and
+/// "A.pdf" are the same path, so the key is lowercased there; on
+/// case-sensitive filesystems (Linux) distinct casing stays distinct.
+fn local_path_key(path: &str) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        path.to_string()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        path.to_lowercase()
+    }
+}
+
 /// Converts the parsed metadata into download tasks: builds each file's
 /// absolute URL and its sanitized local path, warning about every rename.
 ///
@@ -104,6 +122,9 @@ fn files_to_download(files: Vec<XmlFile>, xml_file_name: &str) -> Vec<XmlFile> {
 /// slashes only) are skipped: joining `""` would resolve to the metadata
 /// URL itself. Likewise, an entry whose sanitized local path collides with
 /// an earlier entry's is skipped, so one file never overwrites another.
+/// Collisions are compared case-insensitively on case-insensitive
+/// filesystems (Windows, default macOS), where "a.pdf" and "A.pdf" are the
+/// same path.
 ///
 /// Returns the tasks and how many filenames were sanitized. A failed URL
 /// join aborts the run: silently keeping the base URL would download the
@@ -111,7 +132,7 @@ fn files_to_download(files: Vec<XmlFile>, xml_file_name: &str) -> Vec<XmlFile> {
 fn build_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<(Vec<DownloadTask>, usize)> {
     let mut sanitized_count = 0;
     let mut tasks: Vec<DownloadTask> = Vec::new();
-    // Sanitized local path -> original name, so a collision can be
+    // Normalised local path -> original name, so a collision can be
     // reported with both sides of the clash.
     let mut taken_paths: HashMap<String, String> = HashMap::new();
 
@@ -125,7 +146,7 @@ fn build_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<(Vec<Down
                 "{} {} {} (empty name)",
                 "⚠".yellow().bold(),
                 "Skipped:".yellow(),
-                format!("{:?}", file.name).dimmed()
+                file.name.dimmed()
             );
             continue;
         }
@@ -151,18 +172,21 @@ fn build_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<(Vec<Down
         // (e.g. "file:1.mp4" and "file_1.mp4"); downloading both would
         // overwrite the earlier file, so keep the first entry and skip the
         // rest.
-        if let Some(first_name) = taken_paths.get(&sanitized_name) {
+        // The key normalises case on case-insensitive filesystems, so
+        // "Report.PDF" and "report.pdf" collide there but not on Linux.
+        let path_key = local_path_key(&sanitized_name);
+        if let Some(first_name) = taken_paths.get(&path_key) {
             println!(
                 "{} {} {} collides with {} at {} — the later entry is skipped",
                 "⚠".yellow().bold(),
                 "Collision:".yellow(),
-                format!("{:?}", file.name).dimmed(),
-                format!("{first_name:?}").dimmed(),
+                file.name.dimmed(),
+                first_name.dimmed(),
                 sanitized_name.bold()
             );
             continue;
         }
-        taken_paths.insert(sanitized_name.clone(), file.name.clone());
+        taken_paths.insert(path_key, file.name.clone());
 
         tasks.push(DownloadTask {
             url: absolute_url.to_string(),
@@ -488,5 +512,40 @@ mod tests {
             "https://archive.org/download/item1/file%3A1.mp4"
         );
         assert_eq!(tasks[0].file_path, "file_1.mp4");
+    }
+
+    #[test]
+    fn build_download_tasks_case_collision_follows_filesystem() {
+        // Names differing only by case: on case-insensitive filesystems
+        // (Windows, default macOS) the later entry must be skipped, on
+        // case-sensitive ones (Linux) both names are distinct paths.
+        let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
+        let files = vec![
+            xml_file("Report.PDF", Some(1)),
+            xml_file("report.pdf", Some(2)),
+        ];
+        let (tasks, _) = build_download_tasks(files, &base).expect("tasks must build");
+
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                tasks.len(),
+                2,
+                "differing case must stay two files on Linux"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(tasks.len(), 1, "the case-colliding entry must be skipped");
+            assert_eq!(tasks[0].file_path, "Report.PDF");
+        }
+    }
+
+    #[test]
+    fn local_path_key_normalises_case_per_platform() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(local_path_key("A/b.pdf"), "A/b.pdf");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(local_path_key("A/b.PDF"), "a/b.pdf");
     }
 }
