@@ -357,7 +357,7 @@ impl RetryTracker {
 
         if self.count > MAX_RETRIES {
             println!(
-                "{} {}      {} Maximum retries ({}) exceeded",
+                "{} {}       {} Maximum retries ({}) exceeded",
                 "├╼".cyan().dimmed(),
                 "Failed".red().bold(),
                 "✘".red().bold(),
@@ -373,7 +373,7 @@ impl RetryTracker {
             .unwrap_or_else(|| (self.delay)(self.count));
 
         println!(
-            "{} {}      {} {} (attempt {}/{}): {}",
+            "{} {}        {} {} (attempt {}/{}): {}",
             "├╼".cyan().dimmed(),
             "Retry".yellow().bold(),
             "⟳".yellow().bold(),
@@ -383,7 +383,7 @@ impl RetryTracker {
             detail
         );
         println!(
-            "{} {}      Waiting {:.1}s before retry{}",
+            "{} {}         Waiting {:.1}s before retry{}",
             "├╼".cyan().dimmed(),
             "Wait".white(),
             delay.as_secs_f64(),
@@ -601,7 +601,7 @@ async fn download_file_content(
 
                 pb.finish_and_clear();
                 print_downloaded_line(
-                    &"├╼".cyan().dimmed(),
+                    "├╼".cyan().dimmed(),
                     downloaded_bytes,
                     Some(start_time.elapsed()),
                 );
@@ -734,6 +734,80 @@ enum FileOutcome {
     Failed(String),
 }
 
+/// Outcome of checking the existing copy of a file before downloading
+enum ExistingFileHandling {
+    /// The existing copy is valid; nothing left to do
+    Done,
+    /// No valid copy on disk; the file must be (re)downloaded
+    Download,
+    /// The stale copy could not be removed; hold the failure reason
+    Blocked(String),
+}
+
+/// Disposes of the existing (final) copy of a file before downloading it:
+/// a verified copy finishes the job, a stale copy is removed so the
+/// download starts from a clean slate, and any leftover `.part` file is
+/// cleaned up either way.
+fn handle_existing_file(
+    file_path: &str,
+    part_path: &str,
+    expected_md5: Option<&str>,
+    expected_size: Option<u64>,
+    expected_mtime: Option<u64>,
+    running: &Arc<AtomicBool>,
+) -> Result<ExistingFileHandling> {
+    match check_existing_file(file_path, expected_md5, expected_size, running)? {
+        ExistingFileStatus::Verified { md5 } => {
+            remove_part_file(part_path);
+            // No request is made for a verified file, so only the XML
+            // mtime is available here.
+            if let Some(target) = mtime_from_xml(expected_mtime) {
+                sync_file_mtime(file_path, target);
+            }
+            print_verified_hash(md5.as_deref());
+            Ok(ExistingFileHandling::Done)
+        }
+        ExistingFileStatus::Invalid => {
+            println!(
+                "{} {}      {} the existing file failed verification, re-downloading",
+                "├╼".cyan().dimmed(),
+                "Partial".white(),
+                "▲".yellow().bold()
+            );
+            if let Err(e) = fs::remove_file(file_path) {
+                // A stale file that cannot be removed (locked, read-only)
+                // is a per-file failure, not a batch-aborting one.
+                remove_part_file(part_path);
+                return Ok(ExistingFileHandling::Blocked(format!(
+                    "stale file could not be removed: {e}"
+                )));
+            }
+            remove_part_file(part_path);
+            Ok(ExistingFileHandling::Download)
+        }
+        ExistingFileStatus::Missing => Ok(ExistingFileHandling::Download),
+    }
+}
+
+/// Installs a verified `.part` file under its final name, then sets its
+/// mtime: the server's Last-Modified header wins, the `_files.xml` mtime is
+/// the fallback, and the time is left untouched when both are absent.
+fn install_downloaded_file(
+    file_path: &str,
+    part_path: &str,
+    server_mtime: Option<SystemTime>,
+    xml_mtime: Option<u64>,
+) -> Result<()> {
+    if Path::new(file_path).exists() {
+        fs::remove_file(file_path)?;
+    }
+    fs::rename(part_path, file_path)?;
+    if let Some(target) = server_mtime.or(mtime_from_xml(xml_mtime)) {
+        sync_file_mtime(file_path, target);
+    }
+    Ok(())
+}
+
 /// Processes one file of the batch: verifies an existing copy or downloads
 /// (with verification) and renames the `.part` file to its final name.
 ///
@@ -759,36 +833,17 @@ async fn process_file(
 
     let part_path = format!("{}.part", file_path);
 
-    match check_existing_file(file_path, expected_md5, expected_size, running)? {
-        ExistingFileStatus::Verified { md5 } => {
-            // Final file is already valid; clean up any stale .part file
-            remove_part_file(&part_path);
-            // No request is made for a verified file, so only the XML
-            // mtime is available here.
-            if let Some(target) = mtime_from_xml(expected_mtime) {
-                sync_file_mtime(file_path, target);
-            }
-            print_verified_hash(md5.as_deref());
-            return Ok(FileOutcome::Succeeded);
-        }
-        ExistingFileStatus::Invalid => {
-            println!(
-                "{} {}      {} the existing file failed verification, re-downloading",
-                "├╼".cyan().dimmed(),
-                "Partial".white(),
-                "▲".yellow().bold()
-            );
-            if let Err(e) = fs::remove_file(file_path) {
-                // A stale file that cannot be removed (locked, read-only)
-                // is a per-file failure, not a batch-aborting one.
-                remove_part_file(&part_path);
-                return Ok(FileOutcome::Failed(format!(
-                    "stale file could not be removed: {e}"
-                )));
-            }
-            remove_part_file(&part_path);
-        }
-        ExistingFileStatus::Missing => {}
+    match handle_existing_file(
+        file_path,
+        &part_path,
+        expected_md5,
+        expected_size,
+        expected_mtime,
+        running,
+    )? {
+        ExistingFileHandling::Done => return Ok(FileOutcome::Succeeded),
+        ExistingFileHandling::Blocked(reason) => return Ok(FileOutcome::Failed(reason)),
+        ExistingFileHandling::Download => {}
     }
 
     let outcome = run_download_attempts(
@@ -804,16 +859,7 @@ async fn process_file(
 
     match outcome {
         DownloadOutcome::Verified { server_mtime } => {
-            if Path::new(file_path).exists() {
-                fs::remove_file(file_path)?;
-            }
-            fs::rename(&part_path, file_path)?;
-            // Prefer the server's Last-Modified header, fall back to the
-            // mtime from _files.xml, and leave the time untouched if both
-            // are absent.
-            if let Some(target) = server_mtime.or(mtime_from_xml(expected_mtime)) {
-                sync_file_mtime(file_path, target);
-            }
+            install_downloaded_file(file_path, &part_path, server_mtime, expected_mtime)?;
             Ok(FileOutcome::Succeeded)
         }
         DownloadOutcome::Failed {
@@ -884,7 +930,7 @@ async fn run_download_attempts(
             remove_part_file(part_path);
             file = prepare_file_for_download(part_path)?;
             println!(
-                "{} {}      {} Re-downloading from scratch (attempt {}/{})",
+                "{} {}        {} Re-downloading from scratch (attempt {}/{})",
                 "├╼".cyan().dimmed(),
                 "Retry".yellow().bold(),
                 "⟳".yellow().bold(),
@@ -1021,176 +1067,9 @@ fn batch_failed(failed_files: &[(String, String)], total: usize) -> IaGetError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{mtime_of, temp_dir_for};
+    use crate::test_support::{mtime_of, temp_dir_for, MockBody, MockResponse, MockServer};
     use std::collections::{HashMap, VecDeque};
-    use std::net::{TcpListener, TcpStream};
-    use std::sync::Mutex;
-    use std::thread;
     use std::time::Instant;
-
-    /// Body variant for mock server responses
-    #[derive(Clone)]
-    enum MockBody {
-        /// Send the whole body
-        Full(Vec<u8>),
-        /// Announce `announced_len` bytes via Content-Length, send only
-        /// `partial` bytes, then close the connection mid-body
-        Truncated {
-            announced_len: u64,
-            partial: Vec<u8>,
-        },
-    }
-
-    #[derive(Clone)]
-    struct MockResponse {
-        status: u16,
-        body: MockBody,
-        extra_headers: Vec<(String, String)>,
-    }
-
-    impl MockResponse {
-        fn new(status: u16, body: MockBody) -> Self {
-            Self {
-                status,
-                body,
-                extra_headers: vec![],
-            }
-        }
-
-        fn with_header(mut self, name: &str, value: &str) -> Self {
-            self.extra_headers
-                .push((name.to_string(), value.to_string()));
-            self
-        }
-    }
-
-    struct ServerState {
-        scripts: HashMap<String, VecDeque<MockResponse>>,
-        fallback: MockResponse,
-        request_count: usize,
-        ranges: Vec<Option<u64>>,
-    }
-
-    struct MockServer {
-        base_url: String,
-        state: Arc<Mutex<ServerState>>,
-    }
-
-    impl MockServer {
-        fn url(&self, path: &str) -> String {
-            format!("{}{}", self.base_url, path)
-        }
-
-        fn request_count(&self) -> usize {
-            self.state.lock().unwrap().request_count
-        }
-
-        fn ranges(&self) -> Vec<Option<u64>> {
-            self.state.lock().unwrap().ranges.clone()
-        }
-    }
-
-    fn handle_mock_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
-        // Read the request head
-        let mut buf: Vec<u8> = Vec::new();
-        let mut chunk = [0u8; 1024];
-        loop {
-            match stream.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    buf.extend_from_slice(&chunk[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-
-        let head = String::from_utf8_lossy(&buf).into_owned();
-        let path = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or("/")
-            .to_string();
-        let range = head
-            .lines()
-            .find(|line| line.to_ascii_lowercase().starts_with("range:"))
-            .and_then(|line| {
-                line.split_once(':')?
-                    .1
-                    .trim()
-                    .strip_prefix("bytes=")?
-                    .split('-')
-                    .next()?
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-            });
-
-        let response = {
-            let mut st = state.lock().unwrap();
-            st.request_count += 1;
-            st.ranges.push(range);
-            st.scripts
-                .get_mut(&path)
-                .and_then(|q| q.pop_front())
-                .unwrap_or_else(|| st.fallback.clone())
-        };
-
-        let (status, announced_len, body_bytes) = match &response.body {
-            MockBody::Full(data) => (response.status, data.len() as u64, data.clone()),
-            MockBody::Truncated {
-                announced_len,
-                partial,
-            } => (response.status, *announced_len, partial.clone()),
-        };
-
-        let reason = StatusCode::from_u16(status)
-            .ok()
-            .and_then(|s| s.canonical_reason())
-            .unwrap_or("Unknown")
-            .to_string();
-        let mut out = format!("HTTP/1.1 {} {}\r\n", status, reason);
-        out.push_str(&format!("Content-Length: {}\r\n", announced_len));
-        for (name, value) in &response.extra_headers {
-            out.push_str(&format!("{}: {}\r\n", name, value));
-        }
-        out.push_str("Connection: close\r\n\r\n");
-
-        let _ = stream.write_all(out.as_bytes());
-        let _ = stream.write_all(&body_bytes);
-        // The stream is dropped here: for Truncated bodies this closes the
-        // connection before the announced Content-Length has been delivered.
-    }
-
-    /// Starts a mock HTTP server on 127.0.0.1 that serves scripted responses
-    /// per path (falling back to `fallback` once the script is exhausted).
-    fn start_mock_server(
-        scripts: HashMap<String, VecDeque<MockResponse>>,
-        fallback: MockResponse,
-    ) -> MockServer {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock server");
-        let port = listener.local_addr().unwrap().port();
-        let state = Arc::new(Mutex::new(ServerState {
-            scripts,
-            fallback,
-            request_count: 0,
-            ranges: Vec::new(),
-        }));
-        let handler_state = state.clone();
-        thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                handle_mock_connection(stream, &handler_state);
-            }
-        });
-
-        MockServer {
-            base_url: format!("http://127.0.0.1:{}", port),
-            state,
-        }
-    }
 
     /// Near-instant retry delay so tests do not wait for real backoff
     fn fast_retry(_attempt: u32) -> Duration {
@@ -1256,7 +1135,7 @@ mod tests {
                 MockResponse::new(200, MockBody::Full(content.to_vec())),
             ]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("http_500");
         let part = dir.join("file.bin.part");
@@ -1282,7 +1161,7 @@ mod tests {
             VecDeque::from(vec![MockResponse::new(200, MockBody::Full(vec![]))]),
         );
         // Fallback also returns an empty 200 so every retry sees the same
-        let server = start_mock_server(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("empty_response");
         let part = dir.join("file.bin.part");
@@ -1316,7 +1195,7 @@ mod tests {
                 MockResponse::new(206, MockBody::Full(full[8..].to_vec())),
             ]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(206, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(206, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("mid_stream");
         let part = dir.join("file.bin.part");
@@ -1342,7 +1221,7 @@ mod tests {
             "/file.bin".to_string(),
             VecDeque::from(vec![MockResponse::new(200, MockBody::Full(full.to_vec()))]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("range_ignored");
         let part = dir.join("file.bin.part");
@@ -1374,7 +1253,7 @@ mod tests {
                 MockBody::Full(b"Range not satisfiable".to_vec()),
             )]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(416, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(416, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("http_416");
         let part = dir.join("file.bin.part");
@@ -1402,7 +1281,7 @@ mod tests {
                 MockBody::Full(b"not found".to_vec()),
             )]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(404, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("http_404");
         let part = dir.join("file.bin.part");
@@ -1434,7 +1313,7 @@ mod tests {
                 MockResponse::new(200, MockBody::Full(content.to_vec())),
             ]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(429, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(429, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("retry_after");
         let part = dir.join("file.bin.part");
@@ -1476,7 +1355,7 @@ mod tests {
                 MockBody::Full(ok_content.to_vec()),
             )]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(404, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("batch_continue");
         let missing_path = dir.join("missing.bin").to_str().unwrap().to_string();
@@ -1534,7 +1413,7 @@ mod tests {
                 MockBody::Full(ok_content.to_vec()),
             )]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(404, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("stop_on_error");
         let missing_path = dir.join("missing.bin").to_str().unwrap().to_string();
@@ -1589,7 +1468,7 @@ mod tests {
                 MockResponse::new(200, MockBody::Full(correct.to_vec())),
             ]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("hash_mismatch");
         let file_path = dir.join("file.bin").to_str().unwrap().to_string();
@@ -1639,7 +1518,7 @@ mod tests {
             )
             .with_header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("last_modified");
         let part = dir.join("file.bin.part");
@@ -1673,7 +1552,7 @@ mod tests {
                 MockBody::Full(content.to_vec()),
             )]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("xml_mtime");
         let file_path = dir.join("file.bin").to_str().unwrap().to_string();
@@ -1720,7 +1599,7 @@ mod tests {
             )
             .with_header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("server_mtime");
         let file_path = dir.join("file.bin").to_str().unwrap().to_string();
@@ -1751,7 +1630,7 @@ mod tests {
         let content = b"already-verified-content";
         let xml_mtime = 1_545_586_142;
 
-        let server = start_mock_server(
+        let server = MockServer::start(
             HashMap::new(),
             MockResponse::new(200, MockBody::Full(vec![])),
         );
@@ -1800,7 +1679,7 @@ mod tests {
                 MockBody::Full(content.to_vec()),
             )]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("no_mtime");
         let file_path = dir.join("file.bin").to_str().unwrap().to_string();
@@ -1894,7 +1773,7 @@ mod tests {
                 MockBody::Full(content.to_vec()),
             )]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("size_mismatch_skip");
         let file_path = dir.join("file.bin").to_str().unwrap().to_string();
@@ -1937,7 +1816,7 @@ mod tests {
                 MockBody::Full(ok_content.to_vec()),
             )]),
         );
-        let server = start_mock_server(scripts, MockResponse::new(404, MockBody::Full(vec![])));
+        let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
 
         let dir = temp_dir_for("unremovable_stale");
         // A directory at the final path: both MD5 calculation and remove_file

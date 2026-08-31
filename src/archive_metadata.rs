@@ -1,9 +1,16 @@
 use crate::constants::XML_DEBUG_TRUNCATE_LEN;
-use crate::{downloader, IaGetError, Result};
+use crate::cookie::cookie_header_value;
+use crate::downloader::{parse_last_modified, sync_file_mtime};
+use crate::utils::with_cookie;
+use crate::{IaGetError, Result};
+use colored::*;
+use indicatif::ProgressBar;
+use reqwest::header::HeaderValue;
+use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_xml_rs::from_str;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Root structure for parsing the XML files list from archive.org
 /// The actual XML structure has a `files` root element containing multiple `file` elements
@@ -25,7 +32,7 @@ pub struct XmlFiles {
 /// </file>
 /// ```
 #[allow(dead_code)]
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct XmlFile {
     #[serde(rename = "@name")]
     pub name: String,
@@ -88,16 +95,201 @@ pub fn save_xml_metadata(
     std::fs::write(path, content)?;
 
     if let Some(target) = last_modified {
-        downloader::sync_file_mtime(path, target);
+        sync_file_mtime(path, target);
     }
 
     Ok(())
 }
 
+/// Timeout for the HEAD accessibility check
+const HEAD_CHECK_TIMEOUT_SECS: u64 = 60;
+
+/// Checks if a URL is accessible by sending a HEAD request
+pub async fn is_url_accessible(
+    url: &Url,
+    client: &Client,
+    cookie_header: Option<&HeaderValue>,
+) -> Result<()> {
+    let request = with_cookie(client.head(url.clone()), cookie_header);
+
+    let response = request
+        .timeout(Duration::from_secs(HEAD_CHECK_TIMEOUT_SECS))
+        .send()
+        .await?;
+
+    response.error_for_status()?;
+    Ok(())
+}
+
+/// Converts a details URL to the corresponding XML files list URL
+///
+/// Takes an archive.org details URL and converts it to the XML metadata URL
+/// by replacing "details" with "download" and appending "_files.xml"
+///
+/// # Arguments
+/// * `original_url` - The archive.org details URL
+///
+/// # Returns
+/// The corresponding XML files list URL
+pub fn get_xml_url(original_url: &str) -> String {
+    // Remove trailing slash if present to get a consistent base for identifier extraction
+    let trimmed_url = original_url.trim_end_matches('/');
+
+    // The identifier is the last segment of the trimmed URL
+    // This expect is considered safe because get_xml_url is only called after
+    // validate_archive_url has confirmed the URL structure.
+    let identifier = trimmed_url
+        .rsplit('/')
+        .next() // Changed from split().last() to address clippy warning
+        .expect("Validated URL should have a valid identifier segment after validation");
+
+    // The base URL for download is "https://archive.org/download/{identifier}"
+    let download_url_base = format!("https://archive.org/download/{}", identifier);
+
+    // The XML URL is "{download_url_base}/{identifier}_files.xml"
+    format!("{}/{}_files.xml", download_url_base, identifier)
+}
+
+/// Percent-encodes every path segment of a file name, preserving the `/`
+/// separators, so that URL-special characters in the name (`?`, `#`, `%`,
+/// spaces, non-ASCII, ...) cannot be misread as a query string or fragment
+/// by `Url::join`.
+///
+/// This is the RFC 3986 "unreserved" set, not form-URL-encoding: a space
+/// must become `%20` (never `+`), which is why a small encoder is written
+/// here instead of reusing `form_urlencoded::byte_serialize`.
+pub fn encode_download_path(name: &str) -> String {
+    let mut out = String::new();
+    for (i, segment) in name.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        for ch in segment.chars() {
+            match ch {
+                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(ch),
+                _ => {
+                    let mut buf = [0u8; 4];
+                    for b in ch.encode_utf8(&mut buf).as_bytes() {
+                        out.push_str(&format!("%{b:02X}"));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The `_files.xml` entry name: the last path segment of the XML URL
+/// (which always ends in "<identifier>_files.xml", see get_xml_url)
+pub fn xml_file_name_of(url: &Url) -> &str {
+    url.path()
+        .rsplit('/')
+        .next()
+        .expect("XML URL should have a file name segment")
+}
+
+/// XML metadata response: the parsed file list plus the raw data needed to
+/// persist the `_files.xml` document locally.
+#[derive(Debug)]
+pub struct XmlMetadata {
+    /// The parsed `_files.xml` file list
+    pub files: XmlFiles,
+    /// The URL the metadata was fetched from (the download base for files)
+    pub base_url: Url,
+    /// The `Cookie` header for the metadata host, if any was supplied
+    pub cookie_header: Option<HeaderValue>,
+    /// The raw XML content, to persist locally
+    pub content: String,
+    /// The server's `Last-Modified` time, if the server sent one
+    pub last_modified: Option<SystemTime>,
+}
+
+/// Fetches and parses XML metadata from archive.org
+///
+/// Combines XML URL generation, accessibility check, download, and parsing
+/// into a single operation with integrated error handling.
+///
+/// # Arguments
+/// * `details_url` - The original archive.org details URL
+/// * `client` - HTTP client for requests
+/// * `spinner` - Progress spinner to update during processing
+///
+/// # Returns
+/// The `XmlMetadata` with the parsed files, base URL, cookie header, raw
+/// XML content and the server's `Last-Modified` time
+pub async fn fetch_xml_metadata(
+    details_url: &str,
+    client: &Client,
+    spinner: &ProgressBar,
+    cookie_input: Option<&str>,
+) -> Result<XmlMetadata> {
+    // Generate XML URL
+    let xml_url = get_xml_url(details_url);
+    spinner.set_message(format!(
+        "{} Accessing XML metadata: {}",
+        "⚙".blue(),
+        xml_url.bold()
+    ));
+    fetch_and_parse_xml(&xml_url, client, spinner, cookie_input).await
+}
+
+/// Fetches, downloads and parses a `_files.xml` document from an explicit URL.
+///
+/// Split out of `fetch_xml_metadata` so tests can point it at a local mock
+/// server instead of the fixed archive.org download URL.
+pub async fn fetch_and_parse_xml(
+    xml_url: &str,
+    client: &Client,
+    spinner: &ProgressBar,
+    cookie_input: Option<&str>,
+) -> Result<XmlMetadata> {
+    // Parse base URL and fetch XML content
+    let base_url = Url::parse(xml_url)?;
+    let cookie_header = cookie_header_value(cookie_input, &base_url)?;
+
+    // Check XML URL accessibility
+    if let Err(e) = is_url_accessible(&base_url, client, cookie_header.as_ref()).await {
+        spinner.finish_with_message(format!(
+            "{} XML metadata not accessible: {}",
+            "✘".red().bold(),
+            xml_url.bold()
+        ));
+        return Err(e); // Propagate the error
+    }
+
+    spinner.set_message(format!(
+        "{} {}",
+        "⚙".blue(),
+        "Parsing archive metadata...".bold()
+    ));
+
+    let request = with_cookie(client.get(base_url.clone()), cookie_header.as_ref());
+
+    // The HEAD check above can pass while the GET still fails (throttling,
+    // transient edge errors): surface it as a network error instead of
+    // feeding an error page into the XML parser.
+    let response = request.send().await?.error_for_status()?;
+    let last_modified = parse_last_modified(response.headers());
+    let xml_content = response.text().await?;
+
+    // Parse XML content with improved error handling
+    let files = parse_xml_files(&xml_content)?;
+
+    Ok(XmlMetadata {
+        files,
+        base_url,
+        cookie_header,
+        content: xml_content,
+        last_modified,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{mtime_of, temp_dir_for};
+    use crate::test_support::{mtime_of, temp_dir_for, MockBody, MockResponse, MockServer};
+    use crate::utils::create_spinner;
+    use std::collections::{HashMap, VecDeque};
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -163,5 +355,119 @@ mod tests {
             mtime.abs_diff(now) < 60,
             "mtime {mtime} should be within 60s of now {now}"
         );
+    }
+
+    #[test]
+    fn get_xml_url_converts_details_url() {
+        assert_eq!(
+            get_xml_url("https://archive.org/details/item1"),
+            "https://archive.org/download/item1/item1_files.xml"
+        );
+        assert_eq!(
+            get_xml_url("https://archive.org/details/item1/"), // With trailing slash
+            "https://archive.org/download/item1/item1_files.xml"
+        );
+        assert_eq!(
+            get_xml_url("https://archive.org/details/another-item_v2.0"),
+            "https://archive.org/download/another-item_v2.0/another-item_v2.0_files.xml"
+        );
+        assert_eq!(
+            get_xml_url("https://archive.org/details/another-item_v2.0/"), // With trailing slash
+            "https://archive.org/download/another-item_v2.0/another-item_v2.0_files.xml"
+        );
+    }
+
+    #[test]
+    fn encode_download_path_escapes_url_specials() {
+        // '#' starts a fragment and '?' a query — both must be escaped.
+        assert_eq!(encode_download_path("clip#1.mp4"), "clip%231.mp4");
+        assert_eq!(encode_download_path("a?b.mp4"), "a%3Fb.mp4");
+        // A literal '%' in the name must be escaped so it is not read as an
+        // existing escape sequence.
+        assert_eq!(encode_download_path("100%25off.mp4"), "100%2525off.mp4");
+        // Spaces and non-ASCII are encoded; '/' separators are preserved.
+        assert_eq!(
+            encode_download_path("sub dir/файл.mp4"),
+            "sub%20dir/%D1%84%D0%B0%D0%B9%D0%BB.mp4"
+        );
+        // Unreserved characters pass through unchanged.
+        assert_eq!(
+            encode_download_path("plain-file_v2.0.tar.gz"),
+            "plain-file_v2.0.tar.gz"
+        );
+    }
+
+    #[test]
+    fn file_url_join_must_not_silently_fall_back() {
+        // Regression: a failed join used to keep the XML metadata URL, which
+        // would download _files.xml under the file's name. Encoded names must
+        // always join cleanly against the metadata base URL.
+        let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
+        let joined = base
+            .join(&encode_download_path("Season 1/clip#1.mp4"))
+            .expect("encoded name must join against the base URL");
+        assert_eq!(
+            joined.as_str(),
+            "https://archive.org/download/item1/Season%201/clip%231.mp4"
+        );
+    }
+
+    #[tokio::test]
+    async fn xml_metadata_http_error_is_a_network_error() {
+        // The HEAD check passes; the GET must fail with a status error.
+        let mut scripts = HashMap::new();
+        scripts.insert(
+            "/download/item1/item1_files.xml".to_string(),
+            VecDeque::from(vec![
+                MockResponse::new(200, MockBody::Full(vec![])), // HEAD check
+                MockResponse::new(
+                    500,
+                    MockBody::Full(b"<html><body>nginx error page</body></html>".to_vec()),
+                ),
+            ]),
+        );
+        let server = MockServer::start(scripts, MockResponse::new(500, MockBody::Full(vec![])));
+        let url = server.url("/download/item1/item1_files.xml");
+        let client = Client::new();
+        let spinner = create_spinner("mock");
+
+        let err = fetch_and_parse_xml(&url, &client, &spinner, None)
+            .await
+            .expect_err("an HTTP error on the metadata GET must fail the fetch");
+
+        match err {
+            IaGetError::Network(detail) => {
+                assert!(
+                    detail.contains("500"),
+                    "expected the status code in the error, got: {detail}"
+                );
+            }
+            other => panic!("expected a Network error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn xml_metadata_success_parses_files() {
+        let xml = "<files><file name=\"item1_files.xml\" source=\"original\"><size>23</size></file><file name=\"scan.jpg\" source=\"original\"><size>456</size></file></files>";
+        let mut scripts = HashMap::new();
+        scripts.insert(
+            "/download/item1/item1_files.xml".to_string(),
+            VecDeque::from(vec![
+                MockResponse::new(200, MockBody::Full(vec![])), // HEAD check
+                MockResponse::new(200, MockBody::Full(xml.as_bytes().to_vec())),
+            ]),
+        );
+        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+        let url = server.url("/download/item1/item1_files.xml");
+        let client = Client::new();
+        let spinner = create_spinner("mock");
+
+        let meta = fetch_and_parse_xml(&url, &client, &spinner, None)
+            .await
+            .expect("metadata fetch should succeed");
+
+        assert_eq!(meta.files.files.len(), 2);
+        assert_eq!(meta.files.files[1].name, "scan.jpg");
+        assert_eq!(meta.content, xml);
     }
 }

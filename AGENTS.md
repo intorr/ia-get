@@ -33,14 +33,15 @@ Manual test URLs:
 
 ```
 src/
-├── main.rs              # CLI entry point (clap)
+├── main.rs              # CLI entry point (clap) and orchestration
 ├── lib.rs               # Library exports
-├── downloader.rs        # HTTP download logic with retry/resume
-├── archive_metadata.rs  # XML parsing and _files.xml persistence
-├── utils.rs             # Helpers (filename sanitisation, etc.)
-├── error.rs             # Custom error types
-├── constants.rs         # Timeouts, retries, etc.
-└── test_support.rs      # Shared test helpers (lib unit tests only)
+├── downloader.rs        # HTTP download with retry/resume, size + MD5 verification
+├── archive_metadata.rs  # _files.xml fetch, XML parsing, local persistence
+├── cookie.rs            # Cookie header from raw string or Netscape cookies.txt
+├── utils.rs             # Helpers (filename sanitisation, progress bars, status lines)
+├── error.rs             # Custom error types (thiserror)
+├── constants.rs         # User agent, URL pattern, debug limits
+└── test_support.rs      # Shared test helpers (in-memory HTTP mock server)
 ```
 
 ## Dependencies

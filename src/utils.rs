@@ -149,10 +149,12 @@ pub fn finish_spinner(spinner: &ProgressBar, message: &str) {
 /// Print the "Downloaded ↓ size" status line for a finished file
 ///
 /// `prefix` is the pre-styled tree glyph: "├╼" when more lines follow in the
-/// file's block, "╰╼" for its last line. When `elapsed` is present, the
+/// file's block, "╰╼" for its last line. It is taken by value so the
+/// caller's styling survives (a `&ColoredString` coerced to `&str` would
+/// deref to the plain, uncoloured text). When `elapsed` is present, the
 /// transfer time and rate are appended; it is absent for files that never
 /// crossed the network (e.g. the locally saved `_files.xml`).
-pub fn print_downloaded_line(prefix: &str, transferred: u64, elapsed: Option<Duration>) {
+pub fn print_downloaded_line(prefix: ColoredString, transferred: u64, elapsed: Option<Duration>) {
     let head = format!(
         "{} {}   {} {}",
         prefix,
