@@ -266,15 +266,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         last_modified,
     } = fetch_xml_metadata(&cli.url, &client, &spinner, cli.cookies.as_deref()).await?;
 
-    // Persist the freshly fetched _files.xml (overwriting any previous copy)
-    // with the server's Last-Modified time, and announce it as file #1
-    let total_files = save_and_announce_xml(&files, &base_url, &content, last_modified)?;
-
-    // If requested, list parsed filenames and exit
+    // If requested, list parsed filenames and exit: a read-only preview,
+    // nothing is written to the working directory
     if cli.list {
         list_files(&files, &spinner);
         return Ok(());
     }
+
+    // Persist the freshly fetched _files.xml (overwriting any previous copy)
+    // with the server's Last-Modified time, and announce it as file #1
+    let total_files = save_and_announce_xml(&files, &base_url, &content, last_modified)?;
 
     let files = files_to_download(files.files, xml_file_name_of(&base_url));
 

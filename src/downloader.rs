@@ -997,9 +997,10 @@ async fn download_files_with_signal<I>(
 where
     I: IntoIterator<Item = DownloadTask>,
 {
+    let tasks: Vec<DownloadTask> = files.into_iter().collect();
     let mut failed_files: Vec<(String, String)> = Vec::new();
 
-    for (index, task) in files.into_iter().enumerate() {
+    for (index, task) in tasks.iter().enumerate() {
         // Check if we should stop due to signal
         if !running.load(Ordering::SeqCst) {
             println!(
@@ -1011,7 +1012,7 @@ where
 
         let outcome = process_file(
             client,
-            &task,
+            task,
             index + file_number_start,
             total_files,
             running,
@@ -1022,7 +1023,7 @@ where
         if let FileOutcome::Failed(reason) = outcome {
             failed_files.push((task.file_path.clone(), reason));
             if stop_on_error {
-                return Err(batch_failed(&failed_files, total_files));
+                return Err(batch_failed(&failed_files, tasks.len()));
             }
         }
     }
@@ -1038,13 +1039,16 @@ where
         for (path, reason) in &failed_files {
             println!("  {} {}", path.bold(), reason.dimmed());
         }
-        return Err(batch_failed(&failed_files, total_files));
+        return Err(batch_failed(&failed_files, tasks.len()));
     }
 
     Ok(())
 }
 
-/// Builds the terminal `IaGetError::BatchFailed` from the accumulated failures
+/// Builds the terminal `IaGetError::BatchFailed` from the accumulated failures.
+///
+/// `total` is the number of files in this batch; files handled before the
+/// batch (e.g. the locally saved `_files.xml`) are not counted.
 fn batch_failed(failed_files: &[(String, String)], total: usize) -> IaGetError {
     IaGetError::BatchFailed {
         count: failed_files.len(),
@@ -1432,6 +1436,36 @@ mod tests {
             "second file must never be requested"
         );
         assert!(!dir.join("ok.bin").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn batch_failed_total_counts_only_batch_files() {
+        let (_server, dir, files, _ok_content) = missing_and_ok_batch("batch_failed_total");
+        // The archive-wide total includes a file handled before the batch
+        // (the saved _files.xml); the error must not count it.
+        let batch_len = files.len();
+        let err = download_files_with_signal(
+            &Client::new(),
+            files,
+            batch_len + 1,
+            1,
+            None,
+            false,
+            &test_running(),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            IaGetError::BatchFailed { count, total, .. } => {
+                assert_eq!(
+                    (count, total),
+                    (1, 2),
+                    "total must be the batch size, not the archive-wide total"
+                );
+            }
+            other => panic!("expected BatchFailed, got {:?}", other),
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -156,18 +156,20 @@ pub fn get_xml_url(original_url: &str) -> String {
     format!("{}/{}_files.xml", download_url_base, identifier)
 }
 
-/// Percent-encodes every path segment of a file name, preserving the `/`
+/// Percent-encodes every path segment of a file name, preserving internal `/`
 /// separators, so that URL-special characters in the name (`?`, `#`, `%`,
 /// spaces, non-ASCII, ...) cannot be misread as a query string or fragment
-/// by `Url::join`.
+/// by `Url::join`. Leading `/` characters are dropped, so the result always
+/// stays a relative reference: a name like `//host/x` would otherwise be
+/// joined against a *different host*.
 ///
 /// This is the RFC 3986 "unreserved" set, not form-URL-encoding: a space
 /// must become `%20` (never `+`), which is why a small encoder is written
 /// here instead of reusing `form_urlencoded::byte_serialize`.
 pub fn encode_download_path(name: &str) -> String {
     let mut out = String::new();
-    for (i, segment) in name.split('/').enumerate() {
-        if i > 0 {
+    for segment in name.split('/') {
+        if !out.is_empty() {
             out.push('/');
         }
         for ch in segment.chars() {
@@ -421,6 +423,31 @@ mod tests {
         assert_eq!(
             encode_download_path("plain-file_v2.0.tar.gz"),
             "plain-file_v2.0.tar.gz"
+        );
+    }
+
+    #[test]
+    fn encode_download_path_drops_leading_slashes() {
+        // A leading '/' makes the reference path-absolute, and "//host/"
+        // would be read as a different host — both must stay relative.
+        assert_eq!(encode_download_path("/foo.mp4"), "foo.mp4");
+        assert_eq!(
+            encode_download_path("//evil.example/x.mp4"),
+            "evil.example/x.mp4"
+        );
+        // Internal separators, including doubles, are preserved.
+        assert_eq!(encode_download_path("a//b.mp4"), "a//b.mp4");
+    }
+
+    #[test]
+    fn leading_slash_name_stays_under_item() {
+        let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
+        let joined = base
+            .join(&encode_download_path("//evil.example/x.mp4"))
+            .expect("encoded name must join against the base URL");
+        assert_eq!(
+            joined.as_str(),
+            "https://archive.org/download/item1/evil.example/x.mp4"
         );
     }
 
