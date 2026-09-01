@@ -7,7 +7,6 @@
 
 use clap::Parser;
 use colored::*;
-use ia_get::Result;
 use ia_get::archive_metadata::{
     XmlFile, XmlFiles, XmlMetadata, encode_download_path, fetch_and_parse_xml, get_xml_url,
     save_xml_metadata, xml_file_name_of,
@@ -19,6 +18,7 @@ use ia_get::utils::{
     create_spinner, finish_spinner, format_size, last_glyph, print_downloaded_line,
     print_file_banner, sanitize_filename, validate_archive_url,
 };
+use ia_get::{IaGetError, Result};
 use indicatif::ProgressBar;
 use reqwest::{Client, Url};
 use std::collections::HashMap;
@@ -60,6 +60,18 @@ fn build_client() -> Result<Client> {
         .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
         .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_SECS))
         .build()?)
+}
+
+/// Finishes `spinner` with a red ✘ and the error's message when it is still
+/// running, so every failure path leaves a context-rich line on screen.
+///
+/// `spinner` may already be finished (a deeper failure can finish it on its
+/// own before the error reaches here); finishing it again would just repaint
+/// the same line, so the call is skipped in that case.
+fn report_spinner_error(spinner: &ProgressBar, error: &IaGetError) {
+    if !spinner.is_finished() {
+        spinner.finish_with_message(format!("{} {}", "✘".red().bold(), error));
+    }
 }
 
 /// Persists the freshly fetched `_files.xml` (overwriting any previous copy)
@@ -323,14 +335,14 @@ async fn main() {
 /// path finishes it with a human-readable message before the error is
 /// returned, so the caller only has to decide on the exit code.
 async fn run(cli: &Cli) -> Result<()> {
-    let client = build_client()?;
-
     // Start a single spinner for the entire initialization process
     let spinner = create_spinner(&format!("Processing archive.org URL: {}", cli.url.bold()));
 
+    let client = build_client().inspect_err(|e| report_spinner_error(&spinner, e))?;
+
     // Validate URL format using consolidated function
     if let Err(e) = validate_archive_url(&cli.url) {
-        spinner.finish_with_message(format!("{} {}", "✘".red().bold(), e));
+        report_spinner_error(&spinner, &e);
         return Err(e);
     }
 
@@ -339,8 +351,13 @@ async fn run(cli: &Cli) -> Result<()> {
     // metadata fetch and the file downloads, so a path-scoped cookie
     // applies consistently across the run.
     let xml_url = get_xml_url(&cli.url);
-    let download_url = Url::parse(&xml_url)?;
-    let cookie_header = cookie_header_value(cli.cookies.as_deref(), &download_url)?;
+    let download_url = Url::parse(&xml_url).map_err(|e| {
+        let error = IaGetError::from(e);
+        report_spinner_error(&spinner, &error);
+        error
+    })?;
+    let cookie_header = cookie_header_value(cli.cookies.as_deref(), &download_url)
+        .inspect_err(|e| report_spinner_error(&spinner, e))?;
 
     // Fetch and parse XML metadata in one operation. The accessibility
     // pre-check inside the fetch finishes the spinner with a context-rich
@@ -352,15 +369,9 @@ async fn run(cli: &Cli) -> Result<()> {
         cookie_header,
         content,
         last_modified,
-    } = match fetch_and_parse_xml(&xml_url, &client, &spinner, cookie_header.as_ref()).await {
-        Ok(metadata) => metadata,
-        Err(e) => {
-            if !spinner.is_finished() {
-                spinner.finish_with_message(format!("{} {}", "✘".red().bold(), e));
-            }
-            return Err(e);
-        }
-    };
+    } = fetch_and_parse_xml(&xml_url, &client, &spinner, cookie_header.as_ref())
+        .await
+        .inspect_err(|e| report_spinner_error(&spinner, e))?;
 
     // If requested, list parsed filenames and exit: a read-only preview,
     // nothing is written to the working directory
@@ -373,16 +384,11 @@ async fn run(cli: &Cli) -> Result<()> {
     // announced, so the counts below only include the tasks that will
     // actually run (entries skipped for empty names or path collisions
     // never appear in the numbering).
-    let plan = match plan_download_tasks(
+    let plan = plan_download_tasks(
         files_to_download(files.files, xml_file_name_of(&base_url)),
         &base_url,
-    ) {
-        Ok(plan) => plan,
-        Err(e) => {
-            spinner.finish_with_message(format!("{} {}", "✘".red().bold(), e));
-            return Err(e);
-        }
-    };
+    )
+    .inspect_err(|e| report_spinner_error(&spinner, e))?;
 
     // The saved _files.xml occupies file #1; the planned tasks follow
     // right after it.
@@ -390,10 +396,8 @@ async fn run(cli: &Cli) -> Result<()> {
 
     // Persist the freshly fetched _files.xml (overwriting any previous copy)
     // with the server's Last-Modified time, and announce it as file #1
-    if let Err(e) = save_and_announce_xml(&base_url, &content, last_modified, total_files) {
-        spinner.finish_with_message(format!("{} {}", "✘".red().bold(), e));
-        return Err(e);
-    }
+    save_and_announce_xml(&base_url, &content, last_modified, total_files)
+        .inspect_err(|e| report_spinner_error(&spinner, e))?;
 
     // Successfully finished initialization; separate the banner from the
     // saved-metadata block above.
