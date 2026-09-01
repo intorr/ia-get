@@ -56,8 +56,14 @@ fn read_cookie_file(input: &str) -> Result<String> {
 pub fn cookie_header_from_input(input: &str, url: &Url) -> Result<String> {
     if Path::new(input).is_file() {
         let cookie_file = read_cookie_file(input)?;
-        if has_netscape_cookie_line(&cookie_file) || !input.contains('=') {
-            let header = cookie_header_from_netscape_file(&cookie_file, url)?;
+        let cookies = parse_netscape_cookies(&cookie_file);
+        // The file must either hold at least one recognizable Netscape
+        // cookie line or look nothing like a raw cookie pair (no `=`);
+        // otherwise a raw cookie string that merely collides with a
+        // filename in the working directory would be swallowed as an
+        // empty cookies.txt.
+        if !cookies.is_empty() || !input.contains('=') {
+            let header = cookie_header_from_cookies(&cookies, url)?;
             if header.is_empty() {
                 println!(
                     "{} {} {}",
@@ -72,11 +78,10 @@ pub fn cookie_header_from_input(input: &str, url: &Url) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
-/// True when the content holds at least one recognizable Netscape cookies.txt line.
-fn has_netscape_cookie_line(content: &str) -> bool {
-    content
-        .lines()
-        .any(|line| parse_netscape_cookie(line).is_some())
+/// Parses Netscape cookies.txt content into the cookies it defines,
+/// skipping blank lines, comments and malformed entries.
+fn parse_netscape_cookies(content: &str) -> Vec<NetscapeCookie> {
+    content.lines().filter_map(parse_netscape_cookie).collect()
 }
 
 fn parse_netscape_cookie(line: &str) -> Option<NetscapeCookie> {
@@ -160,6 +165,17 @@ fn cookie_applies_to_url(cookie: &NetscapeCookie, url: &Url, now: u64) -> bool {
 
 /// Parses Netscape cookies.txt content into an HTTP Cookie header value.
 pub fn cookie_header_from_netscape_file(content: &str, url: &Url) -> Result<String> {
+    cookie_header_from_cookies(&parse_netscape_cookies(content), url)
+}
+
+/// Builds the HTTP Cookie header value from the parsed cookies that apply
+/// to `url` (domain, path, expiry, `secure` scheme).
+///
+/// A cookie whose name or value cannot become an HTTP header value
+/// (a control character or DEL, e.g. from a corrupted browser export)
+/// is dropped with a warning instead of failing the whole run: the
+/// remaining cookies still authenticate the request.
+fn cookie_header_from_cookies(cookies: &[NetscapeCookie], url: &Url) -> Result<String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| IaGetError::FileSystem {
@@ -168,14 +184,9 @@ pub fn cookie_header_from_netscape_file(content: &str, url: &Url) -> Result<Stri
         })?
         .as_secs();
 
-    // A cookie whose name or value cannot become an HTTP header value
-    // (a control character or DEL, e.g. from a corrupted browser export)
-    // is dropped with a warning instead of failing the whole run: the
-    // remaining cookies still authenticate the request.
     let mut header_parts: Vec<String> = Vec::new();
-    for cookie in content
-        .lines()
-        .filter_map(parse_netscape_cookie)
+    for cookie in cookies
+        .iter()
         .filter(|cookie| cookie_applies_to_url(cookie, url, now))
     {
         let pair = format!("{}={}", cookie.name, cookie.value);

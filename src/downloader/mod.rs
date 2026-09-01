@@ -280,6 +280,88 @@ enum DownloadOutcome {
     Failed { reason: String, discard_part: bool },
 }
 
+/// Outcome of verifying a `.part` file against the metadata
+enum PartVerification {
+    /// The size and, when the metadata provides one, the MD5 match
+    Valid,
+    /// The contents do not match the metadata
+    Mismatch,
+    /// The file could not be read; holds the problem for the failure report
+    Unreadable(String),
+}
+
+/// Verifies a `.part` file, so the two call sites in `run_download_attempts`
+/// do not each repeat the interruption check: a user interrupt propagates,
+/// and an I/O error while reading the file back (e.g. a momentary AV lock)
+/// is not "corrupted" — the complete `.part` is kept so the next run can
+/// verify it in place.
+fn verify_part(
+    part_path: &str,
+    expected_md5: Option<&str>,
+    expected_size: Option<u64>,
+    running: &Arc<AtomicBool>,
+) -> Result<PartVerification> {
+    match verify_downloaded_file(part_path, expected_md5, expected_size, running) {
+        Ok(true) => Ok(PartVerification::Valid),
+        Ok(false) => Ok(PartVerification::Mismatch),
+        Err(e) if matches!(e, IaGetError::Interrupted) => Err(e),
+        Err(e) => Ok(PartVerification::Unreadable(e.to_string())),
+    }
+}
+
+/// What a 416 (the server rejected our resume offset) does to the attempt loop
+enum OffsetRejected {
+    /// The `.part` already held the whole file and verified in place: the
+    /// download is done
+    Verified,
+    /// The `.part` is not a valid prefix: it must not be kept if the attempts
+    /// end here, and the next attempt re-downloads from scratch
+    Redownload { reason: String },
+    /// The complete `.part` could not be verified; the file fails as a whole
+    Failed { reason: String },
+}
+
+/// Handles a 416: the `.part` file is not a valid prefix, so it must not be
+/// kept if the attempts end here.
+///
+/// One exception: a 416 for `bytes=N-` also fires when the part already
+/// holds the whole file (a previous run was interrupted after the body
+/// finished but before verification) — a part of exactly the expected size
+/// that also hashes correctly is verified in place instead of being
+/// discarded and re-downloaded.
+fn handle_rejected_offset(
+    file: &File,
+    part_path: &str,
+    expected_md5: Option<&str>,
+    expected_size: Option<u64>,
+    running: &Arc<AtomicBool>,
+) -> Result<OffsetRejected> {
+    let complete_part = expected_size
+        .is_some_and(|expected| file.metadata().is_ok_and(|meta| meta.len() == expected));
+    if complete_part && expected_md5.is_some() {
+        println!(
+            "{} {}       {} the .part file is already complete, verifying it in place",
+            branch_glyph(),
+            "Resume".white(),
+            "↻".green().bold()
+        );
+        match verify_part(part_path, expected_md5, expected_size, running)? {
+            PartVerification::Valid => return Ok(OffsetRejected::Verified),
+            // The size matched but the hash did not: size alone is not
+            // proof, so fall through and re-download from scratch.
+            PartVerification::Mismatch => {}
+            PartVerification::Unreadable(reason) => {
+                return Ok(OffsetRejected::Failed {
+                    reason: format!("could not verify complete .part file: {reason}"),
+                });
+            }
+        }
+    }
+    Ok(OffsetRejected::Redownload {
+        reason: IaGetError::RangeNotSatisfiable.to_string(),
+    })
+}
+
 /// Runs the download+verification attempts for one file, re-downloading from
 /// scratch after a failed verification or a rejected resume offset (a `.part`
 /// that already holds the whole file is verified in place instead).
@@ -326,18 +408,21 @@ async fn run_download_attempts(
         }
 
         if attempt > 1 {
-            // The .part file is re-created from scratch, so an earlier
-            // range reject no longer applies to it.
-            discard_part = false;
             file = match reprepare_part_file(part_path) {
                 Ok(file) => file,
+                // The re-create failed, so the on-disk .part is unchanged:
+                // if an earlier 416 already proved it is not a valid prefix,
+                // it must still be discarded.
                 Err(e) => {
                     break DownloadOutcome::Failed {
                         reason: format!("could not prepare .part file: {e}"),
-                        discard_part: false,
+                        discard_part,
                     };
                 }
             };
+            // The .part file is re-created from scratch, so an earlier
+            // range reject no longer applies to it.
+            discard_part = false;
             println!(
                 "{} {}        {} Re-downloading from scratch (attempt {}/{})",
                 branch_glyph(),
@@ -359,58 +444,44 @@ async fn run_download_attempts(
         )
         .await
         {
-            Ok(server_mtime) => {
-                match verify_downloaded_file(part_path, expected_md5, expected_size, running) {
-                    Ok(true) => break DownloadOutcome::Verified { server_mtime },
-                    Ok(false) => {
-                        last_reason =
-                            format!("file failed verification after {attempt} attempt(s)");
+            Ok(server_mtime) => match verify_part(part_path, expected_md5, expected_size, running)?
+            {
+                PartVerification::Valid => break DownloadOutcome::Verified { server_mtime },
+                PartVerification::Mismatch => {
+                    last_reason = format!("file failed verification after {attempt} attempt(s)");
+                }
+                // Fails this file only; the complete .part is kept so the
+                // next run can verify it in place.
+                PartVerification::Unreadable(reason) => {
+                    break DownloadOutcome::Failed {
+                        reason: format!("could not verify downloaded file: {reason}"),
+                        discard_part: false,
+                    };
+                }
+            },
+            Err(e) if matches!(e, IaGetError::Interrupted) => return Err(e),
+            Err(IaGetError::RangeNotSatisfiable) => {
+                match handle_rejected_offset(
+                    &file,
+                    part_path,
+                    expected_md5,
+                    expected_size,
+                    running,
+                )? {
+                    OffsetRejected::Verified => {
+                        break DownloadOutcome::Verified { server_mtime: None };
                     }
-                    Err(e) if matches!(e, IaGetError::Interrupted) => return Err(e),
-                    // An I/O error while reading the file back (e.g. a momentary
-                    // AV lock) fails this file only; the complete .part is kept
-                    // so the next run can verify it in place.
-                    Err(e) => {
+                    OffsetRejected::Redownload { reason } => {
+                        last_reason = reason;
+                        discard_part = true;
+                    }
+                    OffsetRejected::Failed { reason } => {
                         break DownloadOutcome::Failed {
-                            reason: format!("could not verify downloaded file: {e}"),
+                            reason,
                             discard_part: false,
                         };
                     }
                 }
-            }
-            Err(e) if matches!(e, IaGetError::Interrupted) => return Err(e),
-            // The server rejected our offset: the .part file is not a valid
-            // prefix, so it must not be kept if the attempts end here. One
-            // exception: a 416 for `bytes=N-` also fires when the part
-            // already holds the whole file (a previous run was interrupted
-            // after the body finished but before verification) — a part of
-            // exactly the expected size that also hashes correctly is
-            // verified in place instead of being discarded and re-downloaded.
-            Err(IaGetError::RangeNotSatisfiable) => {
-                let complete_part = expected_size.is_some_and(|expected| {
-                    file.metadata().is_ok_and(|meta| meta.len() == expected)
-                });
-                if complete_part && expected_md5.is_some() {
-                    println!(
-                        "{} {}       {} the .part file is already complete, verifying it in place",
-                        branch_glyph(),
-                        "Resume".white(),
-                        "↻".green().bold()
-                    );
-                    match verify_downloaded_file(part_path, expected_md5, expected_size, running) {
-                        Ok(true) => break DownloadOutcome::Verified { server_mtime: None },
-                        Ok(false) => {}
-                        Err(e) if matches!(e, IaGetError::Interrupted) => return Err(e),
-                        Err(e) => {
-                            break DownloadOutcome::Failed {
-                                reason: format!("could not verify complete .part file: {e}"),
-                                discard_part: false,
-                            };
-                        }
-                    }
-                }
-                last_reason = IaGetError::RangeNotSatisfiable.to_string();
-                discard_part = true;
             }
             // Any other failure is final; the partial .part file is still a
             // resumable prefix
@@ -515,20 +586,27 @@ async fn download_files_with_signal(
     }
 
     if !failed_files.is_empty() {
-        println!(" ");
-        println!(
-            "{} {} {} file(s) could not be downloaded:",
-            "✘".red().bold(),
-            "Failed".red().bold(),
-            failed_files.len()
-        );
-        for (path, reason) in &failed_files {
-            println!("  {} {}", path.bold(), reason.dimmed());
-        }
+        print_failed_files(&failed_files);
         return Err(batch_failed(&failed_files, tasks.len()));
     }
 
     Ok(())
+}
+
+/// Prints the end-of-batch failure summary: the count and one line per
+/// failed file with its reason, so the `IaGetError::BatchFailed` returned
+/// afterwards stays a compact, machine-readable line.
+fn print_failed_files(failed_files: &[(String, String)]) {
+    println!(" ");
+    println!(
+        "{} {} {} file(s) could not be downloaded:",
+        "✘".red().bold(),
+        "Failed".red().bold(),
+        failed_files.len()
+    );
+    for (path, reason) in failed_files {
+        println!("  {} {}", path.bold(), reason.dimmed());
+    }
 }
 
 /// Builds the terminal `IaGetError::BatchFailed` from the accumulated failures.

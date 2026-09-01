@@ -27,6 +27,9 @@ pub fn files_to_download(files: Vec<XmlFile>, xml_file_name: &str) -> Vec<XmlFil
 /// On case-insensitive filesystems (Windows, default macOS) "a.pdf" and
 /// "A.pdf" are the same path, so the key is lowercased there; on
 /// case-sensitive filesystems (Linux) distinct casing stays distinct.
+/// A case-sensitive macOS volume is treated like the default: entries
+/// differing only by case are still skipped — the conservative choice,
+/// since a volume's case sensitivity is not detectable portably.
 fn local_path_key(path: &str) -> String {
     #[cfg(target_os = "linux")]
     {
@@ -35,6 +38,56 @@ fn local_path_key(path: &str) -> String {
     #[cfg(not(target_os = "linux"))]
     {
         path.to_lowercase()
+    }
+}
+
+/// The directory components a local path implies: for "a/b/c.txt" the
+/// ancestors are "a" and "a/b". A single-component path has none.
+fn ancestor_components(path: &str) -> Vec<String> {
+    let components: Vec<&str> = path.split('/').collect();
+    (1..components.len())
+        .map(|split_at| components[..split_at].join("/"))
+        .collect()
+}
+
+/// The first planned entry that a new local path would clash with, if any:
+/// the path itself (two files sanitizing to the same name), a planned file
+/// where the new path needs a directory ("notes" then "notes/file.txt"),
+/// or a planned directory where the new path would land a file (the reverse
+/// order). Returns (the path the clash is reported at, the earlier
+/// entry's original name).
+fn clashing_entry(
+    sanitized_name: &str,
+    planned_files: &HashMap<String, String>,
+    planned_dirs: &HashMap<String, String>,
+) -> Option<(String, String)> {
+    let path_key = local_path_key(sanitized_name);
+    if let Some(first) = planned_files.get(&path_key) {
+        return Some((sanitized_name.to_string(), first.clone()));
+    }
+    for ancestor in ancestor_components(sanitized_name) {
+        if let Some(first) = planned_files.get(&local_path_key(&ancestor)) {
+            return Some((ancestor, first.clone()));
+        }
+    }
+    planned_dirs
+        .get(&path_key)
+        .map(|first| (sanitized_name.to_string(), first.clone()))
+}
+
+/// Registers a newly planned path: the file itself plus every ancestor
+/// directory component it implies.
+fn register_planned_path(
+    sanitized_name: &str,
+    original_name: &str,
+    planned_files: &mut HashMap<String, String>,
+    planned_dirs: &mut HashMap<String, String>,
+) {
+    planned_files.insert(local_path_key(sanitized_name), original_name.to_string());
+    for ancestor in ancestor_components(sanitized_name) {
+        planned_dirs
+            .entry(local_path_key(&ancestor))
+            .or_insert_with(|| original_name.to_string());
     }
 }
 
@@ -66,8 +119,9 @@ pub struct DownloadPlan {
 /// Entries whose name encodes to an empty URL path (an empty name, or
 /// slashes only) are skipped: joining `""` would resolve to the metadata
 /// URL itself. Likewise, an entry whose sanitized local path collides with
-/// an earlier entry's is skipped, so one file never overwrites another.
-/// Collisions are compared case-insensitively on case-insensitive
+/// an earlier entry's is skipped, so one file never overwrites another and
+/// a file never lands where another entry needs a directory (or the
+/// reverse). Collisions are compared case-insensitively on case-insensitive
 /// filesystems (Windows, default macOS), where "a.pdf" and "A.pdf" are the
 /// same path.
 ///
@@ -79,13 +133,16 @@ pub fn plan_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<Downlo
     let mut warnings: Vec<String> = Vec::new();
     // Normalised local path -> original name, so a collision can be
     // reported with both sides of the clash.
-    let mut taken_paths: HashMap<String, String> = HashMap::new();
+    let mut planned_files: HashMap<String, String> = HashMap::new();
+    // Normalised directory component -> original name of the first entry
+    // that needs it as a directory.
+    let mut planned_dirs: HashMap<String, String> = HashMap::new();
 
     // The locally saved "<id>_files.xml" occupies the item root too: an
     // entry that sanitizes to that name (differing only by case on
     // case-insensitive filesystems) would silently overwrite the metadata.
     let xml_file_name = xml_file_name_of(base_url);
-    taken_paths.insert(local_path_key(xml_file_name), xml_file_name.to_string());
+    planned_files.insert(local_path_key(xml_file_name), xml_file_name.to_string());
 
     for file in files {
         // Percent-encode the name first so '?' / '#' / '%' characters in
@@ -114,26 +171,34 @@ pub fn plan_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<Downlo
             sanitized_count += 1;
         }
 
-        // Two different remote names may sanitize to the same local path
-        // (e.g. "file:1.mp4" and "file_1.mp4"); downloading both would
-        // overwrite the earlier file, so keep the first entry and skip the
-        // rest.
-        // The key normalises case on case-insensitive filesystems, so
+        // Two entries may clash in three ways: the same local path (e.g.
+        // "file:1.mp4" and "file_1.mp4" both sanitize to "file_1.mp4"), a
+        // planned file where this entry needs a directory ("notes" then
+        // "notes/file.txt"), or a planned directory where this entry would
+        // land a file (the reverse order). Downloading both would always
+        // lose one file, so keep the first entry and skip the rest.
+        // The keys normalise case on case-insensitive filesystems, so
         // "Report.PDF" and "report.pdf" collide there but not on Linux.
-        let path_key = local_path_key(&sanitized_name);
-        if let Some(first_name) = taken_paths.get(&path_key) {
+        if let Some((at, first_name)) =
+            clashing_entry(&sanitized_name, &planned_files, &planned_dirs)
+        {
             warnings.push(warning_line(
                 "Collision",
                 format!(
                     "{} collides with {} at {} — the later entry is skipped",
                     file.name.dimmed(),
                     first_name.dimmed(),
-                    sanitized_name.bold()
+                    at.bold()
                 ),
             ));
             continue;
         }
-        taken_paths.insert(path_key, file.name);
+        register_planned_path(
+            &sanitized_name,
+            &file.name,
+            &mut planned_files,
+            &mut planned_dirs,
+        );
 
         tasks.push(DownloadTask {
             url: absolute_url.to_string(),
@@ -224,6 +289,64 @@ mod tests {
             "https://archive.org/download/item1/file%3A1.mp4"
         );
         assert_eq!(plan.tasks[0].file_path, "file_1.mp4");
+    }
+
+    #[test]
+    fn plan_download_tasks_file_and_directory_name_clash() {
+        let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
+
+        // A planned file where a later entry needs a directory: "notes"
+        // exists as a file, so "notes/file.txt" can never be created.
+        let plan = plan_download_tasks(
+            vec![
+                xml_file("notes", Some(1)),
+                xml_file("notes/file.txt", Some(2)),
+            ],
+            &base,
+        )
+        .expect("plan must build");
+        assert_eq!(
+            plan.tasks.len(),
+            1,
+            "the entry under the planned file must be skipped"
+        );
+        assert_eq!(plan.tasks[0].file_path, "notes");
+        assert!(
+            plan.warnings.iter().any(|line| line.contains("collides")),
+            "the clash must leave a warning line: {:?}",
+            plan.warnings
+        );
+
+        // The reverse order: a planned directory where a later file must
+        // land. "notes/file.txt" is kept, the bare "notes" is skipped.
+        let plan = plan_download_tasks(
+            vec![
+                xml_file("notes/file.txt", Some(1)),
+                xml_file("notes", Some(2)),
+            ],
+            &base,
+        )
+        .expect("plan must build");
+        assert_eq!(
+            plan.tasks.len(),
+            1,
+            "the entry at the planned directory must be skipped"
+        );
+        assert_eq!(plan.tasks[0].file_path, "notes/file.txt");
+    }
+
+    #[test]
+    fn plan_download_tasks_shared_directory_is_not_a_clash() {
+        // Two files in the same directory share the ancestor component:
+        // that is a plain directory, not a collision.
+        let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
+        let plan = plan_download_tasks(
+            vec![xml_file("a/b.txt", Some(1)), xml_file("a/c.txt", Some(2))],
+            &base,
+        )
+        .expect("plan must build");
+        assert_eq!(plan.tasks.len(), 2, "sibling files must both be planned");
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
 
     #[test]
