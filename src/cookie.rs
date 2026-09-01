@@ -34,8 +34,6 @@ struct NetscapeCookie {
 /// printed so an unauthenticated-looking 401/403 has an obvious cause.
 pub fn cookie_header_from_input(input: &str, url: &Url) -> Result<String> {
     if Path::new(input).is_file() {
-        // Guard against a maliciously huge file being buffered in memory.
-        const MAX_COOKIE_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
         let meta =
             std::fs::metadata(input).map_err(|e| crate::error::io_error_with_path(input, e))?;
         if meta.len() > MAX_COOKIE_FILE_BYTES {
@@ -100,6 +98,9 @@ fn parse_netscape_cookie(line: &str) -> Option<NetscapeCookie> {
         value: fields[6].to_string(),
     })
 }
+
+/// Guard against a maliciously huge file being buffered in memory.
+const MAX_COOKIE_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// The only host this tool ever talks to: URL validation restricts every
 /// request to archive.org.
