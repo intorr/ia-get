@@ -705,12 +705,16 @@ async fn download_file_content(
         }
         let base_size = file.metadata()?.len();
 
-        let pb = create_progress_bar(
-            base_size + response.content_length().unwrap_or(0),
-            &download_action,
-            Some("green/green"),
-            true,
-        );
+        // The bar's total: the server-announced length (the bytes this
+        // response will send, added to the local prefix) when present,
+        // else the metadata size, else the current size (an unknown-size
+        // file has no usable total, matching the previous behaviour).
+        let total = response
+            .content_length()
+            .map(|remaining| base_size + remaining)
+            .or(expected_size)
+            .unwrap_or(base_size);
+        let pb = create_progress_bar(total, &download_action, Some("green/green"), true);
         // Set initial progress to current file size for resumed downloads
         pb.set_position(base_size);
 

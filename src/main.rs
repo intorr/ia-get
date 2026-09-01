@@ -10,7 +10,7 @@ use colored::*;
 use ia_get::Result;
 use ia_get::archive_metadata::{
     XmlFile, XmlFiles, XmlMetadata, encode_download_path, fetch_and_parse_xml, get_xml_url,
-    is_url_accessible, save_xml_metadata, xml_file_name_of,
+    save_xml_metadata, xml_file_name_of,
 };
 use ia_get::constants::USER_AGENT;
 use ia_get::cookie::cookie_header_value;
@@ -301,12 +301,28 @@ struct Cli {
 
 /// Main application entry point
 ///
-/// Parses command line arguments, validates the archive.org URL, checks URL accessibility,
-/// downloads XML metadata, and initiates file downloads with built-in signal handling.
+/// Parses the command line arguments and hands off to [`run`]. `run`
+/// finishes its spinner with a context-rich message on every failure path,
+/// so the error is already on screen; `main` only maps the result to a
+/// process exit code, without letting the runtime print the error a second
+/// time.
 #[tokio::main]
-async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn main() {
     let cli = Cli::parse();
+    if run(&cli).await.is_err() {
+        // The failure was already printed by run's spinner; just exit
+        // non-zero so a shell or wrapping script sees it.
+        std::process::exit(1);
+    }
+}
 
+/// Validate the URL, fetch and parse the archive metadata, and download
+/// the files.
+///
+/// A single spinner is shown for the whole initialization; every failure
+/// path finishes it with a human-readable message before the error is
+/// returned, so the caller only has to decide on the exit code.
+async fn run(cli: &Cli) -> Result<()> {
     let client = build_client()?;
 
     // Start a single spinner for the entire initialization process
@@ -315,37 +331,21 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Validate URL format using consolidated function
     if let Err(e) = validate_archive_url(&cli.url) {
         spinner.finish_with_message(format!("{} {}", "✘".red().bold(), e));
-        // The error is already on screen: exit without letting the runtime
-        // print it a second time.
-        std::process::exit(1);
+        return Err(e);
     }
 
-    let details_url = Url::parse(&cli.url)?;
     // The cookie header is computed once against the download URL — the
     // scope every metadata and file request uses — and reused for the
-    // details pre-check, so a path-scoped cookie never leaves the pre-check
-    // unauthenticated while the real requests carry it.
+    // metadata fetch and the file downloads, so a path-scoped cookie
+    // applies consistently across the run.
     let xml_url = get_xml_url(&cli.url);
     let download_url = Url::parse(&xml_url)?;
     let cookie_header = cookie_header_value(cli.cookies.as_deref(), &download_url)?;
 
-    // Check URL accessibility
-    if let Err(e) = is_url_accessible(&details_url, &client, cookie_header.as_ref()).await {
-        spinner.finish_with_message(format!(
-            "{} Archive.org URL not accessible: {} ({})",
-            "✘".red().bold(),
-            cli.url.bold(),
-            e.to_string().dimmed()
-        ));
-        // The error is already on screen: exit without letting the runtime
-        // print it a second time.
-        std::process::exit(1);
-    }
-
-    // Fetch and parse XML metadata in one operation. Every failure is on
-    // screen before the exit: the accessibility pre-check inside the fetch
-    // finishes the spinner with a context-rich message, and any other
-    // failure (a failed GET, an unparseable document) finishes it here.
+    // Fetch and parse XML metadata in one operation. The accessibility
+    // pre-check inside the fetch finishes the spinner with a context-rich
+    // message; any other failure (a failed GET, an unparseable document)
+    // finishes it here.
     let XmlMetadata {
         files,
         base_url,
@@ -358,9 +358,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             if !spinner.is_finished() {
                 spinner.finish_with_message(format!("{} {}", "✘".red().bold(), e));
             }
-            // The error is already on screen: exit without letting the
-            // runtime print it a second time.
-            std::process::exit(1);
+            return Err(e);
         }
     };
 
@@ -382,9 +380,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         Ok(plan) => plan,
         Err(e) => {
             spinner.finish_with_message(format!("{} {}", "✘".red().bold(), e));
-            // The error is already on screen: exit without letting the
-            // runtime print it a second time.
-            std::process::exit(1);
+            return Err(e);
         }
     };
 
@@ -396,9 +392,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // with the server's Last-Modified time, and announce it as file #1
     if let Err(e) = save_and_announce_xml(&base_url, &content, last_modified, total_files) {
         spinner.finish_with_message(format!("{} {}", "✘".red().bold(), e));
-        // The error is already on screen: exit without letting the
-        // runtime print it a second time.
-        std::process::exit(1);
+        return Err(e);
     }
 
     // Successfully finished initialization; separate the banner from the

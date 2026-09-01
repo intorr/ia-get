@@ -81,21 +81,29 @@ You can start seeding the torrent using a pristine copy of the archive, and a co
 
 # Development 🏗️
 
-Such as it is.
+The repository ships a [`justfile`](./justfile) for the common tasks. With [just](https://github.com/casey/just) installed, `just check` runs the format check, clippy (warnings treated as errors) and the test suite in one go:
 
 ```shell
-cargo build
+just check        # fmt-check + clippy + test
+just test         # cargo test
+just lint         # cargo clippy --all-targets --all-features -- -D warnings
+just fmt          # cargo fmt
+just build        # cargo build
 ```
 
-## Unit Tests 🧪
-
-You can run the built-in unit tests with:
+Without `just`, the equivalent cargo commands are:
 
 ```shell
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
-This will run tests that verify URL pattern validation and other core functionality.
+A release build optimises for size (LTO, stripped):
+
+```shell
+cargo build --release
+```
 
 ## Manual Tests 🤞
 
