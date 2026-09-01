@@ -181,7 +181,6 @@ async fn run(cli: &Cli) -> Result<()> {
     let XmlMetadata {
         files,
         base_url,
-        cookie_header,
         content,
         last_modified,
     } = fetch_and_parse_xml(&xml_url, &client, &spinner, cookie_header.as_ref())

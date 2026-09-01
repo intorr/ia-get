@@ -274,24 +274,10 @@ fn ranged_response(
     (status, announced, body, false, headers)
 }
 
-fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
-    // Read the request head
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 1024];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            Err(_) => return,
-        }
-    }
-
-    let head = String::from_utf8_lossy(&buf).into_owned();
+/// The request details a scripted response depends on: the HTTP method, the
+/// absolute path, the `Range` header start offset (None when absent) and
+/// the `Cookie` header (None when absent).
+fn parse_request_head(head: &str) -> (String, String, Option<u64>, Option<String>) {
     let request_line = head.lines().next().unwrap_or("");
     let method = request_line
         .split_whitespace()
@@ -324,6 +310,77 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
             line.split_once(':')
                 .map(|(_, value)| value.trim().to_string())
         });
+    (method, path, range, cookie)
+}
+
+/// Resolves a scripted response into (status, announced length, body bytes,
+/// hold-open, extra headers). A HEAD response carries the status and headers
+/// but no body; a Stalled body holds the connection open after the headers;
+/// a Ranged body is resolved against the request's Range header like a real
+/// origin server; every other body is served exactly as scripted, regardless
+/// of any Range header.
+fn resolve_response(
+    response: &MockResponse,
+    method: &str,
+    range: Option<u64>,
+) -> (u16, u64, Vec<u8>, bool, Vec<(String, String)>) {
+    if method.eq_ignore_ascii_case("HEAD") {
+        return (
+            response.status,
+            0,
+            Vec::new(),
+            false,
+            response.extra_headers.clone(),
+        );
+    }
+    match &response.body {
+        MockBody::Full(data) => (
+            response.status,
+            data.len() as u64,
+            data.clone(),
+            false,
+            response.extra_headers.clone(),
+        ),
+        MockBody::Truncated {
+            announced_len,
+            partial,
+        } => (
+            response.status,
+            *announced_len,
+            partial.clone(),
+            false,
+            response.extra_headers.clone(),
+        ),
+        MockBody::Stalled { announced_len } => (
+            response.status,
+            *announced_len,
+            Vec::new(),
+            true,
+            response.extra_headers.clone(),
+        ),
+        MockBody::Ranged(data) => ranged_response(data, range),
+    }
+}
+
+fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
+    // Read the request head
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+
+    let head = String::from_utf8_lossy(&buf).into_owned();
+    let (method, path, range, cookie) = parse_request_head(&head);
 
     let response = {
         let mut st = state.lock().unwrap();
@@ -337,49 +394,8 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
             .unwrap_or_else(|| st.fallback.clone())
     };
 
-    // A HEAD response carries the status and headers but no body; a Stalled
-    // body holds the connection open after the headers; a Ranged body is
-    // resolved against the request's Range header like a real origin server.
-    // Every other body is served exactly as scripted, regardless of any
-    // Range header.
     let (status, announced_len, body_bytes, stalled, extra_headers) =
-        match (&response.body, method.eq_ignore_ascii_case("HEAD")) {
-            (_, true) => (
-                response.status,
-                0,
-                Vec::new(),
-                false,
-                response.extra_headers.clone(),
-            ),
-            (MockBody::Full(data), false) => (
-                response.status,
-                data.len() as u64,
-                data.clone(),
-                false,
-                response.extra_headers.clone(),
-            ),
-            (
-                MockBody::Truncated {
-                    announced_len,
-                    partial,
-                },
-                false,
-            ) => (
-                response.status,
-                *announced_len,
-                partial.clone(),
-                false,
-                response.extra_headers.clone(),
-            ),
-            (MockBody::Stalled { announced_len }, false) => (
-                response.status,
-                *announced_len,
-                Vec::new(),
-                true,
-                response.extra_headers.clone(),
-            ),
-            (MockBody::Ranged(data), false) => ranged_response(data, range),
-        };
+        resolve_response(&response, &method, range);
 
     let reason = StatusCode::from_u16(status)
         .ok()

@@ -1,6 +1,7 @@
 //! Building the `Cookie` header from a raw string or a Netscape cookies.txt
 //! file, so every authenticated request carries the right cookies.
 
+use crate::error::io_error_with_path;
 use crate::{IaGetError, Result};
 use colored::*;
 use reqwest::header::HeaderValue;
@@ -8,6 +9,13 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
+
+/// Guard against a maliciously huge file being buffered in memory.
+const MAX_COOKIE_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// The only host this tool ever talks to: URL validation restricts every
+/// request to archive.org.
+const COOKIE_HOST: &str = "archive.org";
 
 /// One entry of a Netscape cookies.txt file
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +27,19 @@ struct NetscapeCookie {
     expires: Option<u64>,
     name: String,
     value: String,
+}
+
+/// Reads a cookie file, naming it in I/O errors and refusing to buffer a
+/// file larger than `MAX_COOKIE_FILE_BYTES` in memory.
+fn read_cookie_file(input: &str) -> Result<String> {
+    let meta = fs::metadata(input).map_err(|e| io_error_with_path(input, e))?;
+    if meta.len() > MAX_COOKIE_FILE_BYTES {
+        return Err(IaGetError::FileSystem {
+            detail: format!("{input}: cookie file exceeds {MAX_COOKIE_FILE_BYTES} bytes"),
+            source: None,
+        });
+    }
+    fs::read_to_string(input).map_err(|e| io_error_with_path(input, e))
 }
 
 /// Builds an HTTP Cookie header value from a raw cookie string or cookies.txt path.
@@ -34,19 +55,7 @@ struct NetscapeCookie {
 /// printed so an unauthenticated-looking 401/403 has an obvious cause.
 pub fn cookie_header_from_input(input: &str, url: &Url) -> Result<String> {
     if Path::new(input).is_file() {
-        let meta =
-            std::fs::metadata(input).map_err(|e| crate::error::io_error_with_path(input, e))?;
-        if meta.len() > MAX_COOKIE_FILE_BYTES {
-            return Err(crate::error::IaGetError::FileSystem {
-                detail: format!(
-                    "{}: cookie file exceeds {MAX_COOKIE_FILE_BYTES} bytes",
-                    input
-                ),
-                source: None,
-            });
-        }
-        let cookie_file =
-            fs::read_to_string(input).map_err(|e| crate::error::io_error_with_path(input, e))?;
+        let cookie_file = read_cookie_file(input)?;
         if has_netscape_cookie_line(&cookie_file) || !input.contains('=') {
             let header = cookie_header_from_netscape_file(&cookie_file, url)?;
             if header.is_empty() {
@@ -98,13 +107,6 @@ fn parse_netscape_cookie(line: &str) -> Option<NetscapeCookie> {
         value: fields[6].to_string(),
     })
 }
-
-/// Guard against a maliciously huge file being buffered in memory.
-const MAX_COOKIE_FILE_BYTES: u64 = 10 * 1024 * 1024;
-
-/// The only host this tool ever talks to: URL validation restricts every
-/// request to archive.org.
-const COOKIE_HOST: &str = "archive.org";
 
 /// True when `domain` (already lower-cased, see `parse_netscape_cookie`)
 /// is archive.org itself or one of its subdomains.

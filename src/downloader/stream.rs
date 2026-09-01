@@ -202,17 +202,18 @@ pub(crate) async fn download_file_content(
             });
         }
 
-        // The server ignored the Range header and is sending the full body:
-        // the local prefix is untrusted, so reset the file before streaming.
-        if resuming && status == StatusCode::OK {
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            download_action = download_action_label(false);
-        }
-        if resuming
-            && status == StatusCode::PARTIAL_CONTENT
-            && partial_content_offset(response.headers(), current_file_size) != Some(true)
-        {
+        // The server ignored the Range request and is sending the full body
+        // (200), or the 206's Content-Range does not start where the local
+        // file ends: in either case the local prefix is untrusted, so the
+        // file is reset before the body is streamed.
+        let untrusted_prefix = match status {
+            StatusCode::OK => true,
+            StatusCode::PARTIAL_CONTENT => {
+                partial_content_offset(response.headers(), current_file_size) != Some(true)
+            }
+            _ => false,
+        };
+        if resuming && untrusted_prefix {
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
             download_action = download_action_label(false);

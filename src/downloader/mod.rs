@@ -95,6 +95,14 @@ fn remove_part_file(part_path: &str) {
     let _ = fs::remove_file(part_path);
 }
 
+/// Re-creates the `.part` file from scratch after a failed verification:
+/// the old contents are removed best-effort, then a fresh handle is opened.
+/// The caller's previous handle is closed by the shadowing assignment.
+fn reprepare_part_file(part_path: &str) -> Result<File> {
+    remove_part_file(part_path);
+    prepare_file_for_download(part_path)
+}
+
 /// Outcome of checking the existing copy of a file before downloading
 enum ExistingFileHandling {
     /// The existing copy is valid; nothing left to do
@@ -318,12 +326,9 @@ async fn run_download_attempts(
 
         if attempt > 1 {
             // The .part file is re-created from scratch, so an earlier
-            // range reject no longer applies to it. The stale handle is
-            // closed when the assignment below shadows it.
+            // range reject no longer applies to it.
             discard_part = false;
-            remove_part_file(part_path);
-            let new_file = prepare_file_for_download(part_path);
-            file = match new_file {
+            file = match reprepare_part_file(part_path) {
                 Ok(file) => file,
                 Err(e) => {
                     break DownloadOutcome::Failed {

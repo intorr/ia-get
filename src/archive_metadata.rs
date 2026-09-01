@@ -289,8 +289,6 @@ pub struct XmlMetadata {
     pub files: XmlFiles,
     /// The URL the metadata was fetched from (the download base for files)
     pub base_url: Url,
-    /// The `Cookie` header for the metadata host, if any was supplied
-    pub cookie_header: Option<HeaderValue>,
     /// The raw XML content, to persist locally
     pub content: String,
     /// The server's `Last-Modified` time, if the server sent one
@@ -339,7 +337,6 @@ pub async fn fetch_and_parse_xml(
     Ok(XmlMetadata {
         files,
         base_url: xml_url.clone(),
-        cookie_header: cookie_header.cloned(),
         content: xml_content,
         last_modified,
     })
@@ -795,11 +792,9 @@ mod tests {
         let spinner = create_spinner("mock");
         let header = HeaderValue::from_static("session=abc123");
 
-        let meta = fetch_and_parse_xml(&url, &client, &spinner, Some(&header))
+        fetch_and_parse_xml(&url, &client, &spinner, Some(&header))
             .await
             .expect("metadata fetch should succeed");
-
-        assert_eq!(meta.cookie_header.as_ref(), Some(&header));
         assert_eq!(
             server.cookies(),
             vec![
