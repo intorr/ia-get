@@ -306,15 +306,10 @@ pub async fn fetch_and_parse_xml(
     spinner: &ProgressBar,
     cookie_header: Option<&HeaderValue>,
 ) -> Result<XmlMetadata> {
-    // Check XML URL accessibility
-    if let Err(e) = is_url_accessible(xml_url, client, cookie_header).await {
-        spinner.finish_with_message(format!(
-            "{} XML metadata not accessible: {}",
-            "✘".red().bold(),
-            xml_url.as_str().bold()
-        ));
-        return Err(e); // Propagate the error
-    }
+    // The accessibility pre-check's failure (a definitive 404/410) is
+    // reported by the caller's spinner error path, which carries the full
+    // detail (e.g. "the archive identifier may be incorrect").
+    is_url_accessible(xml_url, client, cookie_header).await?;
 
     spinner.set_message(format!(
         "{} {}",

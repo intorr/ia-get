@@ -38,6 +38,18 @@ fn local_path_key(path: &str) -> String {
     }
 }
 
+/// A plan warning line: the shared "⚠ Label:" prefix (label and colon
+/// styled together) followed by the styled details of the skipped,
+/// renamed or colliding entry.
+fn warning_line(label: &str, details: String) -> String {
+    format!(
+        "{} {}: {}",
+        "⚠".yellow().bold(),
+        format!("{label}:").yellow(),
+        details
+    )
+}
+
 /// The download plan: the tasks that will actually run, how many file
 /// names were sanitized, and the warning lines (sanitized, collided and
 /// skipped entries) that the caller prints.
@@ -81,11 +93,9 @@ pub fn plan_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<Downlo
         let encoded_name = encode_download_path(&file.name);
 
         if encoded_name.is_empty() {
-            warnings.push(format!(
-                "{} {} {} (empty name)",
-                "⚠".yellow().bold(),
-                "Skipped:".yellow(),
-                file.name.dimmed()
+            warnings.push(warning_line(
+                "Skipped",
+                format!("{} (empty name)", file.name.dimmed()),
             ));
             continue;
         }
@@ -97,12 +107,9 @@ pub fn plan_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<Downlo
 
         // Collect a warning line if the filename was modified
         if was_modified {
-            warnings.push(format!(
-                "{} {} {} → {}",
-                "⚠".yellow().bold(),
-                "Sanitized:".yellow(),
-                file.name.dimmed(),
-                sanitized_name.bold()
+            warnings.push(warning_line(
+                "Sanitized",
+                format!("{} → {}", file.name.dimmed(), sanitized_name.bold()),
             ));
             sanitized_count += 1;
         }
@@ -115,13 +122,14 @@ pub fn plan_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<Downlo
         // "Report.PDF" and "report.pdf" collide there but not on Linux.
         let path_key = local_path_key(&sanitized_name);
         if let Some(first_name) = taken_paths.get(&path_key) {
-            warnings.push(format!(
-                "{} {} {} collides with {} at {} — the later entry is skipped",
-                "⚠".yellow().bold(),
-                "Collision:".yellow(),
-                file.name.dimmed(),
-                first_name.dimmed(),
-                sanitized_name.bold()
+            warnings.push(warning_line(
+                "Collision",
+                format!(
+                    "{} collides with {} at {} — the later entry is skipped",
+                    file.name.dimmed(),
+                    first_name.dimmed(),
+                    sanitized_name.bold()
+                ),
             ));
             continue;
         }

@@ -65,22 +65,18 @@ pub enum IaGetError {
 
 impl From<reqwest::Error> for IaGetError {
     fn from(err: reqwest::Error) -> Self {
-        if err.is_connect() || err.is_timeout() {
-            IaGetError::Network {
-                detail: format!("Connection failed: {err}"),
-                source: Some(Box::new(err)),
-            }
-        } else if err.is_status() {
-            let status = err.status().map(|s| s.to_string()).unwrap_or_default();
-            IaGetError::Network {
-                detail: format!("HTTP error {status}: {err}"),
-                source: Some(Box::new(err)),
-            }
+        // Connection failures and HTTP errors get a more specific prefix;
+        // the rest fall back to the reqwest message as is.
+        let detail = if err.is_connect() || err.is_timeout() {
+            format!("Connection failed: {err}")
+        } else if let Some(status) = err.status() {
+            format!("HTTP error {status}: {err}")
         } else {
-            IaGetError::Network {
-                detail: err.to_string(),
-                source: Some(Box::new(err)),
-            }
+            err.to_string()
+        };
+        IaGetError::Network {
+            detail,
+            source: Some(Box::new(err)),
         }
     }
 }

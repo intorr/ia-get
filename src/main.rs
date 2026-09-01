@@ -74,6 +74,19 @@ fn report_spinner_error(spinner: &ProgressBar, error: &IaGetError) {
     }
 }
 
+/// Runs one initialization step of `run`, reporting its failure on the
+/// spinner before the error propagates: on screen the user sees the
+/// context-rich error line, and `main` only has to decide the exit code.
+fn init_step<T>(spinner: &ProgressBar, step: Result<T>) -> Result<T> {
+    match step {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            report_spinner_error(spinner, &error);
+            Err(error)
+        }
+    }
+}
+
 /// Persists the freshly fetched `_files.xml` (overwriting any previous copy)
 /// and prints its "#1" file block.
 ///
@@ -158,34 +171,33 @@ async fn run(cli: &Cli) -> Result<()> {
     // Start a single spinner for the entire initialization process
     let spinner = create_spinner(&format!("Processing archive.org URL: {}", cli.url.bold()));
 
-    let client = build_client().inspect_err(|e| report_spinner_error(&spinner, e))?;
+    let client = init_step(&spinner, build_client())?;
 
     // Validate URL format using consolidated function
-    if let Err(e) = validate_archive_url(&cli.url) {
-        report_spinner_error(&spinner, &e);
-        return Err(e);
-    }
+    init_step(&spinner, validate_archive_url(&cli.url))?;
 
     // The cookie header is computed once against the download URL — the
     // scope every metadata and file request uses — and reused for the
     // metadata fetch and the file downloads, so a path-scoped cookie
     // applies consistently across the run.
-    let xml_url = get_xml_url(&cli.url).inspect_err(|e| report_spinner_error(&spinner, e))?;
-    let cookie_header = cookie_header_value(cli.cookies.as_deref(), &xml_url)
-        .inspect_err(|e| report_spinner_error(&spinner, e))?;
+    let xml_url = init_step(&spinner, get_xml_url(&cli.url))?;
+    let cookie_header = init_step(
+        &spinner,
+        cookie_header_value(cli.cookies.as_deref(), &xml_url),
+    )?;
 
-    // Fetch and parse XML metadata in one operation. The accessibility
-    // pre-check inside the fetch finishes the spinner with a context-rich
-    // message; any other failure (a failed GET, an unparseable document)
-    // finishes it here.
+    // Fetch and parse XML metadata in one operation. Any failure (the
+    // accessibility pre-check, a failed GET, an unparseable document) is
+    // reported by init_step with the full error detail.
     let XmlMetadata {
         files,
         base_url,
         content,
         last_modified,
-    } = fetch_and_parse_xml(&xml_url, &client, &spinner, cookie_header.as_ref())
-        .await
-        .inspect_err(|e| report_spinner_error(&spinner, e))?;
+    } = init_step(
+        &spinner,
+        fetch_and_parse_xml(&xml_url, &client, &spinner, cookie_header.as_ref()).await,
+    )?;
 
     // If requested, list parsed filenames and exit: a read-only preview,
     // nothing is written to the working directory
@@ -198,11 +210,13 @@ async fn run(cli: &Cli) -> Result<()> {
     // announced, so the counts below only include the tasks that will
     // actually run (entries skipped for empty names or path collisions
     // never appear in the numbering).
-    let plan = plan_download_tasks(
-        files_to_download(files.files, xml_file_name_of(&base_url)),
-        &base_url,
-    )
-    .inspect_err(|e| report_spinner_error(&spinner, e))?;
+    let plan = init_step(
+        &spinner,
+        plan_download_tasks(
+            files_to_download(files.files, xml_file_name_of(&base_url)),
+            &base_url,
+        ),
+    )?;
 
     // The saved _files.xml occupies file #1; the planned tasks follow
     // right after it.
@@ -210,8 +224,10 @@ async fn run(cli: &Cli) -> Result<()> {
 
     // Persist the freshly fetched _files.xml (overwriting any previous copy)
     // with the server's Last-Modified time, and announce it as file #1
-    save_and_announce_xml(&base_url, &content, last_modified, total_files)
-        .inspect_err(|e| report_spinner_error(&spinner, e))?;
+    init_step(
+        &spinner,
+        save_and_announce_xml(&base_url, &content, last_modified, total_files),
+    )?;
 
     // Successfully finished initialization; separate the banner from the
     // saved-metadata block above.

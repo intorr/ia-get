@@ -637,47 +637,52 @@ mod tests {
         .await
     }
 
-    /// Two-file batch fixture: "/missing.bin" always 404s, "/ok.bin" serves
-    /// `ok_content`; returns the server, temp dir, task list and content
-    fn missing_and_ok_batch(name: &str) -> (MockServer, TempDir, Vec<DownloadTask>, &'static [u8]) {
-        let ok_content: &'static [u8] = b"ok-content-123";
-        let ok_md5 = md5_hex(ok_content);
+    /// The good sibling file's content in the per-file failure tests:
+    /// one file is blocked, this one must still download.
+    const OK_CONTENT: &[u8] = b"ok-content-123";
 
+    /// Mock serving the good sibling file ("/ok.bin" → `OK_CONTENT`, 404
+    /// for anything else), plus a fresh temp dir
+    fn ok_bin_server(name: &str) -> (MockServer, TempDir) {
         let mut scripts = HashMap::new();
-        scripts.insert(
-            "/missing.bin".to_string(),
-            VecDeque::from(vec![MockResponse::new(
-                404,
-                MockBody::Full(b"gone".to_vec()),
-            )]),
-        );
         scripts.insert(
             "/ok.bin".to_string(),
             VecDeque::from(vec![MockResponse::new(
                 200,
-                MockBody::Full(ok_content.to_vec()),
+                MockBody::Full(OK_CONTENT.to_vec()),
             )]),
         );
         let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
+        (server, TempDir::new(name))
+    }
 
-        let dir = TempDir::new(name);
+    /// The download task for the "/ok.bin" sibling file in `dir`
+    fn ok_bin_task(server: &MockServer, dir: &Path) -> DownloadTask {
+        task(
+            server.url("/ok.bin"),
+            dir.join("ok.bin").to_str().unwrap().to_string(),
+            Some(md5_hex(OK_CONTENT)),
+            Some(OK_CONTENT.len() as u64),
+            None,
+        )
+    }
+
+    /// Two-file batch fixture: "/missing.bin" always 404s, "/ok.bin" serves
+    /// `ok_content`; returns the server, temp dir, task list and content
+    fn missing_and_ok_batch(name: &str) -> (MockServer, TempDir, Vec<DownloadTask>, &'static [u8]) {
+        let (server, dir) = ok_bin_server(name);
+        let missing = dir.join("missing.bin");
         let files = vec![
             task(
                 server.url("/missing.bin"),
-                dir.join("missing.bin").to_str().unwrap().to_string(),
+                missing.to_str().unwrap().to_string(),
                 None,
                 Some(5),
                 None,
             ),
-            task(
-                server.url("/ok.bin"),
-                dir.join("ok.bin").to_str().unwrap().to_string(),
-                Some(ok_md5),
-                Some(ok_content.len() as u64),
-                None,
-            ),
+            ok_bin_task(&server, &dir),
         ];
-        (server, dir, files, ok_content)
+        (server, dir, files, OK_CONTENT)
     }
 
     /// Runs a single download against the mock server and returns the
@@ -1412,20 +1417,7 @@ mod tests {
 
     #[tokio::test]
     async fn unremovable_stale_file_fails_only_that_file() {
-        let ok_content = b"ok-content-123";
-        let ok_md5 = md5_hex(ok_content);
-
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/ok.bin".to_string(),
-            VecDeque::from(vec![MockResponse::new(
-                200,
-                MockBody::Full(ok_content.to_vec()),
-            )]),
-        );
-        let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
-
-        let dir = TempDir::new("unremovable_stale");
+        let (server, dir) = ok_bin_server("unremovable_stale");
         // A directory at the final path cannot be read on any platform, so
         // the check lands in the Unreadable branch: the file is kept and
         // the problem is reported for this file only.
@@ -1439,13 +1431,7 @@ mod tests {
                 None,
                 None,
             ),
-            task(
-                server.url("/ok.bin"),
-                dir.join("ok.bin").to_str().unwrap().to_string(),
-                Some(ok_md5),
-                Some(ok_content.len() as u64),
-                None,
-            ),
+            ok_bin_task(&server, &dir),
         ];
 
         let err = run_batch(files, false).await.unwrap_err();
@@ -1460,7 +1446,7 @@ mod tests {
             }
             other => panic!("expected BatchFailed with one file, got {:?}", other),
         }
-        assert_eq!(fs::read(dir.join("ok.bin")).unwrap(), ok_content);
+        assert_eq!(fs::read(dir.join("ok.bin")).unwrap(), OK_CONTENT);
         assert!(
             blocked.exists(),
             "unremovable stale file must stay in place"
@@ -1472,20 +1458,7 @@ mod tests {
         // A .part path occupied by a directory cannot be opened on any
         // platform; the setup failure must fail that file only, letting the
         // rest of the batch proceed.
-        let ok_content = b"ok-content-123";
-        let ok_md5 = md5_hex(ok_content);
-
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/ok.bin".to_string(),
-            VecDeque::from(vec![MockResponse::new(
-                200,
-                MockBody::Full(ok_content.to_vec()),
-            )]),
-        );
-        let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
-
-        let dir = TempDir::new("uncreatable_part");
+        let (server, dir) = ok_bin_server("uncreatable_part");
         fs::create_dir(dir.join("blocked.bin.part")).unwrap();
         let files = vec![
             task(
@@ -1495,13 +1468,7 @@ mod tests {
                 None,
                 None,
             ),
-            task(
-                server.url("/ok.bin"),
-                dir.join("ok.bin").to_str().unwrap().to_string(),
-                Some(ok_md5),
-                Some(ok_content.len() as u64),
-                None,
-            ),
+            ok_bin_task(&server, &dir),
         ];
 
         let err = run_batch(files, false).await.unwrap_err();
@@ -1519,7 +1486,7 @@ mod tests {
             }
             other => panic!("expected BatchFailed with one file, got {:?}", other),
         }
-        assert_eq!(fs::read(dir.join("ok.bin")).unwrap(), ok_content);
+        assert_eq!(fs::read(dir.join("ok.bin")).unwrap(), OK_CONTENT);
     }
 
     #[tokio::test]
