@@ -4,10 +4,12 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use digest::Digest;
 use reqwest::StatusCode;
 
 /// Creates a unique temp directory for a test.
@@ -37,6 +39,20 @@ pub fn mtime_of(path: &Path) -> Option<u64> {
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
+}
+
+/// The lowercase hex MD5 of `content`, in the form archive.org reports.
+pub fn md5_hex(content: &[u8]) -> String {
+    md5::Md5::digest(content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A "running" flag set to true, for tests that drive the download pipeline
+/// without registering a real Ctrl+C handler.
+pub fn test_running() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
 }
 
 /// Body variant for mock server responses

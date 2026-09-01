@@ -1,287 +1,59 @@
 //! Module for handling file downloads, verification, and related operations.
+//!
+//! The pipeline is split into focused submodules — [`signal`] for Ctrl+C
+//! handling, [`retry`] for backoff and retry tracking, [`verify`] for size
+//! and MD5 checks, [`stream`] for streaming a response body, and [`mtime`]
+//! for last-modified times — and this module orchestrates a batch of
+//! [`DownloadTask`]s.
 
-use std::fs::{self, File};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+mod mtime;
+mod retry;
+mod signal;
+mod stream;
+mod verify;
+
+use std::fs;
+use std::fs::File;
+use std::io::{Seek, SeekFrom};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 use colored::*;
-use digest::Digest;
-use indicatif::ProgressBar;
-use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderValue, LAST_MODIFIED, RETRY_AFTER};
-use reqwest::{Client, Response, StatusCode};
+use reqwest::Client;
+use reqwest::header::HeaderValue;
 
 use crate::Result;
-use crate::error::{IaGetError, io_error_with_path}; // Import IaGetError for explicit error conversion
-use crate::utils::{
-    branch_glyph, create_progress_bar, ensure_not_symlink, format_size, last_glyph,
-    print_downloaded_line, print_file_banner, with_cookie,
-}; // Import utility functions
+use crate::downloader::mtime::mtime_from_xml;
+use crate::downloader::retry::backoff_delay;
+use crate::downloader::signal::setup_signal_handler;
+use crate::downloader::stream::download_file_content;
+use crate::downloader::verify::{
+    ExistingFileStatus, check_existing_file, print_verified_hash, verify_downloaded_file,
+};
+use crate::error::{IaGetError, io_error_with_path};
+use crate::utils::{branch_glyph, ensure_not_symlink, print_file_banner};
 
-/// Buffer size for file operations (8KB)
-const BUFFER_SIZE: usize = 8192;
-
-/// File size threshold for showing hash progress bar (2MB)
-const LARGE_FILE_THRESHOLD: u64 = 2 * 1024 * 1024;
-
-/// Maximum number of retry attempts for a single failing request
-const MAX_RETRIES: u32 = 10;
-
-/// Initial delay between retries in milliseconds (doubles with each retry)
-const INITIAL_RETRY_DELAY_MS: u64 = 5_000;
-
-/// Upper bound for the exponential backoff delay in milliseconds
-const MAX_RETRY_DELAY_MS: u64 = 60_000;
-
-/// Upper bound (in seconds) for a server-provided Retry-After value
-const MAX_RETRY_AFTER_SECS: u64 = 900;
+// Re-export the items that form this module's public API.
+pub use mtime::{parse_last_modified, sync_file_mtime};
 
 /// Maximum full re-download attempts for a file that fails size/hash verification
 const MAX_DOWNLOAD_ATTEMPTS: u32 = 3;
 
-// Numerical constants for the linear congruential generator used to add jitter
-const LCG_MULTIPLIER: u64 = 6364136223846793005;
-const LCG_INCREMENT: u64 = 1442695040888963407;
-
-/// How often interruptible waits (retry backoff, a stalled body read) wake
-/// up to check for a Ctrl+C, so a long server-requested wait (up to 15 min)
-/// or a stalled transfer does not outlive the user's request to stop
-const INTERRUPT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
-
-/// Process-wide "should stop" flag, registered on first use.
-static RUNNING_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-
-/// Sets up signal handling for graceful shutdown on Ctrl+C
-///
-/// Returns an Arc<AtomicBool> that can be checked to see if the process
-/// should stop. The first Ctrl+C sets it to false; a second one quits the
-/// process immediately, so a long Retry-After wait can always be aborted.
-///
-/// Idempotent: repeated calls return the same flag; the handler is
-/// registered only once (a second `ctrlc::set_handler` would panic).
-fn setup_signal_handler() -> Arc<AtomicBool> {
-    let running = RUNNING_FLAG.get_or_init(|| {
-        let running = Arc::new(AtomicBool::new(true));
-        let presses = Arc::new(AtomicU32::new(0));
-        let r = running.clone();
-        let p = presses.clone();
-
-        ctrlc::set_handler(move || match handle_ctrl_c(&r, &p) {
-            CtrlCAction::GracefulStop => {}
-            CtrlCAction::QuitNow => std::process::exit(1),
-        })
-        .expect("Error setting Ctrl+C handler");
-
-        running
-    });
-    running.clone()
-}
-
-/// What a Ctrl+C press must do
-enum CtrlCAction {
-    /// The batch was asked to stop gracefully
-    GracefulStop,
-    /// The process must terminate immediately
-    QuitNow,
-}
-
-/// Ctrl+C handling: the first press asks the batch to stop gracefully, the
-/// second one asks for an immediate quit. Kept apart from the handler
-/// registration so the behaviour is testable without registering a second
-/// (panicking) Ctrl+C handler.
-fn handle_ctrl_c(running: &Arc<AtomicBool>, presses: &Arc<AtomicU32>) -> CtrlCAction {
-    if presses.fetch_add(1, Ordering::SeqCst) == 0 {
-        running.store(false, Ordering::SeqCst);
-        println!(
-            "\n{} Received Ctrl+C, finishing current operation...",
-            "✘".red().bold()
-        );
-        CtrlCAction::GracefulStop
-    } else {
-        println!(
-            "\n{} {} Quitting now.",
-            "✘".red().bold(),
-            "Ctrl+C".red().bold()
-        );
-        CtrlCAction::QuitNow
-    }
-}
-
-/// Finishes and clears the progress bar, if one was created
-fn finish_progress_bar(pb: &Option<ProgressBar>) {
-    if let Some(pb) = pb {
-        pb.finish_and_clear();
-    }
-}
-
-/// Calculates the MD5 hash of a file
-fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
-    let file = File::open(file_path).map_err(|e| io_error_with_path(file_path, e))?;
-    let file_size = file
-        .metadata()
-        .map_err(|e| io_error_with_path(file_path, e))?
-        .len();
-    let is_large_file = file_size > LARGE_FILE_THRESHOLD;
-
-    let mut reader = BufReader::with_capacity(BUFFER_SIZE, file);
-    let mut context = md5::Md5::new();
-    let mut buffer = [0; BUFFER_SIZE];
-
-    let pb = is_large_file.then(|| {
-        create_progress_bar(
-            file_size,
-            &format!("{} {}    ", last_glyph(), "Verifying".white()),
-            Some("blue/blue"),
-            false,
-        )
-    });
-
-    let mut bytes_processed: u64 = 0;
-
-    loop {
-        let bytes_read = reader
-            .read(&mut buffer)
-            .map_err(|e| io_error_with_path(file_path, e))?;
-        if bytes_read == 0 {
-            break;
-        }
-
-        if !running.load(Ordering::SeqCst) {
-            finish_progress_bar(&pb);
-            return Err(IaGetError::Interrupted);
-        }
-
-        context.update(&buffer[..bytes_read]);
-
-        if let Some(ref progress_bar) = pb {
-            bytes_processed += bytes_read as u64;
-            progress_bar.set_position(bytes_processed);
-        }
-    }
-
-    finish_progress_bar(&pb);
-
-    let hash = context.finalize();
-    Ok(hash.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
-/// Outcome of checking whether an already-downloaded file is still valid
+/// A single file to download, plus the archive metadata used to verify it
 #[derive(Debug)]
-enum ExistingFileStatus {
-    /// The file does not exist and must be downloaded
-    Missing,
-    /// The file exists and passed verification; `md5` is the verified hash
-    /// when archive.org provided one to compare against
-    Verified { md5: Option<String> },
-    /// The file exists but failed verification
-    Invalid,
-    /// The file could not be read (an I/O error): it is left untouched and
-    /// the problem is reported for this file only, because a read failure
-    /// proves nothing about the file's contents
-    Unreadable(String),
-}
-
-/// Size guard shared by the pre-download check and the post-download
-/// verification.
-///
-/// Returns `Some((actual, expected))` when the local file's size differs
-/// from the metadata, `None` when the sizes match or no size is known.
-fn size_mismatch(file_path: &str, expected_size: Option<u64>) -> Result<Option<(u64, u64)>> {
-    let Some(expected) = expected_size else {
-        return Ok(None);
-    };
-
-    let actual = fs::metadata(file_path)
-        .map_err(|e| io_error_with_path(file_path, e))?
-        .len();
-    if actual == expected {
-        Ok(None)
-    } else {
-        Ok(Some((actual, expected)))
-    }
-}
-
-/// Check if an existing file is still valid: the (cheap) size check runs
-/// first so a stale or truncated copy never spends a full-file hash
-/// before being rejected
-fn check_existing_file(
-    file_path: &str,
-    expected_md5: Option<&str>,
-    expected_size: Option<u64>,
-    running: &Arc<AtomicBool>,
-) -> Result<ExistingFileStatus> {
-    if !Path::new(file_path).exists() {
-        return Ok(ExistingFileStatus::Missing);
-    }
-    // A directory at the final path can neither be verified as a file nor
-    // safely removed: report it as unreadable and leave it in place.
-    if Path::new(file_path).is_dir() {
-        return Ok(ExistingFileStatus::Unreadable(
-            "a directory occupies the file path".to_string(),
-        ));
-    }
-
-    let mismatch = match size_mismatch(file_path, expected_size) {
-        Ok(mismatch) => mismatch,
-        Err(e) => {
-            return Ok(ExistingFileStatus::Unreadable(format!(
-                "could not read file size: {e}"
-            )));
-        }
-    };
-    if mismatch.is_some() {
-        return Ok(ExistingFileStatus::Invalid);
-    }
-
-    let Some(expected_md5) = expected_md5 else {
-        // No hash to compare against and the size matches: verified
-        return Ok(ExistingFileStatus::Verified { md5: None });
-    };
-
-    let local_md5 = match calculate_md5(file_path, running) {
-        Ok(hash) => hash,
-        Err(e) => {
-            if matches!(e, IaGetError::Interrupted) {
-                return Err(e);
-            }
-            // "Could not read" is not "corrupted": the file is kept as is
-            // and the problem is reported for this file only.
-            return Ok(ExistingFileStatus::Unreadable(format!(
-                "could not verify existing file: {e}"
-            )));
-        }
-    };
-
-    // Hex digests compare case-insensitively: the metadata may carry an
-    // uppercase or mixed-case MD5.
-    if local_md5.eq_ignore_ascii_case(expected_md5) {
-        Ok(ExistingFileStatus::Verified {
-            md5: Some(local_md5),
-        })
-    } else {
-        Ok(ExistingFileStatus::Invalid)
-    }
-}
-
-/// Print the line shown once a file has been verified, using the same
-/// format for freshly downloaded and already-verified files
-fn print_verified_hash(md5: Option<&str>) {
-    match md5 {
-        Some(hash) => println!(
-            "{} {}         {} {}",
-            last_glyph(),
-            "Hash".white(),
-            "✔".green().bold(),
-            format!("({})", hash).dimmed()
-        ),
-        None => println!(
-            "{} {}",
-            "-".dimmed(),
-            "No MD5 hash provided for verification.".dimmed()
-        ),
-    }
+pub struct DownloadTask {
+    /// URL the file is downloaded from
+    pub url: String,
+    /// Path of the final file on disk (may include subdirectories)
+    pub file_path: String,
+    /// MD5 hash from the archive metadata, if present
+    pub expected_md5: Option<String>,
+    /// Expected size in bytes, if known
+    pub expected_size: Option<u64>,
+    /// Unix mtime from the archive metadata, if present
+    pub expected_mtime: Option<u64>,
 }
 
 /// Ensure parent directories exist for a file
@@ -315,613 +87,10 @@ fn prepare_file_for_download(file_path: &str) -> Result<File> {
     Ok(file)
 }
 
-/// Applies +/-20% jitter to a delay so that many clients do not retry in sync.
-///
-/// Uses a linear congruential generator seeded from the current time instead
-/// of pulling in a `rand` dependency.
-fn jitter_ms(value_ms: u64) -> u64 {
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E37_79B9_7F4A_7C15);
-    let x = seed
-        .wrapping_mul(LCG_MULTIPLIER)
-        .wrapping_add(LCG_INCREMENT);
-    let factor = 80u64 + (x >> 33) % 41; // 80..=120 percent
-    value_ms.saturating_mul(factor) / 100
-}
-
-/// Exponential backoff delay for a given 1-based retry attempt.
-///
-/// Starts at `INITIAL_RETRY_DELAY_MS`, doubles per attempt, is capped at
-/// `MAX_RETRY_DELAY_MS`, and then has +/-20% jitter applied.
-fn backoff_delay(attempt: u32) -> Duration {
-    let exp = attempt.saturating_sub(1).min(20);
-    let base_ms = INITIAL_RETRY_DELAY_MS.saturating_mul(1u64 << exp);
-    let capped_ms = base_ms.min(MAX_RETRY_DELAY_MS);
-    Duration::from_millis(jitter_ms(capped_ms))
-}
-
-/// Parses a Retry-After header value given as an integer number of seconds.
-///
-/// HTTP-date forms are not supported and yield `None`. The result is capped
-/// at `MAX_RETRY_AFTER_SECS`.
-fn parse_retry_after(value: &str) -> Option<u64> {
-    value
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(|secs| secs.min(MAX_RETRY_AFTER_SECS))
-}
-
-/// Parses the start offset of a `Content-Range` header of the form
-/// `bytes <start>-<end>/<total>` (or `bytes <start>-<end>/*`), which a 206
-/// response must carry.
-///
-/// Returns `Some(true)` when the offset equals `expected_start`,
-/// `Some(false)` when it differs, and `None` when the header is absent or
-/// malformed — in both `None` cases the caller treats the body as untrusted.
-fn partial_content_offset(headers: &HeaderMap, expected_start: u64) -> Option<bool> {
-    headers
-        .get(CONTENT_RANGE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| {
-            let range = value.strip_prefix("bytes ")?.split_once('/')?.0;
-            let start = range.split_once('-')?.0;
-            start
-                .parse::<u64>()
-                .ok()
-                .map(|start| start == expected_start)
-        })
-}
-
-/// Returns true for HTTP statuses that are worth retrying (transient server
-/// or client throttling problems). Other 4xx/5xx statuses are fatal.
-fn is_retryable_status(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
-}
-
-/// Parses the server-provided `Last-Modified` header into a `SystemTime`.
-///
-/// `reqwest::Response` has no typed accessor for this header, so the raw
-/// HTTP-date is parsed with `httpdate`.
-pub fn parse_last_modified(headers: &HeaderMap) -> Option<SystemTime> {
-    headers
-        .get(LAST_MODIFIED)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| httpdate::parse_http_date(s).ok())
-}
-
-/// Converts the `<mtime>` value from `_files.xml` (unix seconds) into a
-/// `SystemTime`, or `None` when absent or out of representable range.
-fn mtime_from_xml(mtime: Option<u64>) -> Option<SystemTime> {
-    mtime.and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
-}
-
-/// Sets the file's last-modified time to `target` when the current time
-/// differs at second granularity.
-///
-/// A failure to set the time is not fatal: it prints a warning and returns
-/// `false` so the batch can continue.
-pub fn sync_file_mtime(file_path: impl AsRef<Path>, target: SystemTime) -> bool {
-    // A pre-1970 timestamp has no Unix representation; stamping the epoch
-    // would fabricate a wrong mtime, so the time is left untouched instead.
-    let Ok(target_duration) = target.duration_since(UNIX_EPOCH) else {
-        return false;
-    };
-    let target_secs = target_duration.as_secs();
-
-    let current_secs = fs::metadata(&file_path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs());
-
-    if current_secs == Some(target_secs) {
-        return false;
-    }
-
-    // u64 seconds only overflow i64 for dates around the year 292 million
-    // AD; nothing representable exists there, so leave the time as is.
-    let Ok(target_secs) = i64::try_from(target_secs) else {
-        return false;
-    };
-
-    let file_time = filetime::FileTime::from_unix_time(target_secs, 0);
-
-    if let Err(e) = filetime::set_file_mtime(&file_path, file_time) {
-        println!(
-            "{} {}      {}",
-            "⚠".yellow().bold(),
-            "Could not set last modified time".yellow(),
-            e.to_string().dimmed()
-        );
-        return false;
-    }
-
-    true
-}
-
-/// Tracks how many times a file transfer has been retried and how long to
-/// wait before each retry, so retry call sites stay short.
-struct RetryTracker {
-    count: u32,
-    delay: fn(u32) -> Duration,
-}
-
-impl RetryTracker {
-    fn new(delay: fn(u32) -> Duration) -> Self {
-        Self { count: 0, delay }
-    }
-
-    /// Records a failed attempt, prints the retry notice and waits.
-    ///
-    /// Returns an error once `MAX_RETRIES` has been exhausted or the user
-    /// interrupted the run while the wait was in progress.
-    async fn record(
-        &mut self,
-        kind: &str,
-        detail: &str,
-        retry_after_secs: Option<u64>,
-        running: &Arc<AtomicBool>,
-    ) -> Result<()> {
-        self.count += 1;
-
-        if self.count > MAX_RETRIES {
-            println!(
-                "{} {}       {} Maximum retries ({}) exceeded",
-                branch_glyph(),
-                "Failed".red().bold(),
-                "✘".red().bold(),
-                MAX_RETRIES
-            );
-            return Err(IaGetError::Network {
-                detail: format!("{kind}: {detail} (maximum retries {MAX_RETRIES} exceeded)"),
-                source: None,
-            });
-        }
-
-        let delay = retry_after_secs
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| (self.delay)(self.count));
-
-        println!(
-            "{} {}        {} {} (attempt {}/{}): {}",
-            branch_glyph(),
-            "Retry".yellow().bold(),
-            "⟳".yellow().bold(),
-            kind,
-            self.count,
-            MAX_RETRIES,
-            detail
-        );
-        println!(
-            "{} {}         Waiting {:.1}s before retry{}",
-            branch_glyph(),
-            "Wait".white(),
-            delay.as_secs_f64(),
-            if retry_after_secs.is_some() {
-                " (server requested)"
-            } else {
-                ""
-            }
-        );
-
-        // Sleep in slices and check the flag at each slice boundary: a
-        // Ctrl+C during a long wait (a server-requested Retry-After of up
-        // to 15 min) must stop the retry loop without sleeping the whole
-        // delay out.
-        let mut remaining = delay;
-        while remaining > Duration::ZERO {
-            let slice = remaining.min(INTERRUPT_CHECK_INTERVAL);
-            tokio::time::sleep(slice).await;
-            remaining -= slice;
-            if !running.load(Ordering::SeqCst) {
-                return Err(IaGetError::Interrupted);
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Resolves once the batch has been asked to stop, so a stalled body read
-/// can be aborted at the next check instead of waiting for the next chunk
-/// (or the read timeout).
-async fn wait_for_stop(running: &Arc<AtomicBool>) {
-    while running.load(Ordering::SeqCst) {
-        tokio::time::sleep(INTERRUPT_CHECK_INTERVAL).await;
-    }
-}
-
-/// Streams the response body into `file`, updating the progress bar as data
-/// arrives. Returns the number of new bytes written. A user interruption
-/// aborts with `IaGetError::Interrupted`; partial data stays in the file so
-/// the next attempt can resume.
-///
-/// The stop flag is raced against every chunk read: a body that stalls
-/// mid-transfer no longer forces a wait for the next chunk or the read
-/// timeout after a Ctrl+C.
-async fn stream_response_body(
-    response: &mut Response,
-    file: &mut File,
-    base_size: u64,
-    pb: &ProgressBar,
-    running: &Arc<AtomicBool>,
-) -> Result<u64> {
-    let mut downloaded_bytes: u64 = 0;
-
-    loop {
-        tokio::select! {
-            chunk = response.chunk() => match chunk {
-                Ok(Some(chunk)) => {
-                    file.write_all(&chunk)?;
-                    downloaded_bytes += chunk.len() as u64;
-                    pb.set_position(base_size + downloaded_bytes);
-                }
-                Ok(None) => break,
-                Err(e) => return Err(e.into()),
-            },
-            _ = wait_for_stop(running) => {
-                pb.finish_and_clear();
-                return Err(IaGetError::Interrupted);
-            }
-        }
-    }
-
-    Ok(downloaded_bytes)
-}
-
-/// A transfer's body could not be used: clear the progress bar, record the
-/// retry, and leave the file positioned at its end so the next attempt
-/// resumes from where this one stopped.
-async fn retry_open_file(
-    file: &mut File,
-    pb: &ProgressBar,
-    retry: &mut RetryTracker,
-    kind: &str,
-    detail: &str,
-    retry_after_secs: Option<u64>,
-    running: &Arc<AtomicBool>,
-) -> Result<()> {
-    pb.finish_and_clear();
-    retry
-        .record(kind, detail, retry_after_secs, running)
-        .await?;
-    file.seek(SeekFrom::End(0))?;
-    Ok(())
-}
-
-/// Progress bar label for a download attempt: "Resuming" when a Range
-/// request continues an existing `.part` file, "Downloading" otherwise.
-fn download_action_label(resuming: bool) -> String {
-    if resuming {
-        format!("{} {}     ", last_glyph(), "Resuming".white())
-    } else {
-        format!("{} {}  ", last_glyph(), "Downloading".white())
-    }
-}
-
-/// True when the error is a disk-full / no-space condition that retrying
-/// cannot fix (ENOSPC on Linux, ERROR_DISK_FULL on Windows).
-fn is_disk_full_error(err: &IaGetError) -> bool {
-    matches!(
-        err,
-        IaGetError::FileSystem { source: Some(src), .. }
-            if src
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
-    )
-}
-
-/// Download file content with progress reporting and automatic retry on failure.
-///
-/// `retry_delay` computes the delay for a given 1-based retry attempt; tests
-/// substitute near-instant delays for `backoff_delay`.
-///
-/// Only a successful (2xx) response body is ever written to `file`. Error
-/// pages are discarded, empty and truncated bodies are retried, and a 200
-/// response to a ranged request resets the file instead of appending to it.
-///
-/// Returns, when the server sent one on the final successful response, the
-/// parsed `Last-Modified` header value.
-async fn download_file_content(
-    client: &Client,
-    url: &str,
-    file: &mut File,
-    running: &Arc<AtomicBool>,
-    cookie_header: Option<&HeaderValue>,
-    expected_size: Option<u64>,
-    retry_delay: fn(u32) -> Duration,
-) -> Result<Option<SystemTime>> {
-    let mut retry = RetryTracker::new(retry_delay);
-
-    loop {
-        // Re-check file size at start of each attempt (in case of retry)
-        let current_file_size = file.metadata()?.len();
-        let resuming = current_file_size > 0;
-        let mut download_action = download_action_label(resuming);
-
-        let mut request = with_cookie(client.get(url), cookie_header);
-        if resuming {
-            request = request.header(
-                reqwest::header::RANGE,
-                HeaderValue::from_str(&format!("bytes={}-", current_file_size)).map_err(|e| {
-                    IaGetError::Network {
-                        detail: format!("Invalid range header value: {e}"),
-                        source: Some(Box::new(e)),
-                    }
-                })?,
-            );
-        }
-
-        let mut response = match request.send().await {
-            Ok(resp) => resp,
-            Err(e) => {
-                // Request failed before we even got a response
-                retry
-                    .record("Connection error", &e.to_string(), None, running)
-                    .await?;
-                continue;
-            }
-        };
-
-        let status = response.status();
-        let retry_after = response
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_retry_after);
-        // Captured on every successful response so the value returned to the
-        // caller always comes from the attempt that completed the download.
-        let last_modified = parse_last_modified(response.headers());
-
-        if !status.is_success() {
-            // Error pages must never be written to the file; drop the body.
-            drop(response);
-
-            if resuming && status == StatusCode::RANGE_NOT_SATISFIABLE {
-                // The server rejects our offset: the local prefix is not valid,
-                // so the caller must re-download from scratch.
-                return Err(IaGetError::RangeNotSatisfiable);
-            }
-
-            if is_retryable_status(status) {
-                let reason = status
-                    .canonical_reason()
-                    .unwrap_or("unknown status")
-                    .to_string();
-                retry
-                    .record(&format!("HTTP {status}"), &reason, retry_after, running)
-                    .await?;
-                continue;
-            }
-
-            return Err(IaGetError::Network {
-                detail: format!(
-                    "Server responded with HTTP {} {}",
-                    status,
-                    status.canonical_reason().unwrap_or("unknown status")
-                ),
-                source: None,
-            });
-        }
-
-        // The server ignored the Range header and is sending the full body:
-        // the local prefix is untrusted, so reset the file before streaming.
-        if resuming && status == StatusCode::OK {
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            download_action = download_action_label(false);
-        }
-        // A 206 must continue exactly where our Range header started. A
-        // missing or mismatched Content-Range offset means the body does
-        // not continue the local prefix, so reset the file before streaming.
-        if resuming
-            && status == StatusCode::PARTIAL_CONTENT
-            && partial_content_offset(response.headers(), current_file_size) != Some(true)
-        {
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            download_action = download_action_label(false);
-        }
-        let base_size = file.metadata()?.len();
-
-        // The bar's total: the server-announced length (the bytes this
-        // response will send, added to the local prefix) when present,
-        // else the metadata size, else the current size (an unknown-size
-        // file has no usable total, matching the previous behaviour).
-        let total = response
-            .content_length()
-            .map(|remaining| base_size + remaining)
-            .or(expected_size)
-            .unwrap_or(base_size);
-        let pb = create_progress_bar(total, &download_action, Some("green/green"), true);
-        // Set initial progress to current file size for resumed downloads
-        pb.set_position(base_size);
-
-        let start_time = Instant::now();
-        match stream_response_body(&mut response, file, base_size, &pb, running).await {
-            Ok(downloaded_bytes) => {
-                let total_bytes = base_size + downloaded_bytes;
-
-                // A 2xx body with zero bytes is a server malfunction only
-                // when the metadata expects data: a zero-byte file with no
-                // <size> is indistinguishable from a dropped body, so the
-                // unknown-size case is trusted (an MD5, when present, still
-                // verifies the result).
-                if downloaded_bytes == 0
-                    && base_size == 0
-                    && expected_size.is_some_and(|expected| expected > 0)
-                {
-                    retry_open_file(
-                        file,
-                        &pb,
-                        &mut retry,
-                        "Empty response",
-                        "server returned no data",
-                        retry_after,
-                        running,
-                    )
-                    .await?;
-                    continue;
-                }
-
-                // The body ended before the announced size: the transfer was
-                // truncated, so resume from where we stopped.
-                if let Some(expected) = expected_size
-                    && total_bytes < expected
-                {
-                    retry_open_file(
-                        file,
-                        &pb,
-                        &mut retry,
-                        "Incomplete body",
-                        &format!("received {total_bytes} of {expected} bytes"),
-                        None,
-                        running,
-                    )
-                    .await?;
-                    continue;
-                }
-
-                pb.finish_and_clear();
-                print_downloaded_line(branch_glyph(), downloaded_bytes, Some(start_time.elapsed()));
-
-                return Ok(last_modified);
-            }
-            Err(e) => {
-                // A user interruption aborts the run, other errors retry
-                if matches!(e, IaGetError::Interrupted) {
-                    pb.finish_and_clear();
-                    return Err(e);
-                }
-
-                // Disk full is not transient: retrying wastes minutes before
-                // the same ENOSPC / ERROR_DISK_FULL recurs.
-                if is_disk_full_error(&e) {
-                    pb.finish_and_clear();
-                    return Err(e);
-                }
-
-                // Mid-stream failure: keep the partial data and resume later.
-                retry_open_file(
-                    file,
-                    &pb,
-                    &mut retry,
-                    "Download error",
-                    &e.to_string(),
-                    None,
-                    running,
-                )
-                .await?;
-            }
-        }
-    }
-}
-
-/// Verify a downloaded file's size and hash against expected values
-fn verify_downloaded_file(
-    file_path: &str,
-    expected_md5: Option<&str>,
-    expected_size: Option<u64>,
-    running: &Arc<AtomicBool>,
-) -> Result<bool> {
-    if let Some((actual_size, expected_size)) = size_mismatch(file_path, expected_size)? {
-        println!(
-            "{} {}         {} {} (expected {})",
-            last_glyph(),
-            "Size".white(),
-            "✘".red().bold(),
-            format_size(actual_size).red(),
-            format_size(expected_size).dimmed()
-        );
-        return Ok(false);
-    }
-
-    let Some(expected_md5) = expected_md5 else {
-        // No hash to check against, consider it verified
-        print_verified_hash(None);
-        return Ok(true);
-    };
-
-    let local_md5 = calculate_md5(file_path, running)?;
-    if local_md5.eq_ignore_ascii_case(expected_md5) {
-        print_verified_hash(Some(&local_md5));
-        Ok(true)
-    } else {
-        println!(
-            "{} {}         {} ({}) Expected ({})",
-            last_glyph(),
-            "Hash".white(),
-            "✘".red().bold(),
-            local_md5.red(),
-            expected_md5.dimmed()
-        );
-        Ok(false)
-    }
-}
-
-/// A single file to download, plus the archive metadata used to verify it
-#[derive(Debug)]
-pub struct DownloadTask {
-    /// URL the file is downloaded from
-    pub url: String,
-    /// Path of the final file on disk (may include subdirectories)
-    pub file_path: String,
-    /// MD5 hash from the archive metadata, if present
-    pub expected_md5: Option<String>,
-    /// Expected size in bytes, if known
-    pub expected_size: Option<u64>,
-    /// Unix mtime from the archive metadata, if present
-    pub expected_mtime: Option<u64>,
-}
-
-/// Download multiple files with shared signal handling
-///
-/// This function sets up signal handling once for the entire download session
-/// and allows for graceful interruption between files.
-///
-/// Each file is streamed to a `<filename>.part` file and only renamed to its
-/// final name once verification passes, so a failed download never corrupts
-/// the final file. By default the batch continues after a failed file and
-/// returns `IaGetError::BatchFailed` at the end; pass `stop_on_error` to
-/// abort at the first failure instead.
-///
-/// Files are numbered starting at `file_number_start` (1-based) out of
-/// `total_files`, so files handled before the batch (for example the
-/// locally saved `_files.xml` as file #1) can be counted into the numbering.
-pub async fn download_files<I>(
-    client: &Client,
-    files: I,
-    total_files: usize,
-    file_number_start: usize,
-    cookie_header: Option<&HeaderValue>,
-    stop_on_error: bool,
-) -> Result<()>
-where
-    I: IntoIterator<Item = DownloadTask>,
-{
-    // Set up signal handling for the entire download session
-    let running = setup_signal_handler();
-
-    download_files_with_signal(
-        client,
-        files,
-        total_files,
-        file_number_start,
-        cookie_header,
-        stop_on_error,
-        &running,
-    )
-    .await
-}
-
-/// Outcome of processing a single file of the batch
-enum FileOutcome {
-    /// The file is now valid: already verified, or freshly downloaded
-    Succeeded,
-    /// The file could not be downloaded; holds the reason for the failure report
-    Failed(String),
+/// Best-effort removal of a leftover `.part` file: its absence is not an
+/// error, and a locked file must not fail the processing of the file itself
+fn remove_part_file(part_path: &str) {
+    let _ = fs::remove_file(part_path);
 }
 
 /// Outcome of checking the existing copy of a file before downloading
@@ -1006,6 +175,14 @@ fn install_downloaded_file(
     Ok(())
 }
 
+/// Outcome of processing a single file of the batch
+enum FileOutcome {
+    /// The file is now valid: already verified, or freshly downloaded
+    Succeeded,
+    /// The file could not be downloaded; holds the reason for the failure report
+    Failed(String),
+}
+
 /// Processes one file of the batch: verifies an existing copy or downloads
 /// (with verification) and renames the `.part` file to its final name.
 ///
@@ -1079,12 +256,6 @@ async fn process_file(
             Ok(FileOutcome::Failed(reason))
         }
     }
-}
-
-/// Best-effort removal of a leftover `.part` file: its absence is not an
-/// error, and a locked file must not fail the processing of the file itself
-fn remove_part_file(part_path: &str) {
-    let _ = fs::remove_file(part_path);
 }
 
 /// Outcome of the re-download attempts for one file
@@ -1250,6 +421,46 @@ async fn run_download_attempts(
     Ok(outcome)
 }
 
+/// Download multiple files with shared signal handling
+///
+/// This function sets up signal handling once for the entire download session
+/// and allows for graceful interruption between files.
+///
+/// Each file is streamed to a `<filename>.part` file and only renamed to its
+/// final name once verification passes, so a failed download never corrupts
+/// the final file. By default the batch continues after a failed file and
+/// returns `IaGetError::BatchFailed` at the end; pass `stop_on_error` to
+/// abort at the first failure instead.
+///
+/// Files are numbered starting at `file_number_start` (1-based) out of
+/// `total_files`, so files handled before the batch (for example the
+/// locally saved `_files.xml` as file #1) can be counted into the numbering.
+pub async fn download_files<I>(
+    client: &Client,
+    files: I,
+    total_files: usize,
+    file_number_start: usize,
+    cookie_header: Option<&HeaderValue>,
+    stop_on_error: bool,
+) -> Result<()>
+where
+    I: IntoIterator<Item = DownloadTask>,
+{
+    // Set up signal handling for the entire download session
+    let running = setup_signal_handler();
+
+    download_files_with_signal(
+        client,
+        files,
+        total_files,
+        file_number_start,
+        cookie_header,
+        stop_on_error,
+        &running,
+    )
+    .await
+}
+
 /// Batch download logic with an externally provided signal flag.
 ///
 /// Split out from `download_files` so tests can drive the batch loop without
@@ -1338,26 +549,17 @@ fn batch_failed(failed_files: &[(String, String)], total: usize) -> IaGetError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{MockBody, MockResponse, MockServer, mtime_of, temp_dir_for};
+    use crate::downloader::retry::MAX_RETRIES;
+    use crate::test_support::{
+        MockBody, MockResponse, MockServer, md5_hex, mtime_of, temp_dir_for, test_running,
+    };
     use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
-    use std::time::Instant;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     /// Near-instant retry delay so tests do not wait for real backoff
     fn fast_retry(_attempt: u32) -> Duration {
         Duration::from_millis(1)
-    }
-
-    fn test_running() -> Arc<AtomicBool> {
-        Arc::new(AtomicBool::new(true))
-    }
-
-    /// The lowercase hex MD5 of `content`, in the form archive.org reports
-    fn md5_hex(content: &[u8]) -> String {
-        md5::Md5::digest(content)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
     }
 
     /// Builds a `DownloadTask` for the mock server
@@ -1726,44 +928,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn partial_content_offset_parses_matching_and_mismatching_ranges() {
-        fn headers(range: Option<&str>) -> HeaderMap {
-            let mut headers = HeaderMap::new();
-            if let Some(range) = range {
-                headers.insert(
-                    CONTENT_RANGE,
-                    HeaderValue::from_str(range).expect("a static test string is a valid header"),
-                );
-            }
-            headers
-        }
-
-        assert_eq!(
-            partial_content_offset(&headers(Some("bytes 8-19/20")), 8),
-            Some(true)
-        );
-        assert_eq!(
-            partial_content_offset(&headers(Some("bytes 0-9/20")), 8),
-            Some(false)
-        );
-        assert_eq!(
-            partial_content_offset(&headers(Some("bytes 8-19/*")), 9),
-            Some(false)
-        );
-        assert_eq!(partial_content_offset(&headers(None), 8), None);
-        // A suffix-form range has no usable start offset: untrusted.
-        assert_eq!(
-            partial_content_offset(&headers(Some("bytes */20")), 8),
-            None
-        );
-        // A range without a total is not what a 206 carries: untrusted.
-        assert_eq!(
-            partial_content_offset(&headers(Some("bytes 8-19")), 8),
-            None
-        );
-    }
-
     #[tokio::test]
     async fn full_200_response_resets_untrusted_prefix() {
         let full = b"0123456789"; // 10 bytes
@@ -2056,16 +1220,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn mtime_from_xml_converts_and_rejects_overflow() {
-        assert_eq!(mtime_from_xml(None), None);
-        assert_eq!(
-            mtime_from_xml(Some(1_735_965_174)),
-            Some(UNIX_EPOCH + Duration::from_secs(1_735_965_174))
-        );
-        assert_eq!(mtime_from_xml(Some(u64::MAX)), None);
-    }
-
     #[tokio::test]
     async fn last_modified_header_is_captured() {
         let content = b"0123456789abcdef";
@@ -2236,57 +1390,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn parse_retry_after_seconds() {
-        assert_eq!(parse_retry_after("30"), Some(30));
-        assert_eq!(parse_retry_after("  5 "), Some(5));
-        assert_eq!(parse_retry_after("0"), Some(0));
-        assert_eq!(parse_retry_after("999999"), Some(MAX_RETRY_AFTER_SECS));
-        assert_eq!(parse_retry_after(""), None);
-        assert_eq!(parse_retry_after("next tuesday"), None);
-        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
-    }
-
-    #[test]
-    fn backoff_delay_stays_within_bounds() {
-        let d1 = backoff_delay(1);
-        assert!(
-            (4000..=6000).contains(&d1.as_millis()),
-            "attempt 1: {:?}",
-            d1
-        );
-        let d2 = backoff_delay(2);
-        assert!(
-            (8000..=12000).contains(&d2.as_millis()),
-            "attempt 2: {:?}",
-            d2
-        );
-        let d60 = backoff_delay(60);
-        assert!(
-            (48000..=72000).contains(&d60.as_millis()),
-            "attempt 60 must be capped at 60s ±20%: {:?}",
-            d60
-        );
-    }
-
-    #[test]
-    fn is_retryable_status_covers_server_errors() {
-        for code in [408u16, 425, 429, 500, 502, 503, 504] {
-            assert!(
-                is_retryable_status(StatusCode::from_u16(code).unwrap()),
-                "{} must be retryable",
-                code
-            );
-        }
-        for code in [200u16, 206, 301, 400, 401, 403, 404, 416] {
-            assert!(
-                !is_retryable_status(StatusCode::from_u16(code).unwrap()),
-                "{} must not be retryable",
-                code
-            );
-        }
-    }
-
     #[tokio::test]
     async fn existing_file_with_wrong_size_and_no_md5_is_redownloaded() {
         let content = b"fresh-content-001";
@@ -2377,82 +1480,6 @@ mod tests {
         assert!(
             blocked.exists(),
             "unremovable stale file must stay in place"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn size_mismatch_short_circuits_before_hashing() {
-        // A copy whose size does not match the metadata must be rejected
-        // as Invalid without spending a full-file hash.
-        let dir = temp_dir_for("size_short_circuit");
-        let path = dir.join("file.bin");
-        fs::write(&path, b"short").unwrap(); // 5 bytes
-
-        let expected = md5_hex(b"totally different content");
-        let status = check_existing_file(
-            path.to_str().unwrap(),
-            Some(expected.as_str()),
-            Some(100),
-            &test_running(),
-        )
-        .unwrap();
-
-        assert!(
-            matches!(status, ExistingFileStatus::Invalid),
-            "got {status:?}"
-        );
-        assert!(
-            path.exists(),
-            "the stale copy is removed by the caller, not by the check"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn unreadable_existing_file_is_reported_not_redownloaded() {
-        // A directory at the file path must yield Unreadable (per-file
-        // failure, the entry is kept), not Invalid, which would delete it
-        // and re-download based on a read failure.
-        let dir = temp_dir_for("unreadable_existing");
-        let path = dir.join("dirfile.bin");
-        fs::create_dir(&path).unwrap();
-
-        let expected = md5_hex(b"x");
-        let status = check_existing_file(
-            path.to_str().unwrap(),
-            Some(expected.as_str()),
-            None,
-            &test_running(),
-        )
-        .unwrap();
-
-        match status {
-            ExistingFileStatus::Unreadable(reason) => {
-                assert!(!reason.is_empty(), "the reason must name the problem");
-            }
-            other => panic!("expected Unreadable, got {other:?}"),
-        }
-        assert!(path.exists(), "an unreadable file must not be deleted");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn sync_file_mtime_skips_pre_epoch_times() {
-        // A Last-Modified before 1970 has no Unix representation: the mtime
-        // must be left untouched instead of being stamped to the epoch.
-        let dir = temp_dir_for("mtime_pre_epoch");
-        let path = dir.join("f.txt");
-        fs::write(&path, "x").unwrap();
-
-        let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
-        assert!(!sync_file_mtime(&path, pre_epoch));
-
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
-        assert!(
-            mtime.duration_since(UNIX_EPOCH).unwrap().abs_diff(now) < Duration::from_secs(60),
-            "the mtime must stay at the write time"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2603,26 +1630,6 @@ mod tests {
             "an interrupted batch must fail, got {err:?}"
         );
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn second_ctrl_c_press_requests_immediate_quit() {
-        let running = Arc::new(AtomicBool::new(true));
-        let presses = Arc::new(AtomicU32::new(0));
-
-        assert!(
-            matches!(handle_ctrl_c(&running, &presses), CtrlCAction::GracefulStop),
-            "the first press must stop the batch gracefully"
-        );
-        assert!(
-            !running.load(Ordering::SeqCst),
-            "the first press must flag the batch to stop"
-        );
-
-        assert!(
-            matches!(handle_ctrl_c(&running, &presses), CtrlCAction::QuitNow),
-            "the second press must ask the handler to exit the process"
-        );
     }
 
     #[tokio::test]

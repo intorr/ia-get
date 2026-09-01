@@ -1,0 +1,294 @@
+//! Integrity verification of local files: the (cheap) size check that runs
+//! first, and the full-file MD5 hash that confirms the contents.
+
+use std::fs;
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use colored::*;
+use digest::Digest;
+
+use crate::Result;
+use crate::error::{IaGetError, io_error_with_path};
+use crate::utils::{create_progress_bar, finish_progress_bar, format_size, last_glyph};
+
+/// Buffer size for file operations (8KB)
+const BUFFER_SIZE: usize = 8192;
+
+/// File size threshold for showing hash progress bar (2MB)
+const LARGE_FILE_THRESHOLD: u64 = 2 * 1024 * 1024;
+
+/// Calculates the MD5 hash of a file
+fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
+    let file = File::open(file_path).map_err(|e| io_error_with_path(file_path, e))?;
+    let file_size = file
+        .metadata()
+        .map_err(|e| io_error_with_path(file_path, e))?
+        .len();
+    let is_large_file = file_size > LARGE_FILE_THRESHOLD;
+
+    let mut reader = BufReader::with_capacity(BUFFER_SIZE, file);
+    let mut context = md5::Md5::new();
+    let mut buffer = [0; BUFFER_SIZE];
+
+    let pb = is_large_file.then(|| {
+        create_progress_bar(
+            file_size,
+            &format!("{} {}    ", last_glyph(), "Verifying".white()),
+            Some("blue/blue"),
+            false,
+        )
+    });
+
+    let mut bytes_processed: u64 = 0;
+
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .map_err(|e| io_error_with_path(file_path, e))?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        if !running.load(Ordering::SeqCst) {
+            finish_progress_bar(&pb);
+            return Err(IaGetError::Interrupted);
+        }
+
+        context.update(&buffer[..bytes_read]);
+
+        if let Some(ref progress_bar) = pb {
+            bytes_processed += bytes_read as u64;
+            progress_bar.set_position(bytes_processed);
+        }
+    }
+
+    finish_progress_bar(&pb);
+
+    let hash = context.finalize();
+    Ok(hash.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Outcome of checking whether an already-downloaded file is still valid
+#[derive(Debug)]
+pub(crate) enum ExistingFileStatus {
+    /// The file does not exist and must be downloaded
+    Missing,
+    /// The file exists and passed verification; `md5` is the verified hash
+    /// when archive.org provided one to compare against
+    Verified { md5: Option<String> },
+    /// The file exists but failed verification
+    Invalid,
+    /// The file could not be read (an I/O error): it is left untouched and
+    /// the problem is reported for this file only, because a read failure
+    /// proves nothing about the file's contents
+    Unreadable(String),
+}
+
+/// Size guard shared by the pre-download check and the post-download
+/// verification.
+///
+/// Returns `Some((actual, expected))` when the local file's size differs
+/// from the metadata, `None` when the sizes match or no size is known.
+fn size_mismatch(file_path: &str, expected_size: Option<u64>) -> Result<Option<(u64, u64)>> {
+    let Some(expected) = expected_size else {
+        return Ok(None);
+    };
+
+    let actual = fs::metadata(file_path)
+        .map_err(|e| io_error_with_path(file_path, e))?
+        .len();
+    if actual == expected {
+        Ok(None)
+    } else {
+        Ok(Some((actual, expected)))
+    }
+}
+
+/// Check if an existing file is still valid: the (cheap) size check runs
+/// first so a stale or truncated copy never spends a full-file hash
+/// before being rejected
+pub(crate) fn check_existing_file(
+    file_path: &str,
+    expected_md5: Option<&str>,
+    expected_size: Option<u64>,
+    running: &Arc<AtomicBool>,
+) -> Result<ExistingFileStatus> {
+    if !Path::new(file_path).exists() {
+        return Ok(ExistingFileStatus::Missing);
+    }
+    // A directory at the final path can neither be verified as a file nor
+    // safely removed: report it as unreadable and leave it in place.
+    if Path::new(file_path).is_dir() {
+        return Ok(ExistingFileStatus::Unreadable(
+            "a directory occupies the file path".to_string(),
+        ));
+    }
+
+    let mismatch = match size_mismatch(file_path, expected_size) {
+        Ok(mismatch) => mismatch,
+        Err(e) => {
+            return Ok(ExistingFileStatus::Unreadable(format!(
+                "could not read file size: {e}"
+            )));
+        }
+    };
+    if mismatch.is_some() {
+        return Ok(ExistingFileStatus::Invalid);
+    }
+
+    let Some(expected_md5) = expected_md5 else {
+        // No hash to compare against and the size matches: verified
+        return Ok(ExistingFileStatus::Verified { md5: None });
+    };
+
+    let local_md5 = match calculate_md5(file_path, running) {
+        Ok(hash) => hash,
+        Err(e) => {
+            if matches!(e, IaGetError::Interrupted) {
+                return Err(e);
+            }
+            // "Could not read" is not "corrupted": the file is kept as is
+            // and the problem is reported for this file only.
+            return Ok(ExistingFileStatus::Unreadable(format!(
+                "could not verify existing file: {e}"
+            )));
+        }
+    };
+
+    // Hex digests compare case-insensitively: the metadata may carry an
+    // uppercase or mixed-case MD5.
+    if local_md5.eq_ignore_ascii_case(expected_md5) {
+        Ok(ExistingFileStatus::Verified {
+            md5: Some(local_md5),
+        })
+    } else {
+        Ok(ExistingFileStatus::Invalid)
+    }
+}
+
+/// Print the line shown once a file has been verified, using the same
+/// format for freshly downloaded and already-verified files
+pub(crate) fn print_verified_hash(md5: Option<&str>) {
+    match md5 {
+        Some(hash) => println!(
+            "{} {}         {} {}",
+            last_glyph(),
+            "Hash".white(),
+            "✔".green().bold(),
+            format!("({})", hash).dimmed()
+        ),
+        None => println!(
+            "{} {}",
+            "-".dimmed(),
+            "No MD5 hash provided for verification.".dimmed()
+        ),
+    }
+}
+
+/// Verify a downloaded file's size and hash against expected values
+pub(crate) fn verify_downloaded_file(
+    file_path: &str,
+    expected_md5: Option<&str>,
+    expected_size: Option<u64>,
+    running: &Arc<AtomicBool>,
+) -> Result<bool> {
+    if let Some((actual_size, expected_size)) = size_mismatch(file_path, expected_size)? {
+        println!(
+            "{} {}         {} {} (expected {})",
+            last_glyph(),
+            "Size".white(),
+            "✘".red().bold(),
+            format_size(actual_size).red(),
+            format_size(expected_size).dimmed()
+        );
+        return Ok(false);
+    }
+
+    let Some(expected_md5) = expected_md5 else {
+        // No hash to check against, consider it verified
+        print_verified_hash(None);
+        return Ok(true);
+    };
+
+    let local_md5 = calculate_md5(file_path, running)?;
+    if local_md5.eq_ignore_ascii_case(expected_md5) {
+        print_verified_hash(Some(&local_md5));
+        Ok(true)
+    } else {
+        println!(
+            "{} {}         {} ({}) Expected ({})",
+            last_glyph(),
+            "Hash".white(),
+            "✘".red().bold(),
+            local_md5.red(),
+            expected_md5.dimmed()
+        );
+        Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{md5_hex, temp_dir_for, test_running};
+
+    #[test]
+    fn size_mismatch_short_circuits_before_hashing() {
+        // A copy whose size does not match the metadata must be rejected
+        // as Invalid without spending a full-file hash.
+        let dir = temp_dir_for("size_short_circuit");
+        let path = dir.join("file.bin");
+        fs::write(&path, b"short").unwrap(); // 5 bytes
+
+        let expected = md5_hex(b"totally different content");
+        let status = check_existing_file(
+            path.to_str().unwrap(),
+            Some(expected.as_str()),
+            Some(100),
+            &test_running(),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(status, ExistingFileStatus::Invalid),
+            "got {status:?}"
+        );
+        assert!(
+            path.exists(),
+            "the stale copy is removed by the caller, not by the check"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_existing_file_is_reported_not_redownloaded() {
+        // A directory at the file path must yield Unreadable (per-file
+        // failure, the entry is kept), not Invalid, which would delete it
+        // and re-download based on a read failure.
+        let dir = temp_dir_for("unreadable_existing");
+        let path = dir.join("dirfile.bin");
+        fs::create_dir(&path).unwrap();
+
+        let expected = md5_hex(b"x");
+        let status = check_existing_file(
+            path.to_str().unwrap(),
+            Some(expected.as_str()),
+            None,
+            &test_running(),
+        )
+        .unwrap();
+
+        match status {
+            ExistingFileStatus::Unreadable(reason) => {
+                assert!(!reason.is_empty(), "the reason must name the problem");
+            }
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+        assert!(path.exists(), "an unreadable file must not be deleted");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

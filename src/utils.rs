@@ -115,6 +115,13 @@ pub fn create_progress_bar(
     pb
 }
 
+/// Finishes and clears a progress bar, if one was created
+pub fn finish_progress_bar(pb: &Option<ProgressBar>) {
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+    }
+}
+
 /// Tree glyph for a line with more lines following in the file's block.
 pub fn branch_glyph() -> ColoredString {
     "├╼".cyan().dimmed()
