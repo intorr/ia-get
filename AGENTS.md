@@ -35,13 +35,20 @@ Manual test URLs:
 src/
 ├── main.rs              # CLI entry point (clap) and orchestration
 ├── lib.rs               # Library exports
-├── downloader.rs        # HTTP download with retry/resume, size + MD5 verification
+├── plan.rs              # Download plan: URL building, name sanitization, collision detection
 ├── archive_metadata.rs  # _files.xml fetch, XML parsing, local persistence
 ├── cookie.rs            # Cookie header from raw string or Netscape cookies.txt
 ├── utils.rs             # Helpers (filename sanitisation, progress bars, status lines)
 ├── error.rs             # Custom error types (thiserror)
 ├── constants.rs         # User agent, URL pattern, debug limits
-└── test_support.rs      # Shared test helpers (in-memory HTTP mock server)
+├── test_support.rs      # Shared test helpers (in-memory HTTP mock server)
+└── downloader/
+    ├── mod.rs           # Batch orchestration: DownloadTask, .part lifecycle, per-file pipeline
+    ├── stream.rs        # Streaming HTTP body to file, Range/resume, retry decisions
+    ├── retry.rs         # Exponential backoff + jitter, RetryTracker, Retry-After
+    ├── verify.rs        # Size + MD5 verification, ExistingFileStatus
+    ├── signal.rs        # Ctrl+C handler (graceful stop, then hard exit)
+    └── mtime.rs         # Last-Modified / <mtime> parsing and filetime sync
 ```
 
 ## Dependencies

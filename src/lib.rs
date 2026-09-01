@@ -10,6 +10,7 @@ pub mod constants;
 pub mod cookie;
 pub mod downloader;
 pub mod error;
+pub mod plan;
 #[cfg(test)]
 pub mod test_support;
 pub mod utils;
