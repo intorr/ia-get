@@ -8,8 +8,10 @@
 pub mod archive_metadata;
 pub mod constants;
 pub mod cookie;
+pub mod display;
 pub mod downloader;
 pub mod error;
+pub mod filename;
 pub mod plan;
 #[cfg(test)]
 pub mod test_support;

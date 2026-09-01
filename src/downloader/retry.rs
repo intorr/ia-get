@@ -9,8 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use colored::*;
 
 use crate::Result;
+use crate::display::branch_glyph;
 use crate::error::IaGetError;
-use crate::utils::branch_glyph;
 
 /// Maximum number of retry attempts for a single failing request
 pub(crate) const MAX_RETRIES: u32 = 10;

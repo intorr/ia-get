@@ -38,7 +38,9 @@ src/
 ├── plan.rs              # Download plan: URL building, name sanitization, collision detection
 ├── archive_metadata.rs  # _files.xml fetch, XML parsing, local persistence
 ├── cookie.rs            # Cookie header from raw string or Netscape cookies.txt
-├── utils.rs             # Helpers (filename sanitisation, progress bars, status lines)
+├── display.rs           # Terminal output (spinner, progress bars, banners, size/duration formatting)
+├── filename.rs          # Filename sanitization for cross-platform filesystems
+├── utils.rs             # General helpers (cookie header on requests, symlink guard, URL validation)
 ├── error.rs             # Custom error types (thiserror)
 ├── constants.rs         # User agent, URL pattern, debug limits
 ├── test_support.rs      # Shared test helpers (in-memory HTTP mock server)

@@ -11,7 +11,7 @@ use reqwest::Url;
 use crate::Result;
 use crate::archive_metadata::{XmlFile, encode_download_path, xml_file_name_of};
 use crate::downloader::DownloadTask;
-use crate::utils::sanitize_filename;
+use crate::filename::sanitize_filename;
 
 /// Filters out the archive's self-referencing `_files.xml` entry, whose
 /// checksum, mtime and size are unreliable, leaving the files to download.

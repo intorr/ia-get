@@ -13,12 +13,12 @@ use ia_get::archive_metadata::{
 };
 use ia_get::constants::USER_AGENT;
 use ia_get::cookie::cookie_header_value;
+use ia_get::display::{
+    create_spinner, finish_spinner, last_glyph, print_downloaded_line, print_file_banner,
+};
 use ia_get::downloader;
 use ia_get::plan::{files_to_download, plan_download_tasks};
-use ia_get::utils::{
-    create_spinner, finish_spinner, last_glyph, print_downloaded_line, print_file_banner,
-    validate_archive_url,
-};
+use ia_get::utils::validate_archive_url;
 use ia_get::{IaGetError, Result};
 use indicatif::ProgressBar;
 use reqwest::{Client, Url};

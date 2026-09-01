@@ -25,6 +25,7 @@ use reqwest::Client;
 use reqwest::header::HeaderValue;
 
 use crate::Result;
+use crate::display::{branch_glyph, print_file_banner};
 use crate::downloader::mtime::mtime_from_xml;
 use crate::downloader::retry::backoff_delay;
 use crate::downloader::signal::setup_signal_handler;
@@ -33,7 +34,7 @@ use crate::downloader::verify::{
     ExistingFileStatus, check_existing_file, print_verified_hash, verify_downloaded_file,
 };
 use crate::error::{IaGetError, io_error_with_path};
-use crate::utils::{branch_glyph, ensure_not_symlink, print_file_banner};
+use crate::utils::ensure_not_symlink;
 
 // Re-export the items that form this module's public API.
 pub use mtime::{parse_last_modified, sync_file_mtime};
@@ -442,17 +443,14 @@ async fn run_download_attempts(
 /// Files are numbered starting at `file_number_start` (1-based) out of
 /// `total_files`, so files handled before the batch (for example the
 /// locally saved `_files.xml` as file #1) can be counted into the numbering.
-pub async fn download_files<I>(
+pub async fn download_files(
     client: &Client,
-    files: I,
+    files: Vec<DownloadTask>,
     total_files: usize,
     file_number_start: usize,
     cookie_header: Option<&HeaderValue>,
     stop_on_error: bool,
-) -> Result<()>
-where
-    I: IntoIterator<Item = DownloadTask>,
-{
+) -> Result<()> {
     // Set up signal handling for the entire download session
     let running = setup_signal_handler();
 
@@ -475,19 +473,15 @@ where
 ///
 /// `file_number_start` is the 1-based number assigned to the first file of
 /// the batch.
-async fn download_files_with_signal<I>(
+async fn download_files_with_signal(
     client: &Client,
-    files: I,
+    tasks: Vec<DownloadTask>,
     total_files: usize,
     file_number_start: usize,
     cookie_header: Option<&HeaderValue>,
     stop_on_error: bool,
     running: &Arc<AtomicBool>,
-) -> Result<()>
-where
-    I: IntoIterator<Item = DownloadTask>,
-{
-    let tasks: Vec<DownloadTask> = files.into_iter().collect();
+) -> Result<()> {
     let mut failed_files: Vec<(String, String)> = Vec::new();
 
     for (index, task) in tasks.iter().enumerate() {

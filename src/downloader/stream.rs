@@ -10,15 +10,14 @@ use std::time::{Duration, Instant, SystemTime};
 use colored::*;
 use indicatif::ProgressBar;
 use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderValue, RANGE, RETRY_AFTER};
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 
 use crate::Result;
+use crate::display::{branch_glyph, create_progress_bar, last_glyph, print_downloaded_line};
 use crate::downloader::mtime::parse_last_modified;
 use crate::downloader::retry::{INTERRUPT_CHECK_INTERVAL, RetryTracker, parse_retry_after};
 use crate::error::IaGetError;
-use crate::utils::{
-    branch_glyph, create_progress_bar, last_glyph, print_downloaded_line, with_cookie,
-};
+use crate::utils::with_cookie;
 
 /// Resolves once the batch has been asked to stop, so a stalled body read
 /// can be aborted at the next check instead of waiting for the next chunk
@@ -109,6 +108,126 @@ fn is_disk_full_error(err: &IaGetError) -> bool {
     )
 }
 
+/// Builds the next attempt's request: a plain GET for a fresh file, or a
+/// `Range: bytes=<size>-` resume request when the local prefix is non-empty.
+fn resume_request(
+    client: &Client,
+    url: &str,
+    cookie_header: Option<&HeaderValue>,
+    current_file_size: u64,
+) -> Result<RequestBuilder> {
+    let mut request = with_cookie(client.get(url), cookie_header);
+    if current_file_size > 0 {
+        request = request.header(
+            RANGE,
+            HeaderValue::from_str(&format!("bytes={current_file_size}-")).map_err(|e| {
+                IaGetError::Network {
+                    detail: format!("Invalid range header value: {e}"),
+                    source: Some(Box::new(e)),
+                }
+            })?,
+        );
+    }
+    Ok(request)
+}
+
+/// Handles a non-success response.
+///
+/// A 416 on a resume is fatal: the local prefix is not a valid one, so the
+/// caller must re-download from scratch. A retryable status is recorded for
+/// another attempt. Any other status is a fatal network error.
+async fn handle_failed_status(
+    status: StatusCode,
+    resuming: bool,
+    retry_after: Option<u64>,
+    retry: &mut RetryTracker,
+    running: &Arc<AtomicBool>,
+) -> Result<()> {
+    if resuming && status == StatusCode::RANGE_NOT_SATISFIABLE {
+        return Err(IaGetError::RangeNotSatisfiable);
+    }
+
+    if !is_retryable_status(status) {
+        return Err(IaGetError::Network {
+            detail: format!(
+                "Server responded with HTTP {} {}",
+                status,
+                status.canonical_reason().unwrap_or("unknown status")
+            ),
+            source: None,
+        });
+    }
+
+    let reason = status
+        .canonical_reason()
+        .unwrap_or("unknown status")
+        .to_string();
+    retry
+        .record(&format!("HTTP {status}"), &reason, retry_after, running)
+        .await
+}
+
+/// Whether the local prefix may be appended to the server's successful
+/// body: only a 206 whose `Content-Range` starts exactly where the file
+/// ends. A full-body 200 replaces the file; any other status (e.g. 204)
+/// carries no resumable body and the prefix is left in place.
+fn prefix_trusted(status: StatusCode, headers: &HeaderMap, local_size: u64) -> bool {
+    match status {
+        StatusCode::OK => false,
+        StatusCode::PARTIAL_CONTENT => partial_content_offset(headers, local_size) == Some(true),
+        _ => true,
+    }
+}
+
+/// The progress bar's total: the server-announced length (the bytes this
+/// response will send, added to the local prefix) when present, else the
+/// metadata size, else the current size (an unknown-size file has no usable
+/// total, matching the previous behaviour).
+fn progress_total(response: &Response, base_size: u64, expected_size: Option<u64>) -> u64 {
+    response
+        .content_length()
+        .map(|remaining| base_size + remaining)
+        .or(expected_size)
+        .unwrap_or(base_size)
+}
+
+/// How to treat a streamed successful body
+enum StreamedBody {
+    /// The body is complete; the download finished
+    Complete,
+    /// The server returned no data at all; retry
+    Empty,
+    /// The body ended before the metadata size; resume where it stopped
+    Incomplete { received: u64, expected: u64 },
+}
+
+/// Decides whether a streamed body is complete.
+///
+/// A zero-byte body is a server malfunction only when the metadata expects
+/// data: a zero-byte file with no `<size>` is indistinguishable from a
+/// dropped body, so the unknown-size case is trusted (an MD5, when present,
+/// still verifies the result). A body shorter than the metadata size was
+/// truncated.
+fn assess_streamed_body(
+    downloaded_bytes: u64,
+    base_size: u64,
+    expected_size: Option<u64>,
+) -> StreamedBody {
+    if downloaded_bytes == 0 && base_size == 0 && expected_size.is_some_and(|expected| expected > 0)
+    {
+        return StreamedBody::Empty;
+    }
+    if let Some(expected) = expected_size
+        && base_size + downloaded_bytes < expected
+    {
+        return StreamedBody::Incomplete {
+            received: base_size + downloaded_bytes,
+            expected,
+        };
+    }
+    StreamedBody::Complete
+}
+
 /// Download file content with progress reporting and automatic retry on failure.
 ///
 /// `retry_delay` computes the delay for a given 1-based retry attempt; tests
@@ -137,21 +256,9 @@ pub(crate) async fn download_file_content(
         let resuming = current_file_size > 0;
         let mut download_action = download_action_label(resuming);
 
-        let mut request = with_cookie(client.get(url), cookie_header);
-        if resuming {
-            request = request.header(
-                RANGE,
-                HeaderValue::from_str(&format!("bytes={}-", current_file_size)).map_err(|e| {
-                    IaGetError::Network {
-                        detail: format!("Invalid range header value: {e}"),
-                        source: Some(Box::new(e)),
-                    }
-                })?,
-            );
-        }
-
+        let request = resume_request(client, url, cookie_header, current_file_size)?;
         let mut response = match request.send().await {
-            Ok(resp) => resp,
+            Ok(response) => response,
             Err(e) => {
                 // Request failed before we even got a response
                 retry
@@ -174,125 +281,80 @@ pub(crate) async fn download_file_content(
         if !status.is_success() {
             // Error pages must never be written to the file; drop the body.
             drop(response);
-
-            if resuming && status == StatusCode::RANGE_NOT_SATISFIABLE {
-                // The server rejects our offset: the local prefix is not valid,
-                // so the caller must re-download from scratch.
-                return Err(IaGetError::RangeNotSatisfiable);
-            }
-
-            if is_retryable_status(status) {
-                let reason = status
-                    .canonical_reason()
-                    .unwrap_or("unknown status")
-                    .to_string();
-                retry
-                    .record(&format!("HTTP {status}"), &reason, retry_after, running)
-                    .await?;
-                continue;
-            }
-
-            return Err(IaGetError::Network {
-                detail: format!(
-                    "Server responded with HTTP {} {}",
-                    status,
-                    status.canonical_reason().unwrap_or("unknown status")
-                ),
-                source: None,
-            });
+            // Ok: the failure was recorded and another attempt follows;
+            // Err: a fatal status returned instead.
+            handle_failed_status(status, resuming, retry_after, &mut retry, running).await?;
+            continue;
         }
 
-        // The server ignored the Range request and is sending the full body
-        // (200), or the 206's Content-Range does not start where the local
-        // file ends: in either case the local prefix is untrusted, so the
-        // file is reset before the body is streamed.
-        let untrusted_prefix = match status {
-            StatusCode::OK => true,
-            StatusCode::PARTIAL_CONTENT => {
-                partial_content_offset(response.headers(), current_file_size) != Some(true)
-            }
-            _ => false,
-        };
-        if resuming && untrusted_prefix {
+        if resuming && !prefix_trusted(status, response.headers(), current_file_size) {
+            // The server ignored the Range request and is sending the full
+            // body (200), or the 206's Content-Range does not start where
+            // the local file ends: in either case the local prefix is
+            // untrusted, so the file is reset before the body is streamed.
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
             download_action = download_action_label(false);
         }
         let base_size = file.metadata()?.len();
 
-        // The bar's total: the server-announced length (the bytes this
-        // response will send, added to the local prefix) when present,
-        // else the metadata size, else the current size (an unknown-size
-        // file has no usable total, matching the previous behaviour).
-        let total = response
-            .content_length()
-            .map(|remaining| base_size + remaining)
-            .or(expected_size)
-            .unwrap_or(base_size);
-        let pb = create_progress_bar(total, &download_action, "green/green", true);
+        let pb = create_progress_bar(
+            progress_total(&response, base_size, expected_size),
+            &download_action,
+            "green/green",
+            true,
+        );
         // Set initial progress to current file size for resumed downloads
         pb.set_position(base_size);
 
         let start_time = Instant::now();
         match stream_response_body(&mut response, file, base_size, &pb, running).await {
             Ok(downloaded_bytes) => {
-                let total_bytes = base_size + downloaded_bytes;
-
-                // A 2xx body with zero bytes is a server malfunction only
-                // when the metadata expects data: a zero-byte file with no
-                // <size> is indistinguishable from a dropped body, so the
-                // unknown-size case is trusted (an MD5, when present, still
-                // verifies the result).
-                if downloaded_bytes == 0
-                    && base_size == 0
-                    && expected_size.is_some_and(|expected| expected > 0)
-                {
-                    retry_open_file(
-                        file,
-                        &pb,
-                        &mut retry,
-                        "Empty response",
-                        "server returned no data",
-                        retry_after,
-                        running,
-                    )
-                    .await?;
-                    continue;
+                match assess_streamed_body(downloaded_bytes, base_size, expected_size) {
+                    StreamedBody::Complete => {
+                        pb.finish_and_clear();
+                        print_downloaded_line(
+                            branch_glyph(),
+                            downloaded_bytes,
+                            Some(start_time.elapsed()),
+                        );
+                        return Ok(last_modified);
+                    }
+                    StreamedBody::Empty => {
+                        retry_open_file(
+                            file,
+                            &pb,
+                            &mut retry,
+                            "Empty response",
+                            "server returned no data",
+                            retry_after,
+                            running,
+                        )
+                        .await?;
+                    }
+                    StreamedBody::Incomplete { received, expected } => {
+                        // The body ended before the announced size: the
+                        // transfer was truncated, so resume from where it
+                        // stopped.
+                        retry_open_file(
+                            file,
+                            &pb,
+                            &mut retry,
+                            "Incomplete body",
+                            &format!("received {received} of {expected} bytes"),
+                            None,
+                            running,
+                        )
+                        .await?;
+                    }
                 }
-
-                // The body ended before the announced size: the transfer was
-                // truncated, so resume from where we stopped.
-                if let Some(expected) = expected_size
-                    && total_bytes < expected
-                {
-                    retry_open_file(
-                        file,
-                        &pb,
-                        &mut retry,
-                        "Incomplete body",
-                        &format!("received {total_bytes} of {expected} bytes"),
-                        None,
-                        running,
-                    )
-                    .await?;
-                    continue;
-                }
-
-                pb.finish_and_clear();
-                print_downloaded_line(branch_glyph(), downloaded_bytes, Some(start_time.elapsed()));
-
-                return Ok(last_modified);
+                continue;
             }
             Err(e) => {
-                // A user interruption aborts the run, other errors retry
-                if matches!(e, IaGetError::Interrupted) {
-                    pb.finish_and_clear();
-                    return Err(e);
-                }
-
-                // Disk full is not transient: retrying wastes minutes before
-                // the same ENOSPC / ERROR_DISK_FULL recurs.
-                if is_disk_full_error(&e) {
+                // A user interruption aborts the run; a disk-full condition
+                // cannot be fixed by retrying (the same ENOSPC /
+                // ERROR_DISK_FULL would recur).
+                if matches!(e, IaGetError::Interrupted) || is_disk_full_error(&e) {
                     pb.finish_and_clear();
                     return Err(e);
                 }

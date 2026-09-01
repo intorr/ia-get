@@ -12,8 +12,8 @@ use colored::*;
 use digest::Digest;
 
 use crate::Result;
+use crate::display::{create_progress_bar, finish_progress_bar, format_size, last_glyph};
 use crate::error::{IaGetError, io_error_with_path};
-use crate::utils::{create_progress_bar, finish_progress_bar, format_size, last_glyph};
 
 /// Buffer size for file operations (8KB)
 const BUFFER_SIZE: usize = 8192;
@@ -96,6 +96,13 @@ pub(crate) enum ExistingFileStatus {
     Unreadable(String),
 }
 
+/// Whether a local hex digest matches the one from the metadata: hex
+/// digests compare case-insensitively, as the metadata may carry an
+/// uppercase or mixed-case MD5.
+fn hash_matches(local: &str, expected: &str) -> bool {
+    local.eq_ignore_ascii_case(expected)
+}
+
 /// Size guard shared by the pre-download check and the post-download
 /// verification.
 ///
@@ -167,9 +174,7 @@ pub(crate) fn check_existing_file(
         }
     };
 
-    // Hex digests compare case-insensitively: the metadata may carry an
-    // uppercase or mixed-case MD5.
-    if local_md5.eq_ignore_ascii_case(expected_md5) {
+    if hash_matches(&local_md5, expected_md5) {
         Ok(ExistingFileStatus::Verified {
             md5: Some(local_md5),
         })
@@ -223,7 +228,7 @@ pub(crate) fn verify_downloaded_file(
     };
 
     let local_md5 = calculate_md5(file_path, running)?;
-    if local_md5.eq_ignore_ascii_case(expected_md5) {
+    if hash_matches(&local_md5, expected_md5) {
         print_verified_hash(Some(&local_md5));
         Ok(true)
     } else {

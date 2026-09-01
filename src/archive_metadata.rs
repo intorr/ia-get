@@ -1,6 +1,7 @@
 use crate::constants::XML_DEBUG_TRUNCATE_LEN;
+use crate::display::format_size;
 use crate::downloader::{parse_last_modified, sync_file_mtime};
-use crate::utils::{ensure_not_symlink, format_size, with_cookie};
+use crate::utils::{ensure_not_symlink, with_cookie};
 use crate::{IaGetError, Result};
 use colored::*;
 use indicatif::ProgressBar;
@@ -40,7 +41,6 @@ pub struct XmlFiles {
 /// the full `_files.xml` schema is available for future features (alternative
 /// integrity checks, deduplication by hash, format filtering, etc.) without
 /// needing a second fetch.
-#[allow(dead_code)]
 #[derive(Deserialize, Debug, Default)]
 pub struct XmlFile {
     #[serde(rename = "@name")]
@@ -390,8 +390,8 @@ pub fn list_summary(files: &XmlFiles) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::display::create_spinner;
     use crate::test_support::{MockBody, MockResponse, MockServer, TempDir, mtime_of, xml_file};
-    use crate::utils::create_spinner;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
