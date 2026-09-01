@@ -110,6 +110,95 @@ pub fn finish_spinner(spinner: &ProgressBar, message: &str) {
     spinner.finish();
 }
 
+/// Prints the "Failed ✘ Maximum retries (N) exceeded" status line
+pub fn print_max_retries_exceeded(max_retries: u32) {
+    println!(
+        "{} {}       {} Maximum retries ({}) exceeded",
+        branch_glyph(),
+        "Failed".red().bold(),
+        "✘".red().bold(),
+        max_retries
+    );
+}
+
+/// Prints the "Retry ⟳ kind (attempt x/y): detail" status line
+pub fn print_retry_notice(kind: &str, attempt: u32, max_retries: u32, detail: &str) {
+    println!(
+        "{} {}        {} {} (attempt {attempt}/{max_retries}): {detail}",
+        branch_glyph(),
+        "Retry".yellow().bold(),
+        "⟳".yellow().bold(),
+        kind
+    );
+}
+
+/// Prints the "Waiting N.Ns before retry" status line, noting when the
+/// delay was requested by the server (Retry-After)
+pub fn print_retry_wait(delay: &Duration, server_requested: bool) {
+    println!(
+        "{} {}         Waiting {:.1}s before retry{}",
+        branch_glyph(),
+        "Wait".white(),
+        delay.as_secs_f64(),
+        if server_requested {
+            " (server requested)"
+        } else {
+            ""
+        }
+    );
+}
+
+/// Prints the "Partial ▲ the existing file failed verification,
+/// re-downloading" status line
+pub fn print_stale_file_redownload() {
+    println!(
+        "{} {}      {} the existing file failed verification, re-downloading",
+        branch_glyph(),
+        "Partial".white(),
+        "▲".yellow().bold()
+    );
+}
+
+/// Prints the "Resume ↻ the .part file is already complete, verifying it
+/// in place" status line
+pub fn print_complete_part_verification() {
+    println!(
+        "{} {}       {} the .part file is already complete, verifying it in place",
+        branch_glyph(),
+        "Resume".white(),
+        "↻".green().bold()
+    );
+}
+
+/// Prints the "Retry ⟳ Re-downloading from scratch (attempt x/y)" status line
+pub fn print_redownload_from_scratch(attempt: u32, max_attempts: u32) {
+    println!(
+        "{} {}        {} Re-downloading from scratch (attempt {attempt}/{max_attempts})",
+        branch_glyph(),
+        "Retry".yellow().bold(),
+        "⟳".yellow().bold()
+    );
+}
+
+/// Prints the "⚠ Could not set last modified time" warning for a
+/// best-effort mtime sync that failed; the batch carries on
+pub fn print_mtime_warning(detail: &str) {
+    println!(
+        "{} {}      {}",
+        "⚠".yellow().bold(),
+        "Could not set last modified time".yellow(),
+        detail.dimmed()
+    );
+}
+
+/// Prints the end-of-batch "Download interrupted" line
+pub fn print_download_interrupted() {
+    println!(
+        "\n{} Download interrupted. Run the command again to resume remaining files.",
+        "✘".red().bold()
+    );
+}
+
 /// Print the "Downloaded ↓ size" status line for a finished file
 ///
 /// `prefix` is the pre-styled tree glyph: "├╼" when more lines follow in the

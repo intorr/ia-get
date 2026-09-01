@@ -10,10 +10,11 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use digest::Digest;
-use reqwest::StatusCode;
+use reqwest::{Client, StatusCode};
 use url::Url;
 
 use crate::archive_metadata::XmlFile;
+use crate::downloader::{DownloadTask, download_file_content, prepare_file_for_download};
 
 /// A unique temp directory for a test that removes itself on drop, so a
 /// test that panics (or simply ends) never leaves a directory behind in
@@ -79,6 +80,87 @@ pub fn xml_file(name: &str, size: Option<u64>) -> XmlFile {
 /// without registering a real Ctrl+C handler.
 pub fn test_running() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(true))
+}
+
+/// Near-instant retry delay so tests do not wait for real backoff
+pub fn fast_retry(_attempt: u32) -> Duration {
+    Duration::from_millis(1)
+}
+
+/// Builds a `DownloadTask`
+pub fn task(
+    url: String,
+    file_path: String,
+    md5: Option<String>,
+    size: Option<u64>,
+    mtime: Option<u64>,
+) -> DownloadTask {
+    DownloadTask {
+        url,
+        file_path,
+        expected_md5: md5,
+        expected_size: size,
+        expected_mtime: mtime,
+    }
+}
+
+/// A 200 response with an empty body — the fallback for most scripts
+pub fn ok_empty() -> MockResponse {
+    MockResponse::new(200, MockBody::Full(vec![]))
+}
+
+/// Mock server serving "/file.bin" from `responses`, plus a fresh temp
+/// dir; the file under test is `dir.join("file.bin")`
+pub fn file_server(
+    name: &str,
+    responses: VecDeque<MockResponse>,
+    fallback: MockResponse,
+) -> (MockServer, TempDir) {
+    let mut scripts = HashMap::new();
+    scripts.insert("/file.bin".to_string(), responses);
+    let server = MockServer::start(scripts, fallback);
+    (server, TempDir::new(name))
+}
+
+/// A single-file batch task for "/file.bin" in `dir`
+pub fn file_task(
+    server: &MockServer,
+    dir: &Path,
+    md5: Option<String>,
+    size: Option<u64>,
+    mtime: Option<u64>,
+) -> DownloadTask {
+    task(
+        server.url("/file.bin"),
+        dir.join("file.bin").to_str().unwrap().to_string(),
+        md5,
+        size,
+        mtime,
+    )
+}
+
+/// Runs a single download against the mock server and returns the
+/// captured `Last-Modified` time.
+pub async fn run_download(
+    url: &str,
+    part_path: &str,
+    expected_size: Option<u64>,
+    running: &Arc<AtomicBool>,
+) -> crate::Result<Option<SystemTime>> {
+    let client = Client::new();
+    let mut file = prepare_file_for_download(part_path)?;
+    let result = download_file_content(
+        &client,
+        url,
+        &mut file,
+        running,
+        None,
+        expected_size,
+        fast_retry,
+    )
+    .await;
+    drop(file);
+    result
 }
 
 /// Body variant for mock server responses

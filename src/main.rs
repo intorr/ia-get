@@ -204,9 +204,16 @@ async fn run(cli: &Cli) -> Result<()> {
         cookie_header_value(cli.cookies.as_deref(), &xml_url),
     )?;
 
-    // Fetch and parse XML metadata in one operation. Any failure (the
-    // accessibility pre-check, a failed GET, an unparseable document) is
-    // reported by init_step with the full error detail.
+    // The spinner switches from "processing the URL" to the parsing stage
+    // before the metadata is fetched: any failure (the accessibility
+    // pre-check, a failed GET, an unparseable document) is reported by
+    // init_step with the full error detail.
+    spinner.set_message(format!(
+        "{} {}",
+        "⚙".blue(),
+        "Parsing archive metadata...".bold()
+    ));
+
     let XmlMetadata {
         files,
         base_url,
@@ -214,7 +221,7 @@ async fn run(cli: &Cli) -> Result<()> {
         last_modified,
     } = init_step(
         &spinner,
-        fetch_and_parse_xml(&xml_url, &client, &spinner, cookie_header.as_ref()).await,
+        fetch_and_parse_xml(&xml_url, &client, cookie_header.as_ref()).await,
     )?;
 
     // If requested, list parsed filenames and exit: a read-only preview,

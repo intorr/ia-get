@@ -5,7 +5,6 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use colored::*;
 use reqwest::header::{HeaderMap, LAST_MODIFIED};
 
 /// Parses the server-provided `Last-Modified` header into a `SystemTime`.
@@ -28,13 +27,14 @@ pub(crate) fn mtime_from_xml(mtime: Option<u64>) -> Option<SystemTime> {
 /// Sets the file's last-modified time to `target` when the current time
 /// differs at second granularity.
 ///
-/// A failure to set the time is not fatal: it prints a warning and returns
-/// `false` so the batch can continue.
-pub fn sync_file_mtime(file_path: impl AsRef<Path>, target: SystemTime) -> bool {
+/// Returns whether the time was set. Setting it may fail (a locked file, a
+/// read-only filesystem); the error is returned to the caller, which treats
+/// the sync as best-effort — a failure warns and the batch continues.
+pub fn sync_file_mtime(file_path: impl AsRef<Path>, target: SystemTime) -> std::io::Result<bool> {
     // A pre-1970 timestamp has no Unix representation; stamping the epoch
     // would fabricate a wrong mtime, so the time is left untouched instead.
     let Ok(target_duration) = target.duration_since(UNIX_EPOCH) else {
-        return false;
+        return Ok(false);
     };
     let target_secs = target_duration.as_secs();
 
@@ -45,28 +45,19 @@ pub fn sync_file_mtime(file_path: impl AsRef<Path>, target: SystemTime) -> bool 
         .map(|d| d.as_secs());
 
     if current_secs == Some(target_secs) {
-        return false;
+        return Ok(false);
     }
 
     // u64 seconds only overflow i64 for dates around the year 292 million
     // AD; nothing representable exists there, so leave the time as is.
     let Ok(target_secs) = i64::try_from(target_secs) else {
-        return false;
+        return Ok(false);
     };
 
     let file_time = filetime::FileTime::from_unix_time(target_secs, 0);
 
-    if let Err(e) = filetime::set_file_mtime(&file_path, file_time) {
-        println!(
-            "{} {}      {}",
-            "⚠".yellow().bold(),
-            "Could not set last modified time".yellow(),
-            e.to_string().dimmed()
-        );
-        return false;
-    }
-
-    true
+    filetime::set_file_mtime(&file_path, file_time)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -93,7 +84,7 @@ mod tests {
         fs::write(&path, "x").unwrap();
 
         let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
-        assert!(!sync_file_mtime(&path, pre_epoch));
+        assert!(!sync_file_mtime(&path, pre_epoch).unwrap());
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let mtime = fs::metadata(&path).unwrap().modified().unwrap();

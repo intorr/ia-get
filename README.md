@@ -58,17 +58,17 @@ So I co-authored `ia-get` to automate the download process.
 
 ### Features ✨
 
-- 🔽 Reliably download files from the Internet Archive
-- 🌳 Preserves the original directory structure
-- 🔄 Automatically resumes partial or failed downloads
-- 🔏 Hash checks to confirm file integrity
-- 🕓 Preserves file modification times — taken from the server's `Last-Modified` header, or from the `<mtime>` entry in `_files.xml` when the header is absent; already-verified files get their times corrected on re-runs
-- 🔁 Retries server errors (timeouts, HTTP 5xx/429, empty or truncated responses) with exponential backoff that honors `Retry-After`
-- 🧩 Downloads to `<name>.part` files and renames them only after size and MD5 verification passes
-- 🚦 A failed file no longer aborts the batch — the remaining files continue and `ia-get` exits non-zero, listing the failures
-- 🌱 Can be run multiple times to update existing downloads
-- 📊 Gets all the metadata for the archive
-- 📄 Saves the archive's own `<id>_files.xml` locally with the server's `Last-Modified` time on every download (overwriting any previous copy; `--list` is read-only) and skips its stale self-reference when downloading the rest
+- 🔽 Reliably downloads files from the Internet Archive
+- 🌳 Preserves the archive's directory structure
+- 🔄 Resumes interrupted downloads from `<name>.part` files
+- 🔏 Verifies size and MD5 hash before installing a file
+- 🔁 Retries transient server errors with exponential backoff, honoring `Retry-After`
+- 🚦 Continues after a failed file, exiting non-zero; `--stop-on-error` aborts at the first failure
+- 🕓 Preserves last-modified times (`Last-Modified` header, falling back to `_files.xml`'s `<mtime>`)
+- 🌱 Safe to re-run: verified files are kept, stale ones are re-downloaded
+- 🔑 Supports private items via `--cookies` (a raw header or a Netscape `cookies.txt`)
+- 📄 `--list` previews the files and sizes without downloading
+- 📊 Saves the archive's own `<id>_files.xml` locally alongside the files
 - 📦️ Available for **Linux** 🐧 **macOS** 🍏 and **Windows** 🪟
 
 ### Sharing is caring 🤝

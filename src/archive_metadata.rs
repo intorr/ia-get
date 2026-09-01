@@ -1,10 +1,9 @@
 use crate::constants::XML_DEBUG_TRUNCATE_LEN;
-use crate::display::format_size;
+use crate::display::{format_size, print_mtime_warning};
 use crate::downloader::{parse_last_modified, sync_file_mtime};
 use crate::utils::{ensure_not_symlink, with_cookie};
 use crate::{IaGetError, Result};
 use colored::*;
-use indicatif::ProgressBar;
 use reqwest::header::HeaderValue;
 use reqwest::{Client, StatusCode, Url};
 use serde::Deserialize;
@@ -155,8 +154,11 @@ pub fn save_xml_metadata(
     ensure_not_symlink(path)?;
     std::fs::write(path, content).map_err(|e| crate::error::io_error_with_path(path, e))?;
 
-    if let Some(target) = last_modified {
-        sync_file_mtime(path, target);
+    if let Some(target) = last_modified
+        && let Err(e) = sync_file_mtime(path, target)
+    {
+        // Best-effort: the save succeeded, only the time sync failed
+        print_mtime_warning(&e.to_string());
     }
 
     Ok(())
@@ -273,12 +275,13 @@ pub fn encode_download_path(name: &str) -> String {
 }
 
 /// The `_files.xml` entry name: the last path segment of the XML URL
-/// (which always ends in "<identifier>_files.xml", see get_xml_url)
+/// (which always ends in "<identifier>_files.xml", see get_xml_url).
+///
+/// Total by construction: a `Url`'s path always splits into at least one
+/// segment, so the last one is always present (possibly empty for a
+/// host-only URL, which this function is never called with).
 pub fn xml_file_name_of(url: &Url) -> &str {
-    url.path()
-        .rsplit('/')
-        .next()
-        .expect("XML URL should have a file name segment")
+    url.path().rsplit('/').next().unwrap_or("")
 }
 
 /// XML metadata response: the parsed file list plus the raw data needed to
@@ -303,19 +306,12 @@ pub struct XmlMetadata {
 pub async fn fetch_and_parse_xml(
     xml_url: &Url,
     client: &Client,
-    spinner: &ProgressBar,
     cookie_header: Option<&HeaderValue>,
 ) -> Result<XmlMetadata> {
     // The accessibility pre-check's failure (a definitive 404/410) is
     // reported by the caller's spinner error path, which carries the full
     // detail (e.g. "the archive identifier may be incorrect").
     is_url_accessible(xml_url, client, cookie_header).await?;
-
-    spinner.set_message(format!(
-        "{} {}",
-        "⚙".blue(),
-        "Parsing archive metadata...".bold()
-    ));
 
     let request = with_cookie(client.get(xml_url.clone()), cookie_header);
 
@@ -398,7 +394,6 @@ pub fn list_summary(files: &XmlFiles) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::display::create_spinner;
     use crate::test_support::{MockBody, MockResponse, MockServer, TempDir, mtime_of, xml_file};
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -696,9 +691,8 @@ mod tests {
             ],
         );
         let client = Client::new();
-        let spinner = create_spinner("mock");
 
-        let err = fetch_and_parse_xml(&url, &client, &spinner, None)
+        let err = fetch_and_parse_xml(&url, &client, None)
             .await
             .expect_err("an HTTP error on the metadata GET must fail the fetch");
 
@@ -726,9 +720,8 @@ mod tests {
             ],
         );
         let client = Client::new();
-        let spinner = create_spinner("mock");
 
-        let meta = fetch_and_parse_xml(&url, &client, &spinner, None)
+        let meta = fetch_and_parse_xml(&url, &client, None)
             .await
             .expect("a 405 on HEAD must not block the GET");
         assert_eq!(meta.files.files.len(), 1);
@@ -743,9 +736,8 @@ mod tests {
             vec![MockResponse::new(404, MockBody::Full(vec![]))],
         );
         let client = Client::new();
-        let spinner = create_spinner("mock");
 
-        let err = fetch_and_parse_xml(&url, &client, &spinner, None)
+        let err = fetch_and_parse_xml(&url, &client, None)
             .await
             .expect_err("a 404 on HEAD must fail the fetch");
         match err {
@@ -770,9 +762,8 @@ mod tests {
             ],
         );
         let client = Client::new();
-        let spinner = create_spinner("mock");
 
-        let meta = fetch_and_parse_xml(&url, &client, &spinner, None)
+        let meta = fetch_and_parse_xml(&url, &client, None)
             .await
             .expect("metadata fetch should succeed");
 
@@ -792,10 +783,9 @@ mod tests {
             ],
         );
         let client = Client::new();
-        let spinner = create_spinner("mock");
         let header = HeaderValue::from_static("session=abc123");
 
-        fetch_and_parse_xml(&url, &client, &spinner, Some(&header))
+        fetch_and_parse_xml(&url, &client, Some(&header))
             .await
             .expect("metadata fetch should succeed");
         assert_eq!(

@@ -405,6 +405,470 @@ fn partial_content_offset(headers: &HeaderMap, expected_start: u64) -> Option<bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::downloader::retry::MAX_RETRIES;
+    use crate::test_support::{
+        MockBody, MockResponse, file_server, ok_empty, run_download, test_running,
+    };
+    use std::collections::VecDeque;
+    use std::fs;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn http_500_body_is_not_written_to_file() {
+        let content = b"0123456789abcdef";
+        let nginx_error =
+            b"<html><head><title>500 Internal Server Error</title></head><body>nginx</body></html>";
+
+        let (server, dir) = file_server(
+            "http_500",
+            VecDeque::from(vec![
+                MockResponse::new(500, MockBody::Full(nginx_error.to_vec())),
+                MockResponse::new(500, MockBody::Full(nginx_error.to_vec())),
+                MockResponse::new(200, MockBody::Full(content.to_vec())),
+            ]),
+            ok_empty(),
+        );
+        let part = dir.join("file.bin.part");
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(content.len() as u64),
+            &test_running(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        let data = fs::read(&part).unwrap();
+        assert_eq!(data, content, "error body must not be written to the file");
+        assert_eq!(server.request_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn empty_response_retries_then_fails() {
+        // Fallback also returns an empty 200 so every retry sees the same
+        let (server, dir) = file_server(
+            "empty_response",
+            VecDeque::from(vec![MockResponse::new(200, MockBody::Full(vec![]))]),
+            ok_empty(),
+        );
+        let part = dir.join("file.bin.part");
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(10),
+            &test_running(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(IaGetError::Network { .. })),
+            "expected a Network error, got {:?}",
+            result.ok()
+        );
+        assert_eq!(fs::metadata(&part).unwrap().len(), 0);
+        assert_eq!(server.request_count(), 1 + MAX_RETRIES as usize);
+    }
+
+    #[tokio::test]
+    async fn empty_response_with_unknown_size_is_accepted() {
+        // A zero-byte file whose metadata carries no <size> must not loop on
+        // "Empty response": with no size to compare against, the empty 200
+        // is the only signal we have, so it is trusted (an MD5, when
+        // present, still verifies the result).
+        let (server, dir) = file_server(
+            "empty_unknown_size",
+            VecDeque::from(vec![MockResponse::new(200, MockBody::Full(vec![]))]),
+            ok_empty(),
+        );
+        let part = dir.join("file.bin.part");
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            None,
+            &test_running(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "an empty body with unknown size must succeed, got {:?}",
+            result.err()
+        );
+        assert_eq!(
+            server.request_count(),
+            1,
+            "a trusted empty body must not be retried"
+        );
+        assert_eq!(fs::metadata(&part).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn resume_after_mid_stream_disconnect() {
+        let full = b"01234567890123456789"; // 20 bytes
+
+        let (server, dir) = file_server(
+            "mid_stream",
+            VecDeque::from(vec![
+                MockResponse::new(
+                    200,
+                    MockBody::Truncated {
+                        announced_len: full.len() as u64,
+                        partial: full[..8].to_vec(),
+                    },
+                ),
+                // Range-aware: the 206 tail and Content-Range are derived from
+                // the client's Range request, so the resume offset is verified
+                // against behaviour rather than script order.
+                MockResponse::ranged(full.to_vec()),
+            ]),
+            MockResponse::new(206, MockBody::Full(vec![])),
+        );
+        let part = dir.join("file.bin.part");
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(full.len() as u64),
+            &test_running(),
+        )
+        .await;
+
+        result.expect("download should succeed");
+        assert_eq!(fs::read(&part).unwrap(), full);
+        assert_eq!(server.ranges(), vec![None, Some(8)]);
+    }
+
+    #[tokio::test]
+    async fn resume_sends_correct_offset_to_range_aware_server() {
+        // The mock honors the Range header like a real origin: a wrong resume
+        // offset would yield a mismatched 206 that resets the file rather than
+        // a silently corrupted tail, so the exact offset the client requests
+        // is what is verified here.
+        let full = b"01234567890123456789"; // 20 bytes
+        let prefix = &full[..8]; // a .part that already holds 8 bytes
+
+        let (server, dir) = file_server(
+            "range_aware_resume",
+            VecDeque::from(vec![MockResponse::ranged(full.to_vec())]),
+            ok_empty(),
+        );
+        let part = dir.join("file.bin.part");
+        fs::write(&part, prefix).unwrap();
+
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(full.len() as u64),
+            &test_running(),
+        )
+        .await;
+
+        result.expect("resume must succeed against a Range-aware server");
+        assert_eq!(
+            fs::read(&part).unwrap(),
+            full,
+            "the resume must append the correct tail, not a wrong offset"
+        );
+        assert_eq!(
+            server.ranges(),
+            vec![Some(8)],
+            "the resume must request bytes=8-, exactly the .part size"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_content_offset_mismatch_resets_file() {
+        // A 206 whose Content-Range does not continue our prefix must not
+        // be appended: the file is reset and re-downloaded from scratch.
+        let full = b"0123456789"; // 10 bytes
+
+        let (server, dir) = file_server(
+            "cr_mismatch",
+            VecDeque::from(vec![
+                MockResponse::new(206, MockBody::Full(full.to_vec()))
+                    .with_header("Content-Range", "bytes 0-9/10"),
+            ]),
+            ok_empty(),
+        );
+        let part = dir.join("file.bin.part");
+        fs::write(&part, b"XXXX").unwrap(); // 4-byte "partial" file
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(full.len() as u64),
+            &test_running(),
+        )
+        .await;
+
+        result.expect("download should succeed");
+        assert_eq!(
+            fs::read(&part).unwrap(),
+            full,
+            "a mismatched 206 body must replace the local prefix, not append to it"
+        );
+        assert_eq!(server.ranges(), vec![Some(4)]);
+    }
+
+    #[tokio::test]
+    async fn partial_content_without_range_header_resets_file() {
+        // A 206 without a Content-Range header is malformed (RFC 7233 makes
+        // it mandatory): the body is untrusted, so the file is reset.
+        let full = b"0123456789"; // 10 bytes
+
+        let (server, dir) = file_server(
+            "cr_missing",
+            VecDeque::from(vec![MockResponse::new(206, MockBody::Full(full.to_vec()))]),
+            ok_empty(),
+        );
+        let part = dir.join("file.bin.part");
+        fs::write(&part, b"XXXX").unwrap(); // 4-byte "partial" file
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(full.len() as u64),
+            &test_running(),
+        )
+        .await;
+
+        result.expect("download should succeed");
+        assert_eq!(
+            fs::read(&part).unwrap(),
+            full,
+            "a 206 without Content-Range must replace the local prefix, not append to it"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_200_response_resets_untrusted_prefix() {
+        let full = b"0123456789"; // 10 bytes
+
+        let (server, dir) = file_server(
+            "range_ignored",
+            VecDeque::from(vec![MockResponse::new(200, MockBody::Full(full.to_vec()))]),
+            ok_empty(),
+        );
+        let part = dir.join("file.bin.part");
+        fs::write(&part, b"XXXXXX").unwrap(); // 6-byte "partial" file
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(full.len() as u64),
+            &test_running(),
+        )
+        .await;
+
+        result.expect("download should succeed");
+        assert_eq!(
+            fs::read(&part).unwrap(),
+            full,
+            "200 response must replace the local prefix, not append to it"
+        );
+        assert_eq!(server.ranges(), vec![Some(6)]);
+    }
+
+    #[tokio::test]
+    async fn http_416_yields_range_not_satisfiable() {
+        let (server, dir) = file_server(
+            "http_416",
+            VecDeque::from(vec![MockResponse::new(
+                416,
+                MockBody::Full(b"Range not satisfiable".to_vec()),
+            )]),
+            MockResponse::new(416, MockBody::Full(vec![])),
+        );
+        let part = dir.join("file.bin.part");
+        fs::write(&part, b"XXXX").unwrap();
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(100),
+            &test_running(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(IaGetError::RangeNotSatisfiable)),
+            "expected RangeNotSatisfiable, got {:?}",
+            result
+        );
+        assert_eq!(server.request_count(), 1, "416 must not be retried");
+        assert_eq!(server.ranges(), vec![Some(4)]);
+    }
+
+    #[tokio::test]
+    async fn http_404_fails_immediately() {
+        let (server, dir) = file_server(
+            "http_404",
+            VecDeque::from(vec![MockResponse::new(
+                404,
+                MockBody::Full(b"not found".to_vec()),
+            )]),
+            MockResponse::new(404, MockBody::Full(vec![])),
+        );
+        let part = dir.join("file.bin.part");
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(10),
+            &test_running(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(IaGetError::Network { .. })),
+            "expected a Network error, got {:?}",
+            result.ok()
+        );
+        assert_eq!(server.request_count(), 1, "404 must not be retried");
+        assert_eq!(
+            fs::metadata(&part).unwrap().len(),
+            0,
+            "error body must not be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_header_is_respected() {
+        let content = b"retry-after-content";
+
+        let (server, dir) = file_server(
+            "retry_after",
+            VecDeque::from(vec![
+                MockResponse::new(429, MockBody::Full(vec![])).with_header("Retry-After", "1"),
+                MockResponse::new(200, MockBody::Full(content.to_vec())),
+            ]),
+            MockResponse::new(429, MockBody::Full(vec![])),
+        );
+        let part = dir.join("file.bin.part");
+        let start = Instant::now();
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(content.len() as u64),
+            &test_running(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        // A loaded CI host may deliver the 1s sleep late, but it cannot
+        // deliver it *early*: the threshold only needs to rule out skipping
+        // the wait.
+        assert!(
+            start.elapsed() >= Duration::from_millis(500),
+            "Retry-After: 1 was not honored (elapsed {:?})",
+            start.elapsed()
+        );
+        assert_eq!(fs::read(&part).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn last_modified_header_is_captured() {
+        let content = b"0123456789abcdef";
+
+        let (server, dir) = file_server(
+            "last_modified",
+            VecDeque::from(vec![
+                MockResponse::new(200, MockBody::Full(content.to_vec()))
+                    .with_header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+            ]),
+            MockResponse::new(200, MockBody::Full(vec![])),
+        );
+        let part = dir.join("file.bin.part");
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(content.len() as u64),
+            &test_running(),
+        )
+        .await;
+
+        let mtime = result.expect("download should succeed");
+        assert_eq!(fs::read(&part).unwrap(), content);
+        assert_eq!(
+            mtime,
+            httpdate::parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT").ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_backoff_stops_retries() {
+        // The server throttles forever; a Ctrl+C during the backoff wait must
+        // end the retry loop instead of sending another request after it.
+        let (server, dir) = file_server(
+            "interrupt_backoff",
+            VecDeque::from(vec![MockResponse::new(429, MockBody::Full(vec![]))]),
+            MockResponse::new(429, MockBody::Full(vec![])),
+        );
+        let running = Arc::new(AtomicBool::new(true));
+        let flag = running.clone();
+        // Simulate the Ctrl+C right after the first 429 has been served (a
+        // fixed timer would race the retry loop on fast machines): the
+        // flag is then guaranteed to be observed inside a retry wait.
+        let watcher = server.clone();
+        tokio::spawn(async move {
+            while watcher.request_count() < 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            flag.store(false, Ordering::SeqCst);
+        });
+
+        let part = dir.join("file.bin.part");
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(10),
+            &running,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(IaGetError::Interrupted)),
+            "an interrupt during the backoff wait must abort the retries, got {result:?}"
+        );
+        assert!(
+            (1..=3).contains(&server.request_count()),
+            "at most one extra retry may follow the interrupt, got {}",
+            server.request_count()
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_stalled_body_stops_waiting_for_chunks() {
+        // A connection that never delivers its body must not force a
+        // Ctrl+C to wait out the read timeout: the stop flag is raced
+        // against the chunk read.
+        let (server, dir) = file_server(
+            "stalled_body",
+            VecDeque::from(vec![MockResponse::stalled(100)]),
+            ok_empty(),
+        );
+        let running = Arc::new(AtomicBool::new(true));
+        let flag = running.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            flag.store(false, Ordering::SeqCst);
+        });
+
+        let part = dir.join("file.bin.part");
+        let start = Instant::now();
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(10),
+            &running,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(IaGetError::Interrupted)),
+            "a Ctrl+C during a stalled body must abort the download, got {:?}",
+            result.ok()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the abort must land within one interrupt check, not the read timeout: {:?}",
+            start.elapsed()
+        );
+    }
 
     #[test]
     fn partial_content_offset_parses_matching_and_mismatching_ranges() {

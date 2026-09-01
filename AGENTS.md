@@ -14,6 +14,7 @@ cargo build --release    # Optimised build (stripped, LTO)
 
 ```shell
 cargo test               # Unit tests
+cargo test --test list -- --ignored  # End-to-end --list against live archive.org (network)
 cargo clippy             # Linting
 cargo fmt --check        # Format check
 ```
@@ -35,15 +36,15 @@ Manual test URLs:
 src/
 ├── main.rs              # CLI entry point (clap) and orchestration
 ├── lib.rs               # Library exports
-├── plan.rs              # Download plan: URL building, name sanitization, collision detection
+├── plan.rs              # Download plan: URL building, collision detection, structured warnings
 ├── archive_metadata.rs  # _files.xml fetch, XML parsing, local persistence
 ├── cookie.rs            # Cookie header from raw string or Netscape cookies.txt
-├── display.rs           # Terminal output (spinner, progress bars, banners, size/duration formatting)
+├── display.rs           # Terminal output (spinner, progress bars, banners, status lines, size/duration formatting)
 ├── filename.rs          # Filename sanitization for cross-platform filesystems
 ├── utils.rs             # General helpers (cookie header on requests, symlink guard, URL validation)
 ├── error.rs             # Custom error types (thiserror)
 ├── constants.rs         # User agent, URL pattern, debug limits
-├── test_support.rs      # Shared test helpers (in-memory HTTP mock server)
+├── test_support.rs      # Shared test helpers (scripted local HTTP mock server, TempDir, download fixtures)
 └── downloader/
     ├── mod.rs           # Batch orchestration: DownloadTask, .part lifecycle, per-file pipeline
     ├── stream.rs        # Streaming HTTP body to file, Range/resume, retry decisions
@@ -51,6 +52,9 @@ src/
     ├── verify.rs        # Size + MD5 verification, ExistingFileStatus
     ├── signal.rs        # Ctrl+C handler (graceful stop, then hard exit)
     └── mtime.rs         # Last-Modified / <mtime> parsing and filetime sync
+
+tests/
+└── list.rs              # End-to-end --list against live archive.org (ignored by default)
 ```
 
 ## Dependencies

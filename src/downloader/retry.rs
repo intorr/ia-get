@@ -6,10 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use colored::*;
-
 use crate::Result;
-use crate::display::branch_glyph;
+use crate::display::{print_max_retries_exceeded, print_retry_notice, print_retry_wait};
 use crate::error::IaGetError;
 
 /// Maximum number of retry attempts for a single failing request
@@ -98,13 +96,7 @@ impl RetryTracker {
         self.count += 1;
 
         if self.count > MAX_RETRIES {
-            println!(
-                "{} {}       {} Maximum retries ({}) exceeded",
-                branch_glyph(),
-                "Failed".red().bold(),
-                "✘".red().bold(),
-                MAX_RETRIES
-            );
+            print_max_retries_exceeded(MAX_RETRIES);
             return Err(IaGetError::Network {
                 detail: format!("{kind}: {detail} (maximum retries {MAX_RETRIES} exceeded)"),
                 source: None,
@@ -115,27 +107,8 @@ impl RetryTracker {
             .map(Duration::from_secs)
             .unwrap_or_else(|| (self.delay)(self.count));
 
-        println!(
-            "{} {}        {} {} (attempt {}/{}): {}",
-            branch_glyph(),
-            "Retry".yellow().bold(),
-            "⟳".yellow().bold(),
-            kind,
-            self.count,
-            MAX_RETRIES,
-            detail
-        );
-        println!(
-            "{} {}         Waiting {:.1}s before retry{}",
-            branch_glyph(),
-            "Wait".white(),
-            delay.as_secs_f64(),
-            if retry_after_secs.is_some() {
-                " (server requested)"
-            } else {
-                ""
-            }
-        );
+        print_retry_notice(kind, self.count, MAX_RETRIES, detail);
+        print_retry_wait(&delay, retry_after_secs.is_some());
 
         // Sleep in slices and check the flag at each slice boundary: a
         // Ctrl+C during a long wait (a server-requested Retry-After of up
