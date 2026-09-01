@@ -9,16 +9,14 @@ use clap::Parser;
 use colored::*;
 use ia_get::archive_metadata::{
     XmlFiles, XmlMetadata, fetch_and_parse_xml, get_xml_url, list_file_rows, list_summary,
-    save_xml_metadata, xml_file_name_of,
+    save_xml_metadata, validate_archive_url, xml_file_name_of,
 };
-use ia_get::constants::USER_AGENT;
 use ia_get::cookie::cookie_header_value;
 use ia_get::display::{
     create_spinner, finish_spinner, last_glyph, print_downloaded_line, print_file_banner,
 };
 use ia_get::downloader;
 use ia_get::plan::{files_to_download, plan_download_tasks};
-use ia_get::utils::validate_archive_url;
 use ia_get::{IaGetError, Result};
 use indicatif::ProgressBar;
 use reqwest::{Client, Url};
@@ -43,6 +41,10 @@ const POOL_MAX_IDLE_PER_HOST: usize = 1;
 
 /// Interval between TCP keepalive probes
 const TCP_KEEPALIVE_SECS: u64 = 60;
+
+/// User agent string for HTTP requests: tool name and version, as archive.org
+/// asks clients to identify themselves with
+const USER_AGENT: &str = concat!("ia-get/", env!("CARGO_PKG_VERSION"));
 
 /// Number assigned to the saved `_files.xml` in the per-file listing; the
 /// archive's files are numbered right after it.
@@ -298,31 +300,4 @@ async fn run(cli: &Cli) -> Result<()> {
     .await?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use ia_get::utils::validate_archive_url;
-
-    #[test]
-    fn check_valid_pattern() {
-        assert!(validate_archive_url("https://archive.org/details/Valid-Pattern").is_ok());
-        assert!(validate_archive_url("https://archive.org/details/Valid-Pattern/").is_ok());
-        assert!(validate_archive_url("https://archive.org/details/test123").is_ok());
-        assert!(validate_archive_url("https://archive.org/details/test123/").is_ok());
-        assert!(validate_archive_url("https://archive.org/details/test_file-name.data").is_ok());
-        assert!(validate_archive_url("https://archive.org/details/test_file-name.data/").is_ok());
-        assert!(validate_archive_url("https://archive.org/details/user@domain").is_ok());
-        assert!(validate_archive_url("https://archive.org/details/user@domain/").is_ok());
-    }
-
-    #[test]
-    fn check_invalid_pattern() {
-        assert!(validate_archive_url("https://archive.org/details/Invalid-Pattern-*").is_err());
-        assert!(validate_archive_url("https://archive.org/details/").is_err()); // This should still be an error (empty identifier)
-        assert!(validate_archive_url("https://example.com/details/test").is_err());
-        assert!(validate_archive_url("http://archive.org/details/test").is_err());
-        assert!(validate_archive_url("https://archive.org/details/test/extra").is_err());
-        assert!(validate_archive_url("https://archive.org/details/test//").is_err());
-    }
 }

@@ -34,16 +34,15 @@ Manual test URLs:
 
 ```
 src/
-├── main.rs              # CLI entry point (clap) and orchestration
+├── main.rs              # CLI entry point (clap), orchestration and the HTTP client (owns USER_AGENT)
 ├── lib.rs               # Library exports
 ├── plan.rs              # Download plan: URL building, collision detection, structured warnings
-├── archive_metadata.rs  # _files.xml fetch, XML parsing, local persistence
-├── cookie.rs            # Cookie header from raw string or Netscape cookies.txt
+├── archive_metadata.rs  # _files.xml fetch/parse/persist + the archive.org URL contract (validate/get_xml_url/encode)
+├── cookie.rs            # Cookie header from raw string or Netscape cookies.txt, and applying it to requests
 ├── display.rs           # Terminal output (spinner, progress bars, banners, status lines, size/duration formatting)
 ├── filename.rs          # Filename sanitization for cross-platform filesystems
-├── utils.rs             # General helpers (cookie header on requests, symlink guard, URL validation)
+├── fs.rs                # Filesystem write-safety: refuse to write through pre-planted symlinks
 ├── error.rs             # Custom error types (thiserror)
-├── constants.rs         # User agent, URL pattern, debug limits
 ├── test_support.rs      # Shared test helpers (scripted local HTTP mock server, TempDir, download fixtures)
 └── downloader/
     ├── mod.rs           # Batch orchestration: DownloadTask, .part lifecycle, per-file pipeline

@@ -1,15 +1,27 @@
-use crate::constants::XML_DEBUG_TRUNCATE_LEN;
+use crate::cookie::with_cookie;
 use crate::display::{format_size, print_mtime_warning};
 use crate::downloader::{parse_last_modified, sync_file_mtime};
-use crate::utils::{ensure_not_symlink, with_cookie};
+use crate::fs::ensure_not_symlink;
 use crate::{IaGetError, Result};
 use colored::*;
+use regex::Regex;
 use reqwest::header::HeaderValue;
 use reqwest::{Client, StatusCode, Url};
 use serde::Deserialize;
 use serde_xml_rs::from_str;
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
+
+/// Maximum length for XML content in debug output (characters)
+const XML_DEBUG_TRUNCATE_LEN: usize = 1000;
+
+/// Regex pattern for validating archive.org details URLs
+const URL_PATTERN: &str = r"^https://archive\.org/details/[a-zA-Z0-9_\-.@]+/?$";
+
+/// Compiled regex for URL validation (initialized once)
+static URL_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(URL_PATTERN).expect("Invalid URL regex pattern"));
 
 /// Root structure for parsing the XML files list from archive.org
 /// The actual XML structure has a `files` root element containing multiple `file` elements
@@ -202,6 +214,32 @@ pub async fn is_url_accessible(
         });
     }
     Ok(())
+}
+
+/// Validates an archive.org details URL format
+///
+/// # Arguments
+/// * `url` - The URL to validate
+///
+/// # Returns
+/// * `Ok(())` if the URL is valid
+/// * `Err(IaGetError::UrlFormat)` if the URL format is invalid
+///
+/// # Examples
+/// ```
+/// use ia_get::archive_metadata::validate_archive_url;
+///
+/// assert!(validate_archive_url("https://archive.org/details/valid-item").is_ok());
+/// assert!(validate_archive_url("https://archive.org/details/valid-item/").is_ok());
+/// assert!(validate_archive_url("https://example.com/invalid").is_err());
+/// ```
+pub fn validate_archive_url(url: &str) -> Result<()> {
+    // The anchored pattern already requires a non-empty identifier right
+    // after "details/" and nothing after it.
+    if URL_REGEX.is_match(url) {
+        return Ok(());
+    }
+    Err(IaGetError::UrlFormat(url.to_string()))
 }
 
 /// Converts a details URL to the corresponding XML files list URL
@@ -571,6 +609,28 @@ mod tests {
             mtime.abs_diff(now) < 60,
             "mtime {mtime} should be within 60s of now {now}"
         );
+    }
+
+    #[test]
+    fn check_valid_pattern() {
+        assert!(validate_archive_url("https://archive.org/details/Valid-Pattern").is_ok());
+        assert!(validate_archive_url("https://archive.org/details/Valid-Pattern/").is_ok());
+        assert!(validate_archive_url("https://archive.org/details/test123").is_ok());
+        assert!(validate_archive_url("https://archive.org/details/test123/").is_ok());
+        assert!(validate_archive_url("https://archive.org/details/test_file-name.data").is_ok());
+        assert!(validate_archive_url("https://archive.org/details/test_file-name.data/").is_ok());
+        assert!(validate_archive_url("https://archive.org/details/user@domain").is_ok());
+        assert!(validate_archive_url("https://archive.org/details/user@domain/").is_ok());
+    }
+
+    #[test]
+    fn check_invalid_pattern() {
+        assert!(validate_archive_url("https://archive.org/details/Invalid-Pattern-*").is_err());
+        assert!(validate_archive_url("https://archive.org/details/").is_err());
+        assert!(validate_archive_url("https://example.com/details/test").is_err());
+        assert!(validate_archive_url("http://archive.org/details/test").is_err());
+        assert!(validate_archive_url("https://archive.org/details/test/extra").is_err());
+        assert!(validate_archive_url("https://archive.org/details/test//").is_err());
     }
 
     #[test]

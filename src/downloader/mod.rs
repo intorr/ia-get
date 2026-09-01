@@ -36,7 +36,7 @@ use crate::downloader::verify::{
     ExistingFileStatus, check_existing_file, print_verified_hash, verify_downloaded_file,
 };
 use crate::error::{IaGetError, io_error_with_path};
-use crate::utils::ensure_not_symlink;
+use crate::fs::ensure_not_symlink;
 
 // Re-export the items that form this module's public API.
 pub use mtime::{parse_last_modified, sync_file_mtime};

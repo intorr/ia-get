@@ -13,11 +13,11 @@ use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderValue, RANGE, RETRY_AFTER}
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 
 use crate::Result;
+use crate::cookie::with_cookie;
 use crate::display::{branch_glyph, create_progress_bar, last_glyph, print_downloaded_line};
 use crate::downloader::mtime::parse_last_modified;
 use crate::downloader::retry::{INTERRUPT_CHECK_INTERVAL, RetryTracker, parse_retry_after};
 use crate::error::IaGetError;
-use crate::utils::with_cookie;
 
 /// Resolves once the batch has been asked to stop, so a stalled body read
 /// can be aborted at the next check instead of waiting for the next chunk

@@ -1,10 +1,12 @@
 //! Building the `Cookie` header from a raw string or a Netscape cookies.txt
-//! file, so every authenticated request carries the right cookies.
+//! file, and applying it to requests, so every authenticated request carries
+//! the right cookies.
 
 use crate::error::io_error_with_path;
 use crate::{IaGetError, Result};
 use colored::*;
-use reqwest::header::HeaderValue;
+use reqwest::RequestBuilder;
+use reqwest::header::{COOKIE, HeaderValue};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -219,6 +221,15 @@ pub fn cookie_header_value(cookie_input: Option<&str>, url: &Url) -> Result<Opti
     let value = HeaderValue::from_str(&cookie_header)
         .map_err(|e| IaGetError::InvalidCookie(e.to_string()))?;
     Ok(Some(value))
+}
+
+/// Adds the `Cookie` header to a request builder when a cookie value is
+/// present, so every authenticated request is built the same way.
+pub fn with_cookie(mut request: RequestBuilder, cookie: Option<&HeaderValue>) -> RequestBuilder {
+    if let Some(cookie) = cookie {
+        request = request.header(COOKIE, cookie);
+    }
+    request
 }
 
 #[cfg(test)]
