@@ -34,6 +34,19 @@ struct NetscapeCookie {
 /// printed so an unauthenticated-looking 401/403 has an obvious cause.
 pub fn cookie_header_from_input(input: &str, url: &Url) -> Result<String> {
     if Path::new(input).is_file() {
+        // Guard against a maliciously huge file being buffered in memory.
+        const MAX_COOKIE_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
+        let meta =
+            std::fs::metadata(input).map_err(|e| crate::error::io_error_with_path(input, e))?;
+        if meta.len() > MAX_COOKIE_FILE_BYTES {
+            return Err(crate::error::IaGetError::FileSystem {
+                detail: format!(
+                    "{}: cookie file exceeds {MAX_COOKIE_FILE_BYTES} bytes",
+                    input
+                ),
+                source: None,
+            });
+        }
         let cookie_file =
             fs::read_to_string(input).map_err(|e| crate::error::io_error_with_path(input, e))?;
         if has_netscape_cookie_line(&cookie_file) || !input.contains('=') {

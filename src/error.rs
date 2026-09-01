@@ -53,8 +53,8 @@ pub enum IaGetError {
     /// One or more files in a batch could not be downloaded.
     ///
     /// The per-file reasons stay out of the display: the batch loop already
-    /// printed them, and the runtime prints this error once more on a
-    /// non-zero exit. `details` remains available for structured access.
+    /// printed them before constructing this error. `details` remains
+    /// available for structured access.
     #[error("{count} of {total} file(s) failed to download")]
     BatchFailed {
         count: usize,

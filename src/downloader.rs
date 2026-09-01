@@ -3,8 +3,8 @@
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use colored::*;
@@ -50,24 +50,33 @@ const LCG_INCREMENT: u64 = 1442695040888963407;
 /// or a stalled transfer does not outlive the user's request to stop
 const INTERRUPT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Process-wide "should stop" flag, registered on first use.
+static RUNNING_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
 /// Sets up signal handling for graceful shutdown on Ctrl+C
 ///
 /// Returns an Arc<AtomicBool> that can be checked to see if the process
 /// should stop. The first Ctrl+C sets it to false; a second one quits the
 /// process immediately, so a long Retry-After wait can always be aborted.
+///
+/// Idempotent: repeated calls return the same flag; the handler is
+/// registered only once (a second `ctrlc::set_handler` would panic).
 fn setup_signal_handler() -> Arc<AtomicBool> {
-    let running = Arc::new(AtomicBool::new(true));
-    let presses = Arc::new(AtomicU32::new(0));
-    let r = running.clone();
-    let p = presses.clone();
+    let running = RUNNING_FLAG.get_or_init(|| {
+        let running = Arc::new(AtomicBool::new(true));
+        let presses = Arc::new(AtomicU32::new(0));
+        let r = running.clone();
+        let p = presses.clone();
 
-    ctrlc::set_handler(move || match handle_ctrl_c(&r, &p) {
-        CtrlCAction::GracefulStop => {}
-        CtrlCAction::QuitNow => std::process::exit(1),
-    })
-    .expect("Error setting Ctrl+C handler");
+        ctrlc::set_handler(move || match handle_ctrl_c(&r, &p) {
+            CtrlCAction::GracefulStop => {}
+            CtrlCAction::QuitNow => std::process::exit(1),
+        })
+        .expect("Error setting Ctrl+C handler");
 
-    running
+        running
+    });
+    running.clone()
 }
 
 /// What a Ctrl+C press must do
@@ -592,6 +601,18 @@ fn download_action_label(resuming: bool) -> String {
     }
 }
 
+/// True when the error is a disk-full / no-space condition that retrying
+/// cannot fix (ENOSPC on Linux, ERROR_DISK_FULL on Windows).
+fn is_disk_full_error(err: &IaGetError) -> bool {
+    matches!(
+        err,
+        IaGetError::FileSystem { source: Some(src), .. }
+            if src
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
+    )
+}
+
 /// Download file content with progress reporting and automatic retry on failure.
 ///
 /// `retry_delay` computes the delay for a given 1-based retry attempt; tests
@@ -771,6 +792,13 @@ async fn download_file_content(
             Err(e) => {
                 // A user interruption aborts the run, other errors retry
                 if matches!(e, IaGetError::Interrupted) {
+                    pb.finish_and_clear();
+                    return Err(e);
+                }
+
+                // Disk full is not transient: retrying wastes minutes before
+                // the same ENOSPC / ERROR_DISK_FULL recurs.
+                if is_disk_full_error(&e) {
                     pb.finish_and_clear();
                     return Err(e);
                 }

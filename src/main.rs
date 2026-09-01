@@ -466,7 +466,6 @@ mod tests {
         assert!(validate_archive_url("http://archive.org/details/test").is_err());
         assert!(validate_archive_url("https://archive.org/details/test/extra").is_err());
         assert!(validate_archive_url("https://archive.org/details/test//").is_err());
-        // Multiple trailing slashes
     }
 
     fn xml_file(name: &str, size: Option<u64>) -> XmlFile {

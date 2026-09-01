@@ -20,7 +20,7 @@ pub struct XmlFiles {
     pub files: Vec<XmlFile>,
 }
 
-/// Represents a single file entry from the archive.org XML metadata
+/// Represents a single file entry from the archive.org `_files.xml` metadata.
 ///
 /// Archive.org XML structure has both attributes and nested elements:
 /// ```xml
@@ -31,6 +31,16 @@ pub struct XmlFiles {
 ///   ...
 /// </file>
 /// ```
+///
+/// All fields except `name` are optional: archive.org omits elements when
+/// the value is not available (e.g. `md5` for very large files, `btih` for
+/// non-torrent items).
+///
+/// Fields like `crc32`, `sha1`, `btih`, `summation`, `original`, `rotation`,
+/// and `format` are not yet used by the download logic but are captured so
+/// the full `_files.xml` schema is available for future features (alternative
+/// integrity checks, deduplication by hash, format filtering, etc.) without
+/// needing a second fetch.
 #[allow(dead_code)]
 #[derive(Deserialize, Debug, Default)]
 pub struct XmlFile {
