@@ -6,7 +6,7 @@ use crate::{IaGetError, Result};
 use colored::*;
 use indicatif::ProgressBar;
 use reqwest::header::HeaderValue;
-use reqwest::{Client, Url};
+use reqwest::{Client, StatusCode, Url};
 use serde::Deserialize;
 use serde_xml_rs::from_str;
 use std::path::Path;
@@ -166,7 +166,13 @@ pub fn save_xml_metadata(
 /// Timeout for the HEAD accessibility check
 const HEAD_CHECK_TIMEOUT_SECS: u64 = 60;
 
-/// Checks if a URL is accessible by sending a HEAD request
+/// Checks if a URL is accessible by sending a HEAD request.
+///
+/// Only a definitive 404/410 is fatal: the resource does not exist or is
+/// permanently gone, and the GET would fail the same way. Other failures
+/// (a proxy that rejects HEAD with 405, a transient 500, a connection
+/// error) are not fatal — the GET that follows gives the authoritative
+/// answer.
 pub async fn is_url_accessible(
     url: &Url,
     client: &Client,
@@ -174,12 +180,26 @@ pub async fn is_url_accessible(
 ) -> Result<()> {
     let request = with_cookie(client.head(url.clone()), cookie_header);
 
-    let response = request
+    let response = match request
         .timeout(Duration::from_secs(HEAD_CHECK_TIMEOUT_SECS))
         .send()
-        .await?;
+        .await
+    {
+        Ok(resp) => resp,
+        // Connection-level failure (DNS, TLS, timeout): the GET below will
+        // produce the same error with a proper message, so just proceed.
+        Err(_) => return Ok(()),
+    };
 
-    response.error_for_status()?;
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+        return Err(IaGetError::Network {
+            detail: format!(
+                "XML metadata not found (HTTP {status}): the archive identifier may be incorrect"
+            ),
+            source: None,
+        });
+    }
     Ok(())
 }
 
@@ -193,6 +213,7 @@ pub async fn is_url_accessible(
 ///
 /// # Returns
 /// The corresponding XML files list URL
+#[must_use]
 pub fn get_xml_url(original_url: &str) -> String {
     // Remove trailing slash if present to get a consistent base for identifier extraction
     let trimmed_url = original_url.trim_end_matches('/');
@@ -222,6 +243,7 @@ pub fn get_xml_url(original_url: &str) -> String {
 /// This is the RFC 3986 "unreserved" set, not form-URL-encoding: a space
 /// must become `%20` (never `+`), which is why a small encoder is written
 /// here instead of reusing `form_urlencoded::byte_serialize`.
+#[must_use]
 pub fn encode_download_path(name: &str) -> String {
     let mut out = String::new();
     for segment in name.split('/') {
@@ -668,6 +690,58 @@ mod tests {
             IaGetError::Network { detail, .. } => {
                 assert!(
                     detail.contains("500"),
+                    "expected the status code in the error, got: {detail}"
+                );
+            }
+            other => panic!("expected a Network error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn head_405_does_not_block_the_get() {
+        // A proxy that rejects HEAD (405) must not prevent the GET from
+        // proceeding; the metadata is still fetched.
+        let xml = "<files><file name=\"a.bin\"/></files>";
+        let mut scripts = HashMap::new();
+        scripts.insert(
+            "/download/item1/item1_files.xml".to_string(),
+            VecDeque::from(vec![
+                MockResponse::new(405, MockBody::Full(vec![])), // HEAD rejected
+                MockResponse::new(200, MockBody::Full(xml.as_bytes().to_vec())),
+            ]),
+        );
+        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
+        let url = server.url("/download/item1/item1_files.xml");
+        let client = Client::new();
+        let spinner = create_spinner("mock");
+
+        let meta = fetch_and_parse_xml(&url, &client, &spinner, None)
+            .await
+            .expect("a 405 on HEAD must not block the GET");
+        assert_eq!(meta.files.files.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn head_404_is_fatal() {
+        // A 404 on HEAD is definitive: the resource does not exist, so the
+        // fetch must fail without attempting the GET.
+        let mut scripts = HashMap::new();
+        scripts.insert(
+            "/download/item1/item1_files.xml".to_string(),
+            VecDeque::from(vec![MockResponse::new(404, MockBody::Full(vec![]))]),
+        );
+        let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
+        let url = server.url("/download/item1/item1_files.xml");
+        let client = Client::new();
+        let spinner = create_spinner("mock");
+
+        let err = fetch_and_parse_xml(&url, &client, &spinner, None)
+            .await
+            .expect_err("a 404 on HEAD must fail the fetch");
+        match err {
+            IaGetError::Network { detail, .. } => {
+                assert!(
+                    detail.contains("404"),
                     "expected the status code in the error, got: {detail}"
                 );
             }

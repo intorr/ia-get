@@ -376,6 +376,7 @@ fn sanitize_component(component: &str) -> (String, bool) {
 /// assert_eq!(sanitized, "Season 1/Episode_.mp4");
 /// assert!(modified);
 /// ```
+#[must_use]
 pub fn sanitize_filename(filename: &str) -> (String, bool) {
     // Process each path component separately to preserve directory structure
     let components: Vec<&str> = filename.split('/').collect();
