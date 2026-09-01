@@ -110,7 +110,7 @@ fn save_and_announce_xml(
 }
 
 /// Lists parsed filenames from XML metadata when --list/-l is used
-fn list_files(files: &XmlFiles, spinner: &ProgressBar) {
+fn list_files(files: &XmlFiles, spinner: &ProgressBar, xml_file_name: &str) {
     finish_spinner(
         spinner,
         &format!(
@@ -119,8 +119,26 @@ fn list_files(files: &XmlFiles, spinner: &ProgressBar) {
             list_summary(files).bold()
         ),
     );
-    for row in list_file_rows(files) {
+    for row in list_file_rows(files, xml_file_name) {
         println!("{row}");
+    }
+    // The archive's own _files.xml entry counts in the list above but not
+    // in the download plan (it is saved locally as file #1): bridge the
+    // two numbers so they do not look inconsistent.
+    if files.files.iter().any(|file| file.name == xml_file_name) {
+        let remaining = files.files.len() - 1;
+        println!(
+            "\n{} {} {}",
+            "ⓘ".blue().bold(),
+            "Note:".blue(),
+            format!(
+                "{} is the archive's own metadata (saved locally as file #1): a download fetches the remaining {} file{}",
+                xml_file_name,
+                remaining,
+                if remaining == 1 { "" } else { "s" }
+            )
+            .dimmed()
+        );
     }
 }
 
@@ -202,7 +220,7 @@ async fn run(cli: &Cli) -> Result<()> {
     // If requested, list parsed filenames and exit: a read-only preview,
     // nothing is written to the working directory
     if cli.list {
-        list_files(&files, &spinner);
+        list_files(&files, &spinner, xml_file_name_of(&base_url));
         return Ok(());
     }
 

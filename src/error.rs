@@ -36,6 +36,11 @@ pub enum IaGetError {
     #[error("Failed to parse XML: {0}")]
     XmlParsing(String),
 
+    /// The system clock failed to provide the current time (a time before
+    /// the Unix epoch on platforms that allow it)
+    #[error("Failed to get the system time: {0}")]
+    SystemTime(#[source] std::time::SystemTimeError),
+
     /// The supplied cookie input cannot be turned into a valid HTTP header
     #[error("Invalid cookie header: {0}")]
     InvalidCookie(String),
@@ -121,6 +126,20 @@ pub fn io_error_with_path(path: impl AsRef<std::path::Path>, err: std::io::Error
 mod tests {
     use super::*;
     use std::io::ErrorKind;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn system_time_error_displays_its_own_kind() {
+        // A clock before the Unix epoch is not a file system problem: it
+        // must not wear the "File operation failed" label.
+        let past = UNIX_EPOCH - Duration::from_secs(1);
+        let err = IaGetError::SystemTime(
+            past.duration_since(UNIX_EPOCH)
+                .expect_err("a past time has no duration_since"),
+        );
+        assert!(err.to_string().contains("system time"), "got: {err}");
+        assert!(!err.to_string().contains("File operation"));
+    }
 
     #[test]
     fn os_interrupted_maps_to_filesystem_error() {

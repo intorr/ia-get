@@ -135,6 +135,18 @@ pub(crate) fn check_existing_file(
     if !Path::new(file_path).exists() {
         return Ok(ExistingFileStatus::Missing);
     }
+    // A symlink at the final path would be followed by every check below
+    // (size, hash, and the mtime sync that the caller performs on a
+    // verified file), reaching whatever the link points at: treat it like
+    // the directory case — unreadable, left in place.
+    if Path::new(file_path)
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Ok(ExistingFileStatus::Unreadable(
+            "a symlink occupies the file path".to_string(),
+        ));
+    }
     // A directory at the final path can neither be verified as a file nor
     // safely removed: report it as unreadable and leave it in place.
     if Path::new(file_path).is_dir() {
@@ -301,5 +313,34 @@ mod tests {
             other => panic!("expected Unreadable, got {other:?}"),
         }
         assert!(path.exists(), "an unreadable file must not be deleted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_at_final_path_is_unreadable() {
+        // A symlink at the final name whose target happens to match the
+        // metadata must not verify through the link: the checks would
+        // follow it into the link target.
+        let dir = TempDir::new("symlink_final");
+        let target = dir.join("target.bin");
+        fs::write(&target, b"matching-content").unwrap();
+        let link = dir.join("file.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let status = check_existing_file(
+            link.to_str().unwrap(),
+            Some(md5_hex(b"matching-content").as_str()),
+            Some(16),
+            &test_running(),
+        )
+        .unwrap();
+
+        match status {
+            ExistingFileStatus::Unreadable(reason) => {
+                assert!(reason.contains("symlink"), "got: {reason}");
+            }
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+        assert!(link.exists(), "the symlink must be left in place");
     }
 }

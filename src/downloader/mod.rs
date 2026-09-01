@@ -167,9 +167,11 @@ fn handle_existing_file(
 /// mtime: the server's Last-Modified header wins, the `_files.xml` mtime is
 /// the fallback, and the time is left untouched when both are absent.
 ///
-/// `fs::rename` atomically replaces an existing destination on all
-/// supported platforms, so no separate remove step (and the crash window
-/// it opens) is needed. A symlink planted at the final name is refused,
+/// `fs::rename` replaces an existing destination on all supported
+/// platforms — atomically on POSIX; on Windows the replacement is not
+/// atomic, but a stale copy is removed earlier in the same file's
+/// processing, so the destination is gone by then — no separate remove
+/// step is needed. A symlink planted at the final name is refused,
 /// mirroring the `.part` guard: the verified `.part` stays in place for
 /// the next run.
 fn install_downloaded_file(
@@ -580,6 +582,9 @@ async fn download_files_with_signal(
         if let FileOutcome::Failed(reason) = outcome {
             failed_files.push((task.file_path.clone(), reason));
             if stop_on_error {
+                // The loop ends early here, so the end-of-batch summary
+                // below is never reached: print it in this branch too.
+                print_failed_files(&failed_files);
                 return Err(batch_failed(&failed_files, tasks.len()));
             }
         }

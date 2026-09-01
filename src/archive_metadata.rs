@@ -338,7 +338,11 @@ pub async fn fetch_and_parse_xml(
 }
 
 /// Return formatted file rows for `--list` output.
-pub fn list_file_rows(files: &XmlFiles) -> Vec<String> {
+///
+/// The archive's own `_files.xml` entry (matched against `xml_file_name`)
+/// gets a dimmed "(metadata)" marker: a download saves it locally as file
+/// #1 instead of fetching it as one of the archive's files.
+pub fn list_file_rows(files: &XmlFiles, xml_file_name: &str) -> Vec<String> {
     files
         .files
         .iter()
@@ -347,7 +351,11 @@ pub fn list_file_rows(files: &XmlFiles) -> Vec<String> {
                 .size
                 .map(format_size)
                 .unwrap_or_else(|| "unknown".to_string());
-            format!("{size:>9} {}", file.name)
+            if file.name == xml_file_name {
+                format!("{size:>9} {} {}", file.name, "(metadata)".dimmed())
+            } else {
+                format!("{size:>9} {}", file.name)
+            }
         })
         .collect()
 }
@@ -810,10 +818,28 @@ mod tests {
         };
 
         assert_eq!(
-            list_file_rows(&files),
+            list_file_rows(&files, "item1_files.xml"),
             vec![
                 "  12.06KB cover.jpg".to_string(),
                 "  unknown metadata.xml".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_file_rows_marks_the_xml_metadata_entry() {
+        let files = XmlFiles {
+            files: vec![
+                xml_file("cover.jpg", Some(12_345)),
+                xml_file("item1_files.xml", Some(23)),
+            ],
+        };
+
+        assert_eq!(
+            list_file_rows(&files, "item1_files.xml"),
+            vec![
+                "  12.06KB cover.jpg".to_string(),
+                "      23B item1_files.xml (metadata)".to_string(),
             ]
         );
     }

@@ -30,6 +30,7 @@ ia-get -b 'logged-in-user=...; logged-in-sig=...' https://archive.org/details/<i
 Preview the files first with `--list` or `-l`.
 This lists the names and sizes reported by archive.org metadata without downloading anything.
 If archive.org does not provide a size for an entry, `ia-get` reports it as `unknown` and excludes it from the total known size.
+The archive's own `<id>_files.xml` entry is marked as `(metadata)`: it is saved locally as file #1 during a download rather than fetched as one of the archive's files, which is why a download reports one fewer file than `--list` shows.
 
 ```shell
 ia-get --list https://archive.org/details/<identifier>

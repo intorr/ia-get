@@ -178,10 +178,7 @@ pub fn cookie_header_from_netscape_file(content: &str, url: &Url) -> Result<Stri
 fn cookie_header_from_cookies(cookies: &[NetscapeCookie], url: &Url) -> Result<String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| IaGetError::FileSystem {
-            detail: e.to_string(),
-            source: Some(Box::new(e)),
-        })?
+        .map_err(IaGetError::SystemTime)?
         .as_secs();
 
     let mut header_parts: Vec<String> = Vec::new();
