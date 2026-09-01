@@ -53,6 +53,12 @@ pub enum MockBody {
     /// Announce `announced_len` bytes via Content-Length, then hold the
     /// connection open without ever sending the body (a stalled server)
     Stalled { announced_len: u64 },
+    /// Serve `data` honoring the request's `Range` header like a real origin
+    /// server: a full 200 with no Range, a 206 with the tail and a matching
+    /// `Content-Range` for a satisfying `bytes=N-`, or a 416 when `N` is at
+    /// or past the end. Lets resume tests verify the client's offset against
+    /// behaviour, not script order.
+    Ranged(Vec<u8>),
 }
 
 /// A scripted response: status, body and extra headers
@@ -84,6 +90,17 @@ impl MockResponse {
         Self {
             status: 200,
             body: MockBody::Stalled { announced_len },
+            extra_headers: vec![],
+        }
+    }
+
+    /// A body that honors the request's `Range` header like a real origin
+    /// server (200/206/416): the scripted status is ignored, the status is
+    /// derived from the Range so resume is verified against behaviour.
+    pub fn ranged(data: Vec<u8>) -> Self {
+        Self {
+            status: 200,
+            body: MockBody::Ranged(data),
             extra_headers: vec![],
         }
     }
@@ -163,6 +180,43 @@ impl MockServer {
     }
 }
 
+/// Resolves a `Ranged` body against the request's `Range` header the way a
+/// real origin server does, so resume tests verify the client's offset
+/// against behaviour rather than script order: a satisfying `bytes=N-`
+/// yields a 206 with the tail and a matching `Content-Range`, an
+/// unsatisfiable one (`N` at or past the end) yields a 416, and no Range
+/// yields the full 200. Returns (status, announced_len, body, stalled,
+/// extra_headers).
+fn ranged_response(
+    data: &[u8],
+    range: Option<u64>,
+) -> (u16, u64, Vec<u8>, bool, Vec<(String, String)>) {
+    let len = data.len() as u64;
+    let (status, announced, body, content_range) = match range {
+        None => (200, len, data.to_vec(), None),
+        Some(start) if start < len => (
+            206,
+            len - start,
+            data[start as usize..].to_vec(),
+            Some((
+                "Content-Range".to_string(),
+                format!("bytes {start}-{end}/{total}", end = len - 1, total = len),
+            )),
+        ),
+        Some(_) => (
+            416,
+            0,
+            Vec::new(),
+            Some(("Content-Range".to_string(), format!("bytes */{len}"))),
+        ),
+    };
+    let mut headers = Vec::new();
+    if let Some(cr) = content_range {
+        headers.push(cr);
+    }
+    (status, announced, body, false, headers)
+}
+
 fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
     // Read the request head
     let mut buf: Vec<u8> = Vec::new();
@@ -226,30 +280,58 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
             .unwrap_or_else(|| st.fallback.clone())
     };
 
-    // A HEAD response carries the status and headers but no body; a
-    // Stalled body holds the connection open after the headers
-    let (announced_len, body_bytes, stalled) =
+    // A HEAD response carries the status and headers but no body; a Stalled
+    // body holds the connection open after the headers; a Ranged body is
+    // resolved against the request's Range header like a real origin server.
+    // Every other body is served exactly as scripted, regardless of any
+    // Range header.
+    let (status, announced_len, body_bytes, stalled, extra_headers) =
         match (&response.body, method.eq_ignore_ascii_case("HEAD")) {
-            (_, true) => (0, Vec::new(), false),
-            (MockBody::Full(data), false) => (data.len() as u64, data.clone(), false),
+            (_, true) => (
+                response.status,
+                0,
+                Vec::new(),
+                false,
+                response.extra_headers.clone(),
+            ),
+            (MockBody::Full(data), false) => (
+                response.status,
+                data.len() as u64,
+                data.clone(),
+                false,
+                response.extra_headers.clone(),
+            ),
             (
                 MockBody::Truncated {
                     announced_len,
                     partial,
                 },
                 false,
-            ) => (*announced_len, partial.clone(), false),
-            (MockBody::Stalled { announced_len }, false) => (*announced_len, Vec::new(), true),
+            ) => (
+                response.status,
+                *announced_len,
+                partial.clone(),
+                false,
+                response.extra_headers.clone(),
+            ),
+            (MockBody::Stalled { announced_len }, false) => (
+                response.status,
+                *announced_len,
+                Vec::new(),
+                true,
+                response.extra_headers.clone(),
+            ),
+            (MockBody::Ranged(data), false) => ranged_response(data, range),
         };
 
-    let reason = StatusCode::from_u16(response.status)
+    let reason = StatusCode::from_u16(status)
         .ok()
         .and_then(|s| s.canonical_reason())
         .unwrap_or("Unknown")
         .to_string();
-    let mut out = format!("HTTP/1.1 {} {}\r\n", response.status, reason);
+    let mut out = format!("HTTP/1.1 {} {}\r\n", status, reason);
     out.push_str(&format!("Content-Length: {announced_len}\r\n"));
-    for (name, value) in &response.extra_headers {
+    for (name, value) in &extra_headers {
         out.push_str(&format!("{name}: {value}\r\n"));
     }
     out.push_str("Connection: close\r\n\r\n");

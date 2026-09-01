@@ -245,7 +245,9 @@ fn check_existing_file(
         }
     };
 
-    if local_md5 == expected_md5 {
+    // Hex digests compare case-insensitively: the metadata may carry an
+    // uppercase or mixed-case MD5.
+    if local_md5.eq_ignore_ascii_case(expected_md5) {
         Ok(ExistingFileStatus::Verified {
             md5: Some(local_md5),
         })
@@ -717,9 +719,15 @@ async fn download_file_content(
             Ok(downloaded_bytes) => {
                 let total_bytes = base_size + downloaded_bytes;
 
-                // A 2xx body with zero bytes is a server malfunction (unless
-                // the server explicitly announced a zero-byte file).
-                if downloaded_bytes == 0 && base_size == 0 && expected_size != Some(0) {
+                // A 2xx body with zero bytes is a server malfunction only
+                // when the metadata expects data: a zero-byte file with no
+                // <size> is indistinguishable from a dropped body, so the
+                // unknown-size case is trusted (an MD5, when present, still
+                // verifies the result).
+                if downloaded_bytes == 0
+                    && base_size == 0
+                    && expected_size.is_some_and(|expected| expected > 0)
+                {
                     retry_open_file(
                         file,
                         &pb,
@@ -805,7 +813,7 @@ fn verify_downloaded_file(
     };
 
     let local_md5 = calculate_md5(file_path, running)?;
-    if local_md5 == expected_md5 {
+    if local_md5.eq_ignore_ascii_case(expected_md5) {
         print_verified_hash(Some(&local_md5));
         Ok(true)
     } else {
@@ -1514,6 +1522,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_response_with_unknown_size_is_accepted() {
+        // A zero-byte file whose metadata carries no <size> must not loop on
+        // "Empty response": with no size to compare against, the empty 200
+        // is the only signal we have, so it is trusted (an MD5, when
+        // present, still verifies the result).
+        let (server, dir) = file_server(
+            "empty_unknown_size",
+            VecDeque::from(vec![MockResponse::new(200, MockBody::Full(vec![]))]),
+            ok_empty(),
+        );
+        let part = dir.join("file.bin.part");
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            None,
+            &test_running(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "an empty body with unknown size must succeed, got {:?}",
+            result.err()
+        );
+        assert_eq!(
+            server.request_count(),
+            1,
+            "a trusted empty body must not be retried"
+        );
+        assert_eq!(fs::metadata(&part).unwrap().len(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn resume_after_mid_stream_disconnect() {
         let full = b"01234567890123456789"; // 20 bytes
 
@@ -1527,8 +1569,10 @@ mod tests {
                         partial: full[..8].to_vec(),
                     },
                 ),
-                MockResponse::new(206, MockBody::Full(full[8..].to_vec()))
-                    .with_header("Content-Range", "bytes 8-19/20"),
+                // Range-aware: the 206 tail and Content-Range are derived from
+                // the client's Range request, so the resume offset is verified
+                // against behaviour rather than script order.
+                MockResponse::ranged(full.to_vec()),
             ]),
             MockResponse::new(206, MockBody::Full(vec![])),
         );
@@ -1544,6 +1588,45 @@ mod tests {
         result.expect("download should succeed");
         assert_eq!(fs::read(&part).unwrap(), full);
         assert_eq!(server.ranges(), vec![None, Some(8)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resume_sends_correct_offset_to_range_aware_server() {
+        // The mock honors the Range header like a real origin: a wrong resume
+        // offset would yield a mismatched 206 that resets the file rather than
+        // a silently corrupted tail, so the exact offset the client requests
+        // is what is verified here.
+        let full = b"01234567890123456789"; // 20 bytes
+        let prefix = &full[..8]; // a .part that already holds 8 bytes
+
+        let (server, dir) = file_server(
+            "range_aware_resume",
+            VecDeque::from(vec![MockResponse::ranged(full.to_vec())]),
+            ok_empty(),
+        );
+        let part = dir.join("file.bin.part");
+        fs::write(&part, prefix).unwrap();
+
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(full.len() as u64),
+            &test_running(),
+        )
+        .await;
+
+        result.expect("resume must succeed against a Range-aware server");
+        assert_eq!(
+            fs::read(&part).unwrap(),
+            full,
+            "the resume must append the correct tail, not a wrong offset"
+        );
+        assert_eq!(
+            server.ranges(),
+            vec![Some(8)],
+            "the resume must request bytes=8-, exactly the .part size"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1871,6 +1954,73 @@ mod tests {
             "mismatch must trigger exactly one re-download"
         );
         assert_eq!(fs::read(dir.join("file.bin")).unwrap(), correct);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn md5_case_is_insensitive_on_download() {
+        // archive.org reports lowercase MD5, but a metadata value in upper or
+        // mixed case must still verify a correct file instead of failing it
+        // into three re-downloads.
+        let content = b"case-insensitive-md5";
+        let md5_upper = md5_hex(content).to_ascii_uppercase();
+
+        let (server, dir) = file_server(
+            "md5_case_download",
+            VecDeque::from(vec![MockResponse::new(
+                200,
+                MockBody::Full(content.to_vec()),
+            )]),
+            ok_empty(),
+        );
+        let files = vec![file_task(
+            &server,
+            &dir,
+            Some(md5_upper),
+            Some(content.len() as u64),
+            None,
+        )];
+
+        run_batch(files, false)
+            .await
+            .expect("an uppercase MD5 must verify a correct file");
+
+        assert_eq!(
+            server.request_count(),
+            1,
+            "a correct file must not be re-downloaded"
+        );
+        assert_eq!(fs::read(dir.join("file.bin")).unwrap(), content);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn existing_file_md5_case_is_insensitive() {
+        // A file already on disk verifies in place when the metadata MD5 is
+        // uppercase: it must not be re-downloaded.
+        let content = b"already-on-disk-md5";
+        let md5_upper = md5_hex(content).to_ascii_uppercase();
+
+        let (server, dir) = file_server("md5_case_existing", VecDeque::new(), ok_empty());
+        fs::write(dir.join("file.bin"), content).unwrap();
+        let files = vec![file_task(
+            &server,
+            &dir,
+            Some(md5_upper),
+            Some(content.len() as u64),
+            None,
+        )];
+
+        run_batch(files, false)
+            .await
+            .expect("an uppercase MD5 must verify an existing file in place");
+
+        assert_eq!(
+            server.request_count(),
+            0,
+            "a verified existing file must not be re-downloaded"
+        );
+        assert_eq!(fs::read(dir.join("file.bin")).unwrap(), content);
         let _ = fs::remove_dir_all(&dir);
     }
 
