@@ -1,7 +1,6 @@
 use crate::constants::XML_DEBUG_TRUNCATE_LEN;
-use crate::cookie::cookie_header_value;
 use crate::downloader::{parse_last_modified, sync_file_mtime};
-use crate::utils::{ensure_not_symlink, with_cookie};
+use crate::utils::{ensure_not_symlink, format_size, with_cookie};
 use crate::{IaGetError, Result};
 use colored::*;
 use indicatif::ProgressBar;
@@ -213,24 +212,26 @@ pub async fn is_url_accessible(
 ///
 /// # Returns
 /// The corresponding XML files list URL
-#[must_use]
-pub fn get_xml_url(original_url: &str) -> String {
+pub fn get_xml_url(original_url: &str) -> Result<Url> {
     // Remove trailing slash if present to get a consistent base for identifier extraction
     let trimmed_url = original_url.trim_end_matches('/');
 
-    // The identifier is the last segment of the trimmed URL
-    // This expect is considered safe because get_xml_url is only called after
-    // validate_archive_url has confirmed the URL structure.
-    let identifier = trimmed_url
+    // The identifier is the last segment of the trimmed URL. The caller has
+    // validated the URL structure, but a segment-less input must fail here
+    // instead of building a malformed download URL.
+    let Some(identifier) = trimmed_url
         .rsplit('/')
-        .next() // Changed from split().last() to address clippy warning
-        .expect("Validated URL should have a valid identifier segment after validation");
+        .next()
+        .filter(|segment| !segment.is_empty())
+    else {
+        return Err(IaGetError::UrlFormat(original_url.to_string()));
+    };
 
-    // The base URL for download is "https://archive.org/download/{identifier}"
-    let download_url_base = format!("https://archive.org/download/{}", identifier);
-
-    // The XML URL is "{download_url_base}/{identifier}_files.xml"
-    format!("{}/{}_files.xml", download_url_base, identifier)
+    // The XML URL is "https://archive.org/download/{identifier}/{identifier}_files.xml"
+    Url::parse(&format!(
+        "https://archive.org/download/{identifier}/{identifier}_files.xml"
+    ))
+    .map_err(IaGetError::from)
 }
 
 /// Percent-encodes every path segment of a file name, preserving internal `/`
@@ -296,60 +297,23 @@ pub struct XmlMetadata {
     pub last_modified: Option<SystemTime>,
 }
 
-/// Fetches and parses XML metadata from archive.org
-///
-/// Combines XML URL generation, accessibility check, download, and parsing
-/// into a single operation with integrated error handling.
-///
-/// # Arguments
-/// * `details_url` - The original archive.org details URL
-/// * `client` - HTTP client for requests
-/// * `spinner` - Progress spinner to update during processing
-///
-/// # Returns
-/// The `XmlMetadata` with the parsed files, base URL, cookie header, raw
-/// XML content and the server's `Last-Modified` time
-pub async fn fetch_xml_metadata(
-    details_url: &str,
-    client: &Client,
-    spinner: &ProgressBar,
-    cookie_input: Option<&str>,
-) -> Result<XmlMetadata> {
-    // Generate XML URL
-    let xml_url = get_xml_url(details_url);
-    spinner.set_message(format!(
-        "{} Accessing XML metadata: {}",
-        "⚙".blue(),
-        xml_url.bold()
-    ));
-    // The header is scoped to the download URL: every file of the archive
-    // lives under it, so this is the scope the file downloads reuse
-    let download_url = Url::parse(&xml_url)?;
-    let cookie_header = cookie_header_value(cookie_input, &download_url)?;
-    fetch_and_parse_xml(&xml_url, client, spinner, cookie_header.as_ref()).await
-}
-
 /// Fetches, downloads and parses a `_files.xml` document from an explicit URL.
 ///
 /// The `Cookie` header (if any) is precomputed by the caller against the
 /// download URL, so the metadata fetch and the file downloads of one run
-/// share a single header. Split out of `fetch_xml_metadata` so tests can
-/// point it at a local mock server instead of the fixed archive.org download URL.
+/// share a single header.
 pub async fn fetch_and_parse_xml(
-    xml_url: &str,
+    xml_url: &Url,
     client: &Client,
     spinner: &ProgressBar,
     cookie_header: Option<&HeaderValue>,
 ) -> Result<XmlMetadata> {
-    // Parse base URL and fetch XML content
-    let base_url = Url::parse(xml_url)?;
-
     // Check XML URL accessibility
-    if let Err(e) = is_url_accessible(&base_url, client, cookie_header).await {
+    if let Err(e) = is_url_accessible(xml_url, client, cookie_header).await {
         spinner.finish_with_message(format!(
             "{} XML metadata not accessible: {}",
             "✘".red().bold(),
-            xml_url.bold()
+            xml_url.as_str().bold()
         ));
         return Err(e); // Propagate the error
     }
@@ -360,7 +324,7 @@ pub async fn fetch_and_parse_xml(
         "Parsing archive metadata...".bold()
     ));
 
-    let request = with_cookie(client.get(base_url.clone()), cookie_header);
+    let request = with_cookie(client.get(xml_url.clone()), cookie_header);
 
     // The HEAD check above can pass while the GET still fails (throttling,
     // transient edge errors): surface it as a network error instead of
@@ -374,19 +338,68 @@ pub async fn fetch_and_parse_xml(
 
     Ok(XmlMetadata {
         files,
-        base_url,
+        base_url: xml_url.clone(),
         cookie_header: cookie_header.cloned(),
         content: xml_content,
         last_modified,
     })
 }
 
+/// Return formatted file rows for `--list` output.
+pub fn list_file_rows(files: &XmlFiles) -> Vec<String> {
+    files
+        .files
+        .iter()
+        .map(|file| {
+            let size = file
+                .size
+                .map(format_size)
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("{size:>9} {}", file.name)
+        })
+        .collect()
+}
+
+/// Return a summary for `--list` output.
+pub fn list_summary(files: &XmlFiles) -> String {
+    let total_known_size: u64 = files.files.iter().filter_map(|file| file.size).sum();
+    let unknown_size_count = files
+        .files
+        .iter()
+        .filter(|file| file.size.is_none())
+        .count();
+    let file_label = if files.files.len() == 1 {
+        "file"
+    } else {
+        "files"
+    };
+
+    if unknown_size_count == 0 {
+        format!(
+            "{} {file_label}, {} total",
+            files.files.len(),
+            format_size(total_known_size)
+        )
+    } else {
+        let unknown_label = if unknown_size_count == 1 {
+            "unknown size"
+        } else {
+            "unknown sizes"
+        };
+        format!(
+            "{} {file_label}, {} total known size, {} {unknown_label}",
+            files.files.len(),
+            format_size(total_known_size),
+            unknown_size_count
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{MockBody, MockResponse, MockServer, mtime_of, temp_dir_for};
+    use crate::test_support::{MockBody, MockResponse, MockServer, TempDir, mtime_of, xml_file};
     use crate::utils::create_spinner;
-    use std::collections::{HashMap, VecDeque};
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -501,7 +514,7 @@ mod tests {
 
     #[test]
     fn save_xml_metadata_writes_file_and_sets_mtime() {
-        let dir = temp_dir_for("save_xml_sets_mtime");
+        let dir = TempDir::new("save_xml_sets_mtime");
         let path = dir.join("item1_files.xml");
 
         save_xml_metadata(
@@ -514,19 +527,17 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("item1_files.xml"));
         assert_eq!(mtime_of(&path), Some(1_545_586_142));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn save_xml_metadata_overwrites_existing_file() {
-        let dir = temp_dir_for("save_xml_overwrites");
+        let dir = TempDir::new("save_xml_overwrites");
         let path = dir.join("item1_files.xml");
         std::fs::write(&path, "stale content").unwrap();
 
         save_xml_metadata(&path, "<files/>", None).unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "<files/>");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -534,7 +545,7 @@ mod tests {
     fn save_xml_metadata_refuses_to_write_through_symlink() {
         // A symlink named "<id>_files.xml" must not have its target
         // silently truncated by the metadata save.
-        let dir = temp_dir_for("save_xml_symlink");
+        let dir = TempDir::new("save_xml_symlink");
         let target = dir.join("target.txt");
         std::fs::write(&target, "do not touch").unwrap();
         let link = dir.join("item1_files.xml");
@@ -547,12 +558,11 @@ mod tests {
             "do not touch",
             "the link target must be left untouched"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn save_xml_metadata_without_last_modified_keeps_current_time() {
-        let dir = temp_dir_for("save_xml_no_mtime");
+        let dir = TempDir::new("save_xml_no_mtime");
         let path = dir.join("item1_files.xml");
 
         save_xml_metadata(&path, "<files/>", None).unwrap();
@@ -566,27 +576,36 @@ mod tests {
             mtime.abs_diff(now) < 60,
             "mtime {mtime} should be within 60s of now {now}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn get_xml_url_converts_details_url() {
         assert_eq!(
-            get_xml_url("https://archive.org/details/item1"),
+            get_xml_url("https://archive.org/details/item1")
+                .unwrap()
+                .as_str(),
             "https://archive.org/download/item1/item1_files.xml"
         );
         assert_eq!(
-            get_xml_url("https://archive.org/details/item1/"), // With trailing slash
+            get_xml_url("https://archive.org/details/item1/")
+                .unwrap() // With trailing slash
+                .as_str(),
             "https://archive.org/download/item1/item1_files.xml"
         );
         assert_eq!(
-            get_xml_url("https://archive.org/details/another-item_v2.0"),
+            get_xml_url("https://archive.org/details/another-item_v2.0")
+                .unwrap()
+                .as_str(),
             "https://archive.org/download/another-item_v2.0/another-item_v2.0_files.xml"
         );
         assert_eq!(
-            get_xml_url("https://archive.org/details/another-item_v2.0/"), // With trailing slash
+            get_xml_url("https://archive.org/details/another-item_v2.0/")
+                .unwrap() // With trailing slash
+                .as_str(),
             "https://archive.org/download/another-item_v2.0/another-item_v2.0_files.xml"
         );
+        // A segment-less input must fail instead of building a malformed URL
+        assert!(get_xml_url("").is_err());
     }
 
     #[test]
@@ -666,19 +685,16 @@ mod tests {
     #[tokio::test]
     async fn xml_metadata_http_error_is_a_network_error() {
         // The HEAD check passes; the GET must fail with a status error.
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/download/item1/item1_files.xml".to_string(),
-            VecDeque::from(vec![
+        let (_server, url) = MockServer::scripted(
+            "/download/item1/item1_files.xml",
+            vec![
                 MockResponse::new(200, MockBody::Full(vec![])), // HEAD check
                 MockResponse::new(
                     500,
                     MockBody::Full(b"<html><body>nginx error page</body></html>".to_vec()),
                 ),
-            ]),
+            ],
         );
-        let server = MockServer::start(scripts, MockResponse::new(500, MockBody::Full(vec![])));
-        let url = server.url("/download/item1/item1_files.xml");
         let client = Client::new();
         let spinner = create_spinner("mock");
 
@@ -702,16 +718,13 @@ mod tests {
         // A proxy that rejects HEAD (405) must not prevent the GET from
         // proceeding; the metadata is still fetched.
         let xml = "<files><file name=\"a.bin\"/></files>";
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/download/item1/item1_files.xml".to_string(),
-            VecDeque::from(vec![
+        let (_server, url) = MockServer::scripted(
+            "/download/item1/item1_files.xml",
+            vec![
                 MockResponse::new(405, MockBody::Full(vec![])), // HEAD rejected
                 MockResponse::new(200, MockBody::Full(xml.as_bytes().to_vec())),
-            ]),
+            ],
         );
-        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
-        let url = server.url("/download/item1/item1_files.xml");
         let client = Client::new();
         let spinner = create_spinner("mock");
 
@@ -725,13 +738,10 @@ mod tests {
     async fn head_404_is_fatal() {
         // A 404 on HEAD is definitive: the resource does not exist, so the
         // fetch must fail without attempting the GET.
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/download/item1/item1_files.xml".to_string(),
-            VecDeque::from(vec![MockResponse::new(404, MockBody::Full(vec![]))]),
+        let (_server, url) = MockServer::scripted(
+            "/download/item1/item1_files.xml",
+            vec![MockResponse::new(404, MockBody::Full(vec![]))],
         );
-        let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
-        let url = server.url("/download/item1/item1_files.xml");
         let client = Client::new();
         let spinner = create_spinner("mock");
 
@@ -752,16 +762,13 @@ mod tests {
     #[tokio::test]
     async fn xml_metadata_success_parses_files() {
         let xml = "<files><file name=\"item1_files.xml\" source=\"original\"><size>23</size></file><file name=\"scan.jpg\" source=\"original\"><size>456</size></file></files>";
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/download/item1/item1_files.xml".to_string(),
-            VecDeque::from(vec![
+        let (_server, url) = MockServer::scripted(
+            "/download/item1/item1_files.xml",
+            vec![
                 MockResponse::new(200, MockBody::Full(vec![])), // HEAD check
                 MockResponse::new(200, MockBody::Full(xml.as_bytes().to_vec())),
-            ]),
+            ],
         );
-        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
-        let url = server.url("/download/item1/item1_files.xml");
         let client = Client::new();
         let spinner = create_spinner("mock");
 
@@ -777,16 +784,13 @@ mod tests {
     #[tokio::test]
     async fn precomputed_cookie_header_reaches_the_xml_fetch() {
         let xml = "<files><file name=\"item1_files.xml\"/></files>";
-        let mut scripts = HashMap::new();
-        scripts.insert(
-            "/download/item1/item1_files.xml".to_string(),
-            VecDeque::from(vec![
+        let (server, url) = MockServer::scripted(
+            "/download/item1/item1_files.xml",
+            vec![
                 MockResponse::new(200, MockBody::Full(vec![])), // HEAD check
                 MockResponse::new(200, MockBody::Full(xml.as_bytes().to_vec())),
-            ]),
+            ],
         );
-        let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
-        let url = server.url("/download/item1/item1_files.xml");
         let client = Client::new();
         let spinner = create_spinner("mock");
         let header = HeaderValue::from_static("session=abc123");
@@ -803,6 +807,40 @@ mod tests {
                 Some("session=abc123".to_string()),
             ],
             "both the HEAD check and the GET must carry the precomputed header"
+        );
+    }
+
+    #[test]
+    fn list_file_rows_format_sizes_and_unknown_entries() {
+        let files = XmlFiles {
+            files: vec![
+                xml_file("cover.jpg", Some(12_345)),
+                xml_file("metadata.xml", None),
+            ],
+        };
+
+        assert_eq!(
+            list_file_rows(&files),
+            vec![
+                "  12.06KB cover.jpg".to_string(),
+                "  unknown metadata.xml".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_summary_reports_total_known_size_and_unknown_count() {
+        let files = XmlFiles {
+            files: vec![
+                xml_file("disk1.zip", Some(1_048_576)),
+                xml_file("disk2.zip", Some(2_097_152)),
+                xml_file("notes.txt", None),
+            ],
+        };
+
+        assert_eq!(
+            list_summary(&files),
+            "3 files, 3.00MB total known size, 1 unknown size"
         );
     }
 }

@@ -37,6 +37,8 @@ use crate::utils::{branch_glyph, ensure_not_symlink, print_file_banner};
 
 // Re-export the items that form this module's public API.
 pub use mtime::{parse_last_modified, sync_file_mtime};
+#[cfg(test)]
+pub(crate) use verify::digest_hex;
 
 /// Maximum full re-download attempts for a file that fails size/hash verification
 const MAX_DOWNLOAD_ATTEMPTS: u32 = 3;
@@ -551,10 +553,10 @@ mod tests {
     use super::*;
     use crate::downloader::retry::MAX_RETRIES;
     use crate::test_support::{
-        MockBody, MockResponse, MockServer, md5_hex, mtime_of, temp_dir_for, test_running,
+        MockBody, MockResponse, MockServer, TempDir, md5_hex, mtime_of, test_running,
     };
     use std::collections::{HashMap, VecDeque};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     /// Near-instant retry delay so tests do not wait for real backoff
@@ -590,11 +592,11 @@ mod tests {
         name: &str,
         responses: VecDeque<MockResponse>,
         fallback: MockResponse,
-    ) -> (MockServer, PathBuf) {
+    ) -> (MockServer, TempDir) {
         let mut scripts = HashMap::new();
         scripts.insert("/file.bin".to_string(), responses);
         let server = MockServer::start(scripts, fallback);
-        (server, temp_dir_for(name))
+        (server, TempDir::new(name))
     }
 
     /// A single-file batch task for "/file.bin" in `dir`
@@ -632,7 +634,7 @@ mod tests {
 
     /// Two-file batch fixture: "/missing.bin" always 404s, "/ok.bin" serves
     /// `ok_content`; returns the server, temp dir, task list and content
-    fn missing_and_ok_batch(name: &str) -> (MockServer, PathBuf, Vec<DownloadTask>, &'static [u8]) {
+    fn missing_and_ok_batch(name: &str) -> (MockServer, TempDir, Vec<DownloadTask>, &'static [u8]) {
         let ok_content: &'static [u8] = b"ok-content-123";
         let ok_md5 = md5_hex(ok_content);
 
@@ -653,7 +655,7 @@ mod tests {
         );
         let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
 
-        let dir = temp_dir_for(name);
+        let dir = TempDir::new(name);
         let files = vec![
             task(
                 server.url("/missing.bin"),
@@ -725,7 +727,6 @@ mod tests {
         let data = fs::read(&part).unwrap();
         assert_eq!(data, content, "error body must not be written to the file");
         assert_eq!(server.request_count(), 3);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -752,7 +753,6 @@ mod tests {
         );
         assert_eq!(fs::metadata(&part).unwrap().len(), 0);
         assert_eq!(server.request_count(), 1 + MAX_RETRIES as usize);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -786,7 +786,6 @@ mod tests {
             "a trusted empty body must not be retried"
         );
         assert_eq!(fs::metadata(&part).unwrap().len(), 0);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -822,7 +821,6 @@ mod tests {
         result.expect("download should succeed");
         assert_eq!(fs::read(&part).unwrap(), full);
         assert_eq!(server.ranges(), vec![None, Some(8)]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -861,7 +859,6 @@ mod tests {
             vec![Some(8)],
             "the resume must request bytes=8-, exactly the .part size"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -895,7 +892,6 @@ mod tests {
             "a mismatched 206 body must replace the local prefix, not append to it"
         );
         assert_eq!(server.ranges(), vec![Some(4)]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -925,7 +921,6 @@ mod tests {
             full,
             "a 206 without Content-Range must replace the local prefix, not append to it"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -954,7 +949,6 @@ mod tests {
             "200 response must replace the local prefix, not append to it"
         );
         assert_eq!(server.ranges(), vec![Some(6)]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -984,7 +978,6 @@ mod tests {
         );
         assert_eq!(server.request_count(), 1, "416 must not be retried");
         assert_eq!(server.ranges(), vec![Some(4)]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1017,7 +1010,6 @@ mod tests {
             0,
             "error body must not be written"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1052,7 +1044,6 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(fs::read(&part).unwrap(), content);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1067,7 +1058,6 @@ mod tests {
         }
         assert_eq!(fs::read(dir.join("ok.bin")).unwrap(), ok_content);
         assert!(!dir.join("missing.bin").exists());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1085,12 +1075,11 @@ mod tests {
             "second file must never be requested"
         );
         assert!(!dir.join("ok.bin").exists());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn batch_failed_total_counts_only_batch_files() {
-        let (_server, dir, files, _ok_content) = missing_and_ok_batch("batch_failed_total");
+        let (_server, _dir, files, _ok_content) = missing_and_ok_batch("batch_failed_total");
         // The archive-wide total includes a file handled before the batch
         // (the saved _files.xml); the error must not count it.
         let batch_len = files.len();
@@ -1115,7 +1104,6 @@ mod tests {
             }
             other => panic!("expected BatchFailed, got {:?}", other),
         }
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1150,7 +1138,6 @@ mod tests {
             "mismatch must trigger exactly one re-download"
         );
         assert_eq!(fs::read(dir.join("file.bin")).unwrap(), correct);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1187,7 +1174,6 @@ mod tests {
             "a correct file must not be re-downloaded"
         );
         assert_eq!(fs::read(dir.join("file.bin")).unwrap(), content);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1217,7 +1203,6 @@ mod tests {
             "a verified existing file must not be re-downloaded"
         );
         assert_eq!(fs::read(dir.join("file.bin")).unwrap(), content);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1234,7 +1219,7 @@ mod tests {
         );
         let server = MockServer::start(scripts, MockResponse::new(200, MockBody::Full(vec![])));
 
-        let dir = temp_dir_for("last_modified");
+        let dir = TempDir::new("last_modified");
         let part = dir.join("file.bin.part");
         let result = run_download(
             &server.url("/file.bin"),
@@ -1250,7 +1235,6 @@ mod tests {
             mtime,
             httpdate::parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT").ok()
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1282,7 +1266,6 @@ mod tests {
             Some(xml_mtime),
             "file mtime must be set from _files.xml when the server sent no Last-Modified"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1320,7 +1303,6 @@ mod tests {
             Some(expected),
             "server Last-Modified must take precedence over the _files.xml mtime"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1351,7 +1333,6 @@ mod tests {
             "already-verified file must still get the _files.xml mtime"
         );
         assert_eq!(fs::read(dir.join("file.bin")).unwrap(), content);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1387,7 +1368,6 @@ mod tests {
             "mtime must stay at the download time when no source is available (age {}s)",
             now.saturating_sub(secs)
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1423,7 +1403,6 @@ mod tests {
             "size mismatch without MD5 must trigger a re-download"
         );
         assert_eq!(fs::read(dir.join("file.bin")).unwrap(), content);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1441,7 +1420,7 @@ mod tests {
         );
         let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
 
-        let dir = temp_dir_for("unremovable_stale");
+        let dir = TempDir::new("unremovable_stale");
         // A directory at the final path cannot be read on any platform, so
         // the check lands in the Unreadable branch: the file is kept and
         // the problem is reported for this file only.
@@ -1481,7 +1460,6 @@ mod tests {
             blocked.exists(),
             "unremovable stale file must stay in place"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1502,7 +1480,7 @@ mod tests {
         );
         let server = MockServer::start(scripts, MockResponse::new(404, MockBody::Full(vec![])));
 
-        let dir = temp_dir_for("uncreatable_part");
+        let dir = TempDir::new("uncreatable_part");
         fs::create_dir(dir.join("blocked.bin.part")).unwrap();
         let files = vec![
             task(
@@ -1537,7 +1515,6 @@ mod tests {
             other => panic!("expected BatchFailed with one file, got {:?}", other),
         }
         assert_eq!(fs::read(dir.join("ok.bin")).unwrap(), ok_content);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1574,7 +1551,6 @@ mod tests {
             "a complete .part must not trigger a re-download"
         );
         assert_eq!(server.ranges(), vec![Some(full.len() as u64)]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1612,13 +1588,12 @@ mod tests {
         );
         assert_eq!(server.ranges(), vec![Some(stale.len() as u64), None]);
         assert_eq!(fs::read(&part).unwrap(), fresh);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn interrupt_between_files_is_an_error() {
         // An interrupt detected between files must not exit as a success.
-        let (_server, dir, files, _) = missing_and_ok_batch("interrupt_between_files");
+        let (_server, _dir, files, _) = missing_and_ok_batch("interrupt_between_files");
         let stopped = Arc::new(AtomicBool::new(false));
         let total = files.len();
         let err =
@@ -1629,7 +1604,6 @@ mod tests {
             matches!(err, IaGetError::Interrupted),
             "an interrupted batch must fail, got {err:?}"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1672,7 +1646,6 @@ mod tests {
             "at most one extra retry may follow the interrupt, got {}",
             server.request_count()
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1712,7 +1685,6 @@ mod tests {
             "the abort must land within one interrupt check, not the read timeout: {:?}",
             start.elapsed()
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1720,7 +1692,7 @@ mod tests {
     fn symlinked_part_file_is_refused() {
         // A pre-planted symlink at the .part path must not be opened for
         // writing: the streamed bytes would reach the link target instead.
-        let dir = temp_dir_for("symlink_part");
+        let dir = TempDir::new("symlink_part");
         let target = dir.join("target.bin");
         fs::write(&target, "do not touch").unwrap();
         let part = dir.join("file.bin.part");
@@ -1733,7 +1705,6 @@ mod tests {
             "do not touch",
             "the link target must be left untouched"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1741,7 +1712,7 @@ mod tests {
     fn install_refuses_symlinked_final_file() {
         // A symlink planted at the final name must not shadow the verified
         // .part: the install fails and the .part is kept for the next run.
-        let dir = temp_dir_for("symlink_install");
+        let dir = TempDir::new("symlink_install");
         let target = dir.join("target.bin");
         fs::write(&target, "do not touch").unwrap();
         let final_path = dir.join("file.bin");
@@ -1766,6 +1737,5 @@ mod tests {
             part.exists(),
             "the verified .part must be kept for the next run"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 }

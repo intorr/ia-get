@@ -21,6 +21,15 @@ const BUFFER_SIZE: usize = 8192;
 /// File size threshold for showing hash progress bar (2MB)
 const LARGE_FILE_THRESHOLD: u64 = 2 * 1024 * 1024;
 
+/// The lowercase hex rendering of a hash digest.
+pub(crate) fn digest_hex(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Calculates the MD5 hash of a file
 fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
     let file = File::open(file_path).map_err(|e| io_error_with_path(file_path, e))?;
@@ -38,7 +47,7 @@ fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
         create_progress_bar(
             file_size,
             &format!("{} {}    ", last_glyph(), "Verifying".white()),
-            Some("blue/blue"),
+            "blue/blue",
             false,
         )
     });
@@ -68,8 +77,7 @@ fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
 
     finish_progress_bar(&pb);
 
-    let hash = context.finalize();
-    Ok(hash.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(digest_hex(context.finalize()))
 }
 
 /// Outcome of checking whether an already-downloaded file is still valid
@@ -234,13 +242,13 @@ pub(crate) fn verify_downloaded_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{md5_hex, temp_dir_for, test_running};
+    use crate::test_support::{TempDir, md5_hex, test_running};
 
     #[test]
     fn size_mismatch_short_circuits_before_hashing() {
         // A copy whose size does not match the metadata must be rejected
         // as Invalid without spending a full-file hash.
-        let dir = temp_dir_for("size_short_circuit");
+        let dir = TempDir::new("size_short_circuit");
         let path = dir.join("file.bin");
         fs::write(&path, b"short").unwrap(); // 5 bytes
 
@@ -261,7 +269,6 @@ mod tests {
             path.exists(),
             "the stale copy is removed by the caller, not by the check"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -269,7 +276,7 @@ mod tests {
         // A directory at the file path must yield Unreadable (per-file
         // failure, the entry is kept), not Invalid, which would delete it
         // and re-download based on a read failure.
-        let dir = temp_dir_for("unreadable_existing");
+        let dir = TempDir::new("unreadable_existing");
         let path = dir.join("dirfile.bin");
         fs::create_dir(&path).unwrap();
 
@@ -289,6 +296,5 @@ mod tests {
             other => panic!("expected Unreadable, got {other:?}"),
         }
         assert!(path.exists(), "an unreadable file must not be deleted");
-        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -125,7 +125,7 @@ pub fn plan_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<Downlo
             ));
             continue;
         }
-        taken_paths.insert(path_key, file.name.clone());
+        taken_paths.insert(path_key, file.name);
 
         tasks.push(DownloadTask {
             url: absolute_url.to_string(),
@@ -146,14 +146,7 @@ pub fn plan_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<Downlo
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn xml_file(name: &str, size: Option<u64>) -> XmlFile {
-        XmlFile {
-            name: name.to_string(),
-            size,
-            ..Default::default()
-        }
-    }
+    use crate::test_support::xml_file;
 
     #[test]
     fn files_to_download_excludes_xml_self_reference() {

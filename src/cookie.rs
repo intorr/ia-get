@@ -214,6 +214,7 @@ pub fn cookie_header_value(cookie_input: Option<&str>, url: &Url) -> Result<Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     fn cookie_test_url(path: &str) -> Url {
         Url::parse(&format!("https://archive.org{path}")).unwrap()
@@ -325,15 +326,8 @@ archive.org\tFALSE\t/\tFALSE\t2145916800\tcurrent\tvalue\n";
         );
     }
 
-    fn unique_temp_file(name: &str, content: &str) -> String {
-        let path = std::env::temp_dir().join(format!(
-            "{name}-{}-{}.txt",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn cookie_input_file(dir: &TempDir, name: &str, content: &str) -> String {
+        let path = dir.join(name);
         fs::write(&path, content).expect("failed to write temp cookie file");
         path.to_str().unwrap().to_string()
     }
@@ -342,7 +336,9 @@ archive.org\tFALSE\t/\tFALSE\t2145916800\tcurrent\tvalue\n";
     fn cookie_header_file_with_cookie_lines_is_parsed() {
         // A real cookies.txt (even when the path itself contains '=') is
         // still parsed, not treated as a raw cookie string.
-        let input = unique_temp_file(
+        let dir = TempDir::new("cookie_lines");
+        let input = cookie_input_file(
+            &dir,
             "ia-get-cookie-review=1",
             "archive.org\tFALSE\t/\tFALSE\t2145916800\tsession\tvalue\n",
         );
@@ -350,15 +346,15 @@ archive.org\tFALSE\t/\tFALSE\t2145916800\tcurrent\tvalue\n";
         let header = cookie_header_from_input(&input, &cookie_test_url("/download/item/f.xml"))
             .expect("cookies.txt must parse");
         assert_eq!(header, "session=value");
-
-        let _ = fs::remove_file(&input);
     }
 
     #[test]
     fn cookie_header_file_with_only_expired_cookies_is_empty() {
         // A recognizable-but-expired cookie file must yield an empty header
         // (with a warning), not the file name or the stale cookie.
-        let input = unique_temp_file(
+        let dir = TempDir::new("cookie_expired_only");
+        let input = cookie_input_file(
+            &dir,
             "ia-get-cookie-expired-only",
             "archive.org\tFALSE\t/\tFALSE\t1\told\tvalue\n",
         );
@@ -366,15 +362,14 @@ archive.org\tFALSE\t/\tFALSE\t2145916800\tcurrent\tvalue\n";
         let header = cookie_header_from_input(&input, &cookie_test_url("/download/item/f.xml"))
             .expect("an expired-cookies file must still parse");
         assert_eq!(header, "", "expired cookies must not reach the header");
-
-        let _ = fs::remove_file(&input);
     }
 
     #[test]
     fn cookie_header_colliding_filename_is_kept_as_raw_string() {
         // A file that holds no recognizable cookie line must not swallow a
         // cookie-looking input: the raw cookie string wins.
-        let input = unique_temp_file("ia-get-cookie-collide=1", "not a cookie file\n");
+        let dir = TempDir::new("cookie_collide");
+        let input = cookie_input_file(&dir, "ia-get-cookie-collide=1", "not a cookie file\n");
 
         let header = cookie_header_from_input(&input, &cookie_test_url("/download/item/f.xml"))
             .expect("input must be kept as a cookie string");
@@ -383,7 +378,5 @@ archive.org\tFALSE\t/\tFALSE\t2145916800\tcurrent\tvalue\n";
             input.trim(),
             "the cookie-looking input must survive"
         );
-
-        let _ = fs::remove_file(&input);
     }
 }

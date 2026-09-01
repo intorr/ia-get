@@ -72,7 +72,7 @@ pub fn sync_file_mtime(file_path: impl AsRef<Path>, target: SystemTime) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::temp_dir_for;
+    use crate::test_support::TempDir;
 
     #[test]
     fn mtime_from_xml_converts_and_rejects_overflow() {
@@ -88,7 +88,7 @@ mod tests {
     fn sync_file_mtime_skips_pre_epoch_times() {
         // A Last-Modified before 1970 has no Unix representation: the mtime
         // must be left untouched instead of being stamped to the epoch.
-        let dir = temp_dir_for("mtime_pre_epoch");
+        let dir = TempDir::new("mtime_pre_epoch");
         let path = dir.join("f.txt");
         fs::write(&path, "x").unwrap();
 
@@ -101,6 +101,5 @@ mod tests {
             mtime.duration_since(UNIX_EPOCH).unwrap().abs_diff(now) < Duration::from_secs(60),
             "the mtime must stay at the write time"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 }

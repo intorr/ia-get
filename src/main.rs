@@ -8,15 +8,16 @@
 use clap::Parser;
 use colored::*;
 use ia_get::archive_metadata::{
-    XmlFiles, XmlMetadata, fetch_and_parse_xml, get_xml_url, save_xml_metadata, xml_file_name_of,
+    XmlFiles, XmlMetadata, fetch_and_parse_xml, get_xml_url, list_file_rows, list_summary,
+    save_xml_metadata, xml_file_name_of,
 };
 use ia_get::constants::USER_AGENT;
 use ia_get::cookie::cookie_header_value;
 use ia_get::downloader;
 use ia_get::plan::{files_to_download, plan_download_tasks};
 use ia_get::utils::{
-    create_spinner, finish_spinner, format_size, last_glyph, print_downloaded_line,
-    print_file_banner, validate_archive_url,
+    create_spinner, finish_spinner, last_glyph, print_downloaded_line, print_file_banner,
+    validate_archive_url,
 };
 use ia_get::{IaGetError, Result};
 use indicatif::ProgressBar;
@@ -95,56 +96,6 @@ fn save_and_announce_xml(
     Ok(())
 }
 
-/// Return formatted file rows for `--list` output.
-fn list_file_rows(files: &XmlFiles) -> Vec<String> {
-    files
-        .files
-        .iter()
-        .map(|file| {
-            let size = file
-                .size
-                .map(format_size)
-                .unwrap_or_else(|| "unknown".to_string());
-            format!("{size:>9} {}", file.name)
-        })
-        .collect()
-}
-
-/// Return a summary for `--list` output.
-fn list_summary(files: &XmlFiles) -> String {
-    let total_known_size: u64 = files.files.iter().filter_map(|file| file.size).sum();
-    let unknown_size_count = files
-        .files
-        .iter()
-        .filter(|file| file.size.is_none())
-        .count();
-    let file_label = if files.files.len() == 1 {
-        "file"
-    } else {
-        "files"
-    };
-
-    if unknown_size_count == 0 {
-        format!(
-            "{} {file_label}, {} total",
-            files.files.len(),
-            format_size(total_known_size)
-        )
-    } else {
-        let unknown_label = if unknown_size_count == 1 {
-            "unknown size"
-        } else {
-            "unknown sizes"
-        };
-        format!(
-            "{} {file_label}, {} total known size, {} {unknown_label}",
-            files.files.len(),
-            format_size(total_known_size),
-            unknown_size_count
-        )
-    }
-}
-
 /// Lists parsed filenames from XML metadata when --list/-l is used
 fn list_files(files: &XmlFiles, spinner: &ProgressBar) {
     finish_spinner(
@@ -219,13 +170,8 @@ async fn run(cli: &Cli) -> Result<()> {
     // scope every metadata and file request uses — and reused for the
     // metadata fetch and the file downloads, so a path-scoped cookie
     // applies consistently across the run.
-    let xml_url = get_xml_url(&cli.url);
-    let download_url = Url::parse(&xml_url).map_err(|e| {
-        let error = IaGetError::from(e);
-        report_spinner_error(&spinner, &error);
-        error
-    })?;
-    let cookie_header = cookie_header_value(cli.cookies.as_deref(), &download_url)
+    let xml_url = get_xml_url(&cli.url).inspect_err(|e| report_spinner_error(&spinner, e))?;
+    let cookie_header = cookie_header_value(cli.cookies.as_deref(), &xml_url)
         .inspect_err(|e| report_spinner_error(&spinner, e))?;
 
     // Fetch and parse XML metadata in one operation. The accessibility
@@ -316,8 +262,6 @@ async fn run(cli: &Cli) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use ia_get::archive_metadata::XmlFile;
     use ia_get::utils::validate_archive_url;
 
     #[test]
@@ -340,47 +284,5 @@ mod tests {
         assert!(validate_archive_url("http://archive.org/details/test").is_err());
         assert!(validate_archive_url("https://archive.org/details/test/extra").is_err());
         assert!(validate_archive_url("https://archive.org/details/test//").is_err());
-    }
-
-    fn xml_file(name: &str, size: Option<u64>) -> XmlFile {
-        XmlFile {
-            name: name.to_string(),
-            size,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn list_file_rows_format_sizes_and_unknown_entries() {
-        let files = XmlFiles {
-            files: vec![
-                xml_file("cover.jpg", Some(12_345)),
-                xml_file("metadata.xml", None),
-            ],
-        };
-
-        assert_eq!(
-            list_file_rows(&files),
-            vec![
-                "  12.06KB cover.jpg".to_string(),
-                "  unknown metadata.xml".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn list_summary_reports_total_known_size_and_unknown_count() {
-        let files = XmlFiles {
-            files: vec![
-                xml_file("disk1.zip", Some(1_048_576)),
-                xml_file("disk2.zip", Some(2_097_152)),
-                xml_file("notes.txt", None),
-            ],
-        };
-
-        assert_eq!(
-            list_summary(&files),
-            "3 files, 3.00MB total known size, 1 unknown size"
-        );
     }
 }

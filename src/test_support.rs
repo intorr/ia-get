@@ -11,25 +11,45 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use digest::Digest;
 use reqwest::StatusCode;
+use url::Url;
 
-/// Creates a unique temp directory for a test.
-///
-/// Callers clean the directory up at the end of the test with
-/// `let _ = fs::remove_dir_all(&dir);`; a leftover under the OS temp dir
-/// is harmless, but a long test run should not accumulate them.
-pub fn temp_dir_for(test_name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "ia-get-test-{}-{}-{}",
-        std::process::id(),
-        test_name,
-        nanos
-    ));
-    std::fs::create_dir_all(&dir).expect("failed to create temp dir");
-    dir
+use crate::archive_metadata::XmlFile;
+
+/// A unique temp directory for a test that removes itself on drop, so a
+/// test that panics (or simply ends) never leaves a directory behind in
+/// the OS temp dir.
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    /// Creates a unique, freshly-created temp directory for a test.
+    pub fn new(test_name: &str) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ia-get-test-{}-{}-{}",
+            std::process::id(),
+            test_name,
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        Self(dir)
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Returns a file's mtime as unix seconds, if readable.
@@ -43,10 +63,16 @@ pub fn mtime_of(path: &Path) -> Option<u64> {
 
 /// The lowercase hex MD5 of `content`, in the form archive.org reports.
 pub fn md5_hex(content: &[u8]) -> String {
-    md5::Md5::digest(content)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::downloader::digest_hex(md5::Md5::digest(content))
+}
+
+/// A minimal `XmlFile` test fixture: only the name and size are set.
+pub fn xml_file(name: &str, size: Option<u64>) -> XmlFile {
+    XmlFile {
+        name: name.to_string(),
+        size,
+        ..Default::default()
+    }
 }
 
 /// A "running" flag set to true, for tests that drive the download pipeline
@@ -173,6 +199,21 @@ impl MockServer {
     /// URL for the given absolute path (e.g. "/file.bin")
     pub fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
+    }
+
+    /// Starts a server with a single scripted path: the last response
+    /// doubles as the fallback once the script is exhausted. Returns the
+    /// server and the absolute URL of that path.
+    pub fn scripted(path: &str, responses: Vec<MockResponse>) -> (Self, Url) {
+        let fallback = responses
+            .last()
+            .cloned()
+            .unwrap_or_else(|| MockResponse::new(404, MockBody::Full(vec![])));
+        let mut scripts = HashMap::new();
+        scripts.insert(path.to_string(), VecDeque::from(responses));
+        let server = Self::start(scripts, fallback);
+        let url = Url::parse(&server.url(path)).expect("mock URL must parse");
+        (server, url)
     }
 
     pub fn request_count(&self) -> usize {

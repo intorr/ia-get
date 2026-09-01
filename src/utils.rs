@@ -40,7 +40,7 @@ pub fn ensure_not_symlink(path: &Path) -> Result<()> {
 }
 
 /// Spinner tick interval in milliseconds
-pub const SPINNER_TICK_INTERVAL: u64 = 100;
+const SPINNER_TICK_INTERVAL: u64 = 100;
 
 /// Size constants for formatting
 const KB: u64 = 1024;
@@ -83,22 +83,16 @@ pub fn validate_archive_url(url: &str) -> Result<()> {
 /// * `total` - Total value for the progress bar
 /// * `action` - Action text to show at the beginning, pre-styled with the
 ///   `colored` crate (e.g., "╰╼ Downloading  ")
-/// * `color` - Optional bar color style (defaults to "green/green")
+/// * `color` - Bar color style (e.g. "green/green", "blue/blue")
 /// * `with_eta` - Whether to include ETA in the template
 ///
 /// # Returns
 /// A configured progress bar
-pub fn create_progress_bar(
-    total: u64,
-    action: &str,
-    color: Option<&str>,
-    with_eta: bool,
-) -> ProgressBar {
+pub fn create_progress_bar(total: u64, action: &str, color: &str, with_eta: bool) -> ProgressBar {
     let pb = ProgressBar::new(total);
-    let color_str = color.unwrap_or("green/green");
 
     let template =
-        format!("{action}{{elapsed_precise}} {{bar:40.{color_str}}} {{bytes}}/{{total_bytes}}");
+        format!("{action}{{elapsed_precise}} {{bar:40.{color}}} {{bytes}}/{{total_bytes}}");
     let template = if with_eta {
         format!("{template} (ETA: {{eta}})")
     } else {

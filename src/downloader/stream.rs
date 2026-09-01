@@ -228,7 +228,7 @@ pub(crate) async fn download_file_content(
             .map(|remaining| base_size + remaining)
             .or(expected_size)
             .unwrap_or(base_size);
-        let pb = create_progress_bar(total, &download_action, Some("green/green"), true);
+        let pb = create_progress_bar(total, &download_action, "green/green", true);
         // Set initial progress to current file size for resumed downloads
         pb.set_position(base_size);
 
