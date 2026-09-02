@@ -199,6 +199,21 @@ pub fn print_download_interrupted() {
     );
 }
 
+/// Prints the end-of-batch summary line, mirroring the `--check` report's
+/// closing tally: how many files the batch handled and how many succeeded
+/// or failed.
+pub fn print_download_summary(total: usize, ok: usize, failed: usize) {
+    println!();
+    println!(
+        "{} downloaded {} file{}: {} ok, {} failed",
+        "Σ".bold(),
+        total,
+        if total == 1 { "" } else { "s" },
+        ok,
+        failed
+    );
+}
+
 /// Print the "Downloaded ↓ size" status line for a finished file
 ///
 /// `prefix` is the pre-styled tree glyph: "├╼" when more lines follow in the

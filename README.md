@@ -61,6 +61,7 @@ Archive.org's edge servers occasionally return error pages, empty responses, or 
 - Error response bodies are never written into your files, and an empty or truncated response is retried rather than saved.
 - Each file is downloaded to a `<name>.part` temporary file and renamed to its final name only after the size (when known) and MD5 hash have been verified. A failed verification triggers a re-download from scratch, up to three attempts per file.
 - If a file ultimately fails, the remaining files in the archive still download; `ia-get` exits with a non-zero status and prints a list of the failures. Use `--stop-on-error` to abort at the first failure instead.
+- When the batch completes, `ia-get` prints a closing summary line in the style of the `--check` report: `Σ downloaded N files: X ok, Y failed`.
 
 ```shell
 ia-get --stop-on-error https://archive.org/details/<identifier>

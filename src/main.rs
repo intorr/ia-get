@@ -586,6 +586,7 @@ async fn run(cli: &Cli) -> Result<()> {
         cookie_header.as_ref(),
         cli.stop_on_error,
         rate_limit,
+        &output_dir,
     )
     .await?;
 

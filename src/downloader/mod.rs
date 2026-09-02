@@ -27,8 +27,9 @@ use reqwest::header::HeaderValue;
 
 use crate::Result;
 use crate::display::{
-    print_complete_part_verification, print_download_interrupted, print_file_banner,
-    print_mtime_warning, print_redownload_from_scratch, print_stale_file_redownload,
+    print_complete_part_verification, print_download_interrupted, print_download_summary,
+    print_file_banner, print_mtime_warning, print_redownload_from_scratch,
+    print_stale_file_redownload,
 };
 use crate::downloader::mtime::mtime_from_xml;
 use crate::downloader::retry::backoff_delay;
@@ -65,13 +66,46 @@ pub struct DownloadTask {
     pub expected_mtime: Option<u64>,
 }
 
-/// Ensure parent directories exist for a file
-fn ensure_parent_directories(file_path: &str) -> Result<()> {
-    if let Some(path) = Path::new(file_path).parent()
-        && path.file_name().is_some()
-        && !path.exists()
-    {
-        fs::create_dir_all(path).map_err(|e| io_error_with_path(path, e))?;
+/// Ensures the parent directories of a file exist, refusing to write
+/// through a pre-planted symlink at any server-derived component.
+///
+/// `create_dir_all` accepts an existing symlink-to-directory as "already
+/// exists", so a planted link would silently redirect every write beneath
+/// it; the leaf `.part` and final names are guarded by
+/// `ensure_not_symlink`, but not their ancestors. Every existing component
+/// strictly below `output_dir` is checked — the output directory itself is
+/// user-chosen (a symlink there is intent, not a planted one), and the
+/// components above it are not server-controlled.
+fn ensure_parent_directories(file_path: &str, output_dir: &str) -> Result<()> {
+    let Some(parent) = Path::new(file_path)
+        .parent()
+        .filter(|p| p.file_name().is_some())
+    else {
+        return Ok(());
+    };
+
+    let trusted = Path::new(output_dir);
+    let mut dir = Some(parent);
+    while let Some(candidate) = dir {
+        if candidate == trusted {
+            break;
+        }
+        if let Ok(meta) = fs::symlink_metadata(candidate)
+            && meta.file_type().is_symlink()
+        {
+            return Err(IaGetError::FileSystem {
+                detail: format!(
+                    "{} is a symlink; refusing to write through it",
+                    candidate.display()
+                ),
+                source: None,
+            });
+        }
+        dir = candidate.parent();
+    }
+
+    if !parent.exists() {
+        fs::create_dir_all(parent).map_err(|e| io_error_with_path(parent, e))?;
     }
     Ok(())
 }
@@ -208,6 +242,7 @@ enum FileOutcome {
 /// that cannot be removed, a failed download, a `.part` that cannot be set
 /// up or installed) yield `FileOutcome::Failed`; only a user interruption
 /// propagates as a hard error.
+#[allow(clippy::too_many_arguments)]
 async fn process_file(
     client: &Client,
     task: &DownloadTask,
@@ -216,6 +251,7 @@ async fn process_file(
     running: &Arc<AtomicBool>,
     cookie_header: Option<&HeaderValue>,
     rate_limit: Option<u64>,
+    output_dir: &str,
 ) -> Result<FileOutcome> {
     let url = &task.url;
     let file_path = &task.file_path;
@@ -250,6 +286,7 @@ async fn process_file(
         expected_md5,
         expected_size,
         rate_limit,
+        output_dir,
     )
     .await?;
 
@@ -379,10 +416,12 @@ async fn run_download_attempts(
     expected_md5: Option<&str>,
     expected_size: Option<u64>,
     rate_limit: Option<u64>,
+    output_dir: &str,
 ) -> Result<DownloadOutcome> {
     // Setup I/O problems (a locked or overly long path, a missing directory
-    // that cannot be created) are per-file failures, not batch aborts.
-    if let Err(e) = ensure_parent_directories(part_path) {
+    // that cannot be created, a planted symlink at a directory component)
+    // are per-file failures, not batch aborts.
+    if let Err(e) = ensure_parent_directories(part_path, output_dir) {
         return Ok(DownloadOutcome::Failed {
             reason: format!("could not create parent directories: {e}"),
             discard_part: false,
@@ -517,6 +556,11 @@ async fn run_download_attempts(
 ///
 /// `rate_limit` (bytes/second, from `--limit-rate`) throttles the transfer
 /// when `Some(_ > 0)`; `None` or `Some(0)` leaves the connection unlimited.
+///
+/// `output_dir` is the user-chosen directory the files land in ("" for the
+/// current directory): server-derived components below it that are
+/// pre-planted symlinks are refused instead of written through.
+#[allow(clippy::too_many_arguments)]
 pub async fn download_files(
     client: &Client,
     files: Vec<DownloadTask>,
@@ -525,6 +569,7 @@ pub async fn download_files(
     cookie_header: Option<&HeaderValue>,
     stop_on_error: bool,
     rate_limit: Option<u64>,
+    output_dir: &str,
 ) -> Result<()> {
     // Set up signal handling for the entire download session
     let running = setup_signal_handler();
@@ -537,6 +582,7 @@ pub async fn download_files(
         cookie_header,
         stop_on_error,
         rate_limit,
+        output_dir,
         &running,
     )
     .await
@@ -558,6 +604,7 @@ async fn download_files_with_signal(
     cookie_header: Option<&HeaderValue>,
     stop_on_error: bool,
     rate_limit: Option<u64>,
+    output_dir: &str,
     running: &Arc<AtomicBool>,
 ) -> Result<()> {
     let mut failed_files: Vec<(String, String)> = Vec::new();
@@ -579,15 +626,21 @@ async fn download_files_with_signal(
             running,
             cookie_header,
             rate_limit,
+            output_dir,
         )
         .await?;
 
         if let FileOutcome::Failed(reason) = outcome {
             failed_files.push((task.file_path.clone(), reason));
             if stop_on_error {
-                // The loop ends early here, so the end-of-batch summary
-                // below is never reached: print it in this branch too.
+                // The loop ends early here, so the end-of-batch lines
+                // below are never reached: print them in this branch too.
                 print_failed_files(&failed_files);
+                print_download_summary(
+                    tasks.len(),
+                    tasks.len() - failed_files.len(),
+                    failed_files.len(),
+                );
                 return Err(batch_failed(&failed_files, tasks.len()));
             }
         }
@@ -595,6 +648,14 @@ async fn download_files_with_signal(
 
     if !failed_files.is_empty() {
         print_failed_files(&failed_files);
+    }
+    print_download_summary(
+        tasks.len(),
+        tasks.len() - failed_files.len(),
+        failed_files.len(),
+    );
+
+    if !failed_files.is_empty() {
         return Err(batch_failed(&failed_files, tasks.len()));
     }
 
@@ -645,8 +706,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Runs a batch with a fresh client and a live "running" flag, mirroring
-    /// the production call minus the Ctrl+C handler
-    async fn run_batch(files: Vec<DownloadTask>, stop_on_error: bool) -> Result<()> {
+    /// the production call minus the Ctrl+C handler. `dir` is the batch's
+    /// output directory (the trusted root of the symlink guard).
+    async fn run_batch(dir: &Path, files: Vec<DownloadTask>, stop_on_error: bool) -> Result<()> {
         let total_files = files.len();
         download_files_with_signal(
             &Client::new(),
@@ -656,6 +718,7 @@ mod tests {
             None,
             stop_on_error,
             None,
+            dir.to_str().unwrap(),
             &test_running(),
         )
         .await
@@ -712,7 +775,7 @@ mod tests {
     #[tokio::test]
     async fn batch_continues_after_file_failure() {
         let (_server, dir, files, ok_content) = missing_and_ok_batch("batch_continue");
-        let err = run_batch(files, false).await.unwrap_err();
+        let err = run_batch(&dir, files, false).await.unwrap_err();
         match err {
             IaGetError::BatchFailed { count, total, .. } => {
                 assert_eq!((count, total), (1, 2));
@@ -726,7 +789,7 @@ mod tests {
     #[tokio::test]
     async fn stop_on_error_aborts_batch() {
         let (server, dir, files, _ok_content) = missing_and_ok_batch("stop_on_error");
-        let err = run_batch(files, true).await.unwrap_err();
+        let err = run_batch(&dir, files, true).await.unwrap_err();
         assert!(
             matches!(err, IaGetError::BatchFailed { count: 1, .. }),
             "expected BatchFailed with one file, got {:?}",
@@ -742,7 +805,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_failed_total_counts_only_batch_files() {
-        let (_server, _dir, files, _ok_content) = missing_and_ok_batch("batch_failed_total");
+        let (_server, dir, files, _ok_content) = missing_and_ok_batch("batch_failed_total");
         // The archive-wide total includes a file handled before the batch
         // (the saved _files.xml); the error must not count it.
         let batch_len = files.len();
@@ -754,6 +817,7 @@ mod tests {
             None,
             false,
             None,
+            dir.to_str().unwrap(),
             &test_running(),
         )
         .await
@@ -792,7 +856,7 @@ mod tests {
             None,
         )];
 
-        run_batch(files, false)
+        run_batch(&dir, files, false)
             .await
             .expect("batch should succeed after re-download");
 
@@ -828,7 +892,7 @@ mod tests {
             None,
         )];
 
-        run_batch(files, false)
+        run_batch(&dir, files, false)
             .await
             .expect("an uppercase MD5 must verify a correct file");
 
@@ -857,7 +921,7 @@ mod tests {
             None,
         )];
 
-        run_batch(files, false)
+        run_batch(&dir, files, false)
             .await
             .expect("an uppercase MD5 must verify an existing file in place");
 
@@ -891,7 +955,9 @@ mod tests {
             Some(xml_mtime),
         )];
 
-        run_batch(files, false).await.expect("batch should succeed");
+        run_batch(&dir, files, false)
+            .await
+            .expect("batch should succeed");
 
         assert_eq!(
             mtime_of(&dir.join("file.bin")),
@@ -928,7 +994,9 @@ mod tests {
             Some(xml_mtime),
         )];
 
-        run_batch(files, false).await.expect("batch should succeed");
+        run_batch(&dir, files, false)
+            .await
+            .expect("batch should succeed");
 
         assert_eq!(
             mtime_of(&dir.join("file.bin")),
@@ -952,7 +1020,9 @@ mod tests {
             Some(xml_mtime),
         )];
 
-        run_batch(files, false).await.expect("batch should succeed");
+        run_batch(&dir, files, false)
+            .await
+            .expect("batch should succeed");
 
         assert_eq!(
             server.request_count(),
@@ -988,7 +1058,9 @@ mod tests {
             None,
         )];
 
-        run_batch(files, false).await.expect("batch should succeed");
+        run_batch(&dir, files, false)
+            .await
+            .expect("batch should succeed");
 
         let secs = mtime_of(&dir.join("file.bin")).expect("file must exist");
         let now = SystemTime::now()
@@ -1025,7 +1097,7 @@ mod tests {
             None,
         )];
 
-        run_batch(files, false)
+        run_batch(&dir, files, false)
             .await
             .expect("batch should succeed after re-download");
 
@@ -1056,7 +1128,7 @@ mod tests {
             ok_bin_task(&server, &dir),
         ];
 
-        let err = run_batch(files, false).await.unwrap_err();
+        let err = run_batch(&dir, files, false).await.unwrap_err();
         match err {
             IaGetError::BatchFailed {
                 count,
@@ -1093,7 +1165,7 @@ mod tests {
             ok_bin_task(&server, &dir),
         ];
 
-        let err = run_batch(files, false).await.unwrap_err();
+        let err = run_batch(&dir, files, false).await.unwrap_err();
         match err {
             IaGetError::BatchFailed {
                 count,
@@ -1135,6 +1207,7 @@ mod tests {
             Some(&md5),
             Some(full.len() as u64),
             None,
+            dir.to_str().unwrap(),
         )
         .await
         .expect("a complete .part must verify in place");
@@ -1172,6 +1245,7 @@ mod tests {
             Some(&md5),
             Some(fresh.len() as u64),
             None,
+            dir.to_str().unwrap(),
         )
         .await
         .expect("the re-download must succeed");
@@ -1189,7 +1263,7 @@ mod tests {
     #[tokio::test]
     async fn interrupt_between_files_is_an_error() {
         // An interrupt detected between files must not exit as a success.
-        let (_server, _dir, files, _) = missing_and_ok_batch("interrupt_between_files");
+        let (_server, dir, files, _) = missing_and_ok_batch("interrupt_between_files");
         let stopped = Arc::new(AtomicBool::new(false));
         let total = files.len();
         let err = download_files_with_signal(
@@ -1200,6 +1274,7 @@ mod tests {
             None,
             false,
             None,
+            dir.to_str().unwrap(),
             &stopped,
         )
         .await
@@ -1260,5 +1335,78 @@ mod tests {
             part.exists(),
             "the verified .part must be kept for the next run"
         );
+    }
+
+    #[test]
+    fn ensure_parent_directories_creates_missing_components() {
+        let dir = TempDir::new("ensure_parent_dirs");
+        let base = dir.join("out");
+        fs::create_dir(&base).unwrap();
+        let part = base.join("season1/deep/video.mp4.part");
+
+        ensure_parent_directories(part.to_str().unwrap(), base.to_str().unwrap())
+            .expect("missing components must be created");
+        assert!(base.join("season1/deep").is_dir());
+    }
+
+    #[test]
+    fn ensure_parent_directories_accepts_real_existing_components() {
+        // A re-run finds the directories the first run created: a real
+        // (non-symlink) directory below the output dir must not be refused.
+        let dir = TempDir::new("ensure_parent_dirs_real");
+        let base = dir.join("out");
+        fs::create_dir_all(base.join("season1")).unwrap();
+
+        ensure_parent_directories(
+            base.join("season1/video.mp4.part").to_str().unwrap(),
+            base.to_str().unwrap(),
+        )
+        .expect("a real directory component must be accepted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_parent_directories_refuses_planted_symlink_component() {
+        // A pre-planted symlink at a server-derived directory component must
+        // not redirect the writes beneath it: create_dir_all would accept it
+        // as "already exists" and the .part would land at the link target.
+        let dir = TempDir::new("ensure_parent_dirs_symlink");
+        let base = dir.join("out");
+        fs::create_dir(&base).unwrap();
+        let target = dir.join("target");
+        fs::create_dir(&target).unwrap();
+        let link = base.join("season1");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = ensure_parent_directories(
+            base.join("season1/video.mp4.part").to_str().unwrap(),
+            base.to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+        assert!(
+            !target.join("video.mp4.part").exists(),
+            "nothing must be written through the planted link"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_parent_directories_trusts_a_symlinked_output_dir() {
+        // The output directory is user-chosen (see ensure_output_dir in
+        // main.rs): a symlink the user pointed at with -o is intent, not a
+        // planted one, so the components below it are still managed.
+        let dir = TempDir::new("ensure_parent_dirs_symlink_root");
+        let target = dir.join("target");
+        fs::create_dir(&target).unwrap();
+        let link = dir.join("out");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        ensure_parent_directories(
+            link.join("season1/video.mp4.part").to_str().unwrap(),
+            link.to_str().unwrap(),
+        )
+        .expect("a symlinked output dir must be trusted");
+        assert!(target.join("season1").is_dir());
     }
 }
