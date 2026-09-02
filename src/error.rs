@@ -45,6 +45,26 @@ pub enum IaGetError {
     #[error("Invalid output directory: {0} — the path must name a directory")]
     InvalidOutputDir(String),
 
+    /// The `--limit-rate` value cannot be parsed as a throughput
+    #[error("Invalid rate limit: {0}")]
+    InvalidRate(String),
+
+    /// The `--proxy` value (or the `HTTPS_PROXY` env var) cannot be turned
+    /// into a proxy the HTTP client can use
+    #[error("Invalid proxy: {0}")]
+    InvalidProxy(String),
+
+    /// The planned downloads need more space than the target volume has free;
+    /// `required`/`available` are pre-formatted human sizes
+    #[error(
+        "Not enough disk space: need {required} for the download, only {available} free in {path}"
+    )]
+    InsufficientDiskSpace {
+        required: String,
+        available: String,
+        path: String,
+    },
+
     /// XML parsing errors
     #[error("Failed to parse XML: {0}")]
     XmlParsing(String),

@@ -22,3 +22,27 @@ pub fn ensure_not_symlink(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// The free space (in bytes) of the volume that `path` lives on, or `None`
+/// when it cannot be determined.
+///
+/// Used by the pre-download disk-space check: a `None` result means the
+/// check is skipped (best-effort), never that the download is refused —
+/// platforms or filesystems where the free-space call fails must not block a
+/// download that would otherwise succeed.
+pub fn available_space(path: &Path) -> Option<u64> {
+    fs2::available_space(path).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn available_space_reports_a_volume() {
+        // The current directory's volume must report a free-space figure on
+        // every supported platform; only the fact that it resolves (not the
+        // exact amount) is asserted, since that varies by machine.
+        assert!(available_space(Path::new(".")).is_some());
+    }
+}

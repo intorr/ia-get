@@ -17,6 +17,7 @@ pub mod fs;
 pub mod plan;
 #[cfg(test)]
 pub mod test_support;
+pub mod verbose;
 
 // Re-export the error types for convenience
 pub use error::{IaGetError, Result};

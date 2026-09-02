@@ -269,10 +269,53 @@ pub fn plan_download_tasks(
     })
 }
 
+/// The number of bytes this plan still needs to write, as far as the
+/// metadata and the files already on disk allow:
+///
+/// - a final file that already exists at its expected size is taken to be
+///   done (0), mirroring the cheap size check the downloader runs before it
+///   bothers to hash;
+/// - a leftover `<name>.part` holding a valid prefix only needs the
+///   remainder;
+/// - everything else needs the whole expected size;
+/// - a file whose size the metadata does not report is not counted (0), since
+///   its footprint is unknown.
+///
+/// The sum is therefore a lower bound, not a guarantee: it answers "is there
+/// any chance the download fits", which is exactly what the pre-download
+/// disk-space check needs.
+pub fn required_download_space(tasks: &[DownloadTask]) -> u64 {
+    tasks.iter().map(remaining_bytes_for).sum()
+}
+
+/// The bytes one task still needs, per the rules in [`required_download_space`].
+fn remaining_bytes_for(task: &DownloadTask) -> u64 {
+    let Some(expected) = task.expected_size else {
+        return 0;
+    };
+
+    // A final copy already at the expected size is assumed complete; the
+    // downloader's cheap size check would not re-fetch it.
+    if let Ok(meta) = std::fs::metadata(&task.file_path)
+        && meta.len() == expected
+    {
+        return 0;
+    }
+
+    // A leftover .part holding a valid prefix only needs the remainder.
+    // The "{file_path}.part" spelling matches the downloader exactly.
+    let part_path = format!("{}.part", task.file_path);
+    if let Ok(meta) = std::fs::metadata(&part_path) {
+        return expected.saturating_sub(meta.len());
+    }
+
+    expected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::xml_file;
+    use crate::test_support::{TempDir, task, xml_file};
 
     /// The whole-item target of the "item1" fixture archives
     fn whole_item() -> ArchiveTarget {
@@ -578,5 +621,101 @@ mod tests {
         assert_eq!(join_output_dir("", "a/b.txt"), "a/b.txt");
         assert_eq!(join_output_dir("out", "a/b.txt"), "out/a/b.txt");
         assert_eq!(join_output_dir("out/sub", "c.txt"), "out/sub/c.txt");
+    }
+
+    #[test]
+    fn required_download_space_counts_only_unknown_files() {
+        let dir = TempDir::new("required_space_unknown");
+        let unknown = task(
+            "https://archive.org/download/item/u.bin",
+            dir.join("u.bin").to_str().unwrap().to_string(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            required_download_space(&[unknown]),
+            0,
+            "files without a reported size contribute nothing"
+        );
+    }
+
+    #[test]
+    fn required_download_space_counts_a_fresh_file_in_full() {
+        let dir = TempDir::new("required_space_fresh");
+        let fresh = task(
+            "https://archive.org/download/item/fresh.bin",
+            dir.join("fresh.bin").to_str().unwrap().to_string(),
+            None,
+            Some(1000),
+            None,
+        );
+        assert_eq!(required_download_space(&[fresh]), 1000);
+    }
+
+    #[test]
+    fn required_download_space_ignores_a_complete_final_file() {
+        let dir = TempDir::new("required_space_complete");
+        let path = dir.join("done.bin");
+        std::fs::write(&path, vec![0u8; 1000]).unwrap();
+        let done = task(
+            "https://archive.org/download/item/done.bin",
+            path.to_str().unwrap().to_string(),
+            None,
+            Some(1000),
+            None,
+        );
+        assert_eq!(
+            required_download_space(&[done]),
+            0,
+            "a final file already at its expected size needs no space"
+        );
+    }
+
+    #[test]
+    fn required_download_space_counts_the_part_remainder() {
+        let dir = TempDir::new("required_space_part");
+        // A .part holding 400 of a 1000-byte file needs the remaining 600.
+        let final_path = dir.join("resumable.bin");
+        std::fs::write(format!("{}.part", final_path.display()), vec![0u8; 400]).unwrap();
+        let resumable = task(
+            "https://archive.org/download/item/resumable.bin",
+            final_path.to_str().unwrap().to_string(),
+            None,
+            Some(1000),
+            None,
+        );
+        assert_eq!(required_download_space(&[resumable]), 600);
+    }
+
+    #[test]
+    fn required_download_space_sums_across_files() {
+        let dir = TempDir::new("required_space_sum");
+        let a = task(
+            "https://archive.org/download/item/a.bin",
+            dir.join("a.bin").to_str().unwrap().to_string(),
+            None,
+            Some(300),
+            None,
+        );
+        let unknown = task(
+            "https://archive.org/download/item/b.bin",
+            dir.join("b.bin").to_str().unwrap().to_string(),
+            None,
+            None,
+            None,
+        );
+        let c = task(
+            "https://archive.org/download/item/c.bin",
+            dir.join("c.bin").to_str().unwrap().to_string(),
+            None,
+            Some(200),
+            None,
+        );
+        assert_eq!(
+            required_download_space(&[a, unknown, c]),
+            500,
+            "only the files with a known size are summed"
+        );
     }
 }

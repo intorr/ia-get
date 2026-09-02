@@ -89,15 +89,15 @@ pub fn fast_retry(_attempt: u32) -> Duration {
 
 /// Builds a `DownloadTask`
 pub fn task(
-    url: String,
-    file_path: String,
+    url: impl Into<String>,
+    file_path: impl Into<String>,
     md5: Option<String>,
     size: Option<u64>,
     mtime: Option<u64>,
 ) -> DownloadTask {
     DownloadTask {
-        url,
-        file_path,
+        url: url.into(),
+        file_path: file_path.into(),
         expected_md5: md5,
         expected_size: size,
         expected_mtime: mtime,
@@ -157,6 +157,7 @@ pub async fn run_download(
         None,
         expected_size,
         fast_retry,
+        None,
     )
     .await;
     drop(file);

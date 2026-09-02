@@ -7,6 +7,7 @@
 //! [`DownloadTask`]s.
 
 mod mtime;
+mod rate;
 mod retry;
 mod signal;
 mod stream;
@@ -40,6 +41,7 @@ use crate::fs::ensure_not_symlink;
 
 // Re-export the items that form this module's public API.
 pub use mtime::{parse_last_modified, sync_file_mtime};
+pub use rate::parse_rate;
 pub(crate) use stream::download_file_content;
 #[cfg(test)]
 pub(crate) use verify::digest_hex;
@@ -212,6 +214,7 @@ async fn process_file(
     total_files: usize,
     running: &Arc<AtomicBool>,
     cookie_header: Option<&HeaderValue>,
+    rate_limit: Option<u64>,
 ) -> Result<FileOutcome> {
     let url = &task.url;
     let file_path = &task.file_path;
@@ -245,6 +248,7 @@ async fn process_file(
         cookie_header,
         expected_md5,
         expected_size,
+        rate_limit,
     )
     .await?;
 
@@ -364,6 +368,7 @@ fn handle_rejected_offset(
 /// Runs the download+verification attempts for one file, re-downloading from
 /// scratch after a failed verification or a rejected resume offset (a `.part`
 /// that already holds the whole file is verified in place instead).
+#[allow(clippy::too_many_arguments)]
 async fn run_download_attempts(
     client: &Client,
     url: &str,
@@ -372,6 +377,7 @@ async fn run_download_attempts(
     cookie_header: Option<&HeaderValue>,
     expected_md5: Option<&str>,
     expected_size: Option<u64>,
+    rate_limit: Option<u64>,
 ) -> Result<DownloadOutcome> {
     // Setup I/O problems (a locked or overly long path, a missing directory
     // that cannot be created) are per-file failures, not batch aborts.
@@ -433,6 +439,7 @@ async fn run_download_attempts(
             cookie_header,
             expected_size,
             backoff_delay,
+            rate_limit,
         )
         .await
         {
@@ -506,6 +513,9 @@ async fn run_download_attempts(
 /// Files are numbered starting at `file_number_start` (1-based) out of
 /// `total_files`, so files handled before the batch (for example the
 /// locally saved `_files.xml` as file #1) can be counted into the numbering.
+///
+/// `rate_limit` (bytes/second, from `--limit-rate`) throttles the transfer
+/// when `Some(_ > 0)`; `None` or `Some(0)` leaves the connection unlimited.
 pub async fn download_files(
     client: &Client,
     files: Vec<DownloadTask>,
@@ -513,6 +523,7 @@ pub async fn download_files(
     file_number_start: usize,
     cookie_header: Option<&HeaderValue>,
     stop_on_error: bool,
+    rate_limit: Option<u64>,
 ) -> Result<()> {
     // Set up signal handling for the entire download session
     let running = setup_signal_handler();
@@ -524,6 +535,7 @@ pub async fn download_files(
         file_number_start,
         cookie_header,
         stop_on_error,
+        rate_limit,
         &running,
     )
     .await
@@ -536,6 +548,7 @@ pub async fn download_files(
 ///
 /// `file_number_start` is the 1-based number assigned to the first file of
 /// the batch.
+#[allow(clippy::too_many_arguments)]
 async fn download_files_with_signal(
     client: &Client,
     tasks: Vec<DownloadTask>,
@@ -543,6 +556,7 @@ async fn download_files_with_signal(
     file_number_start: usize,
     cookie_header: Option<&HeaderValue>,
     stop_on_error: bool,
+    rate_limit: Option<u64>,
     running: &Arc<AtomicBool>,
 ) -> Result<()> {
     let mut failed_files: Vec<(String, String)> = Vec::new();
@@ -563,6 +577,7 @@ async fn download_files_with_signal(
             total_files,
             running,
             cookie_header,
+            rate_limit,
         )
         .await?;
 
@@ -639,6 +654,7 @@ mod tests {
             1,
             None,
             stop_on_error,
+            None,
             &test_running(),
         )
         .await
@@ -736,6 +752,7 @@ mod tests {
             1,
             None,
             false,
+            None,
             &test_running(),
         )
         .await
@@ -1116,6 +1133,7 @@ mod tests {
             None,
             Some(&md5),
             Some(full.len() as u64),
+            None,
         )
         .await
         .expect("a complete .part must verify in place");
@@ -1152,6 +1170,7 @@ mod tests {
             None,
             Some(&md5),
             Some(fresh.len() as u64),
+            None,
         )
         .await
         .expect("the re-download must succeed");
@@ -1172,10 +1191,18 @@ mod tests {
         let (_server, _dir, files, _) = missing_and_ok_batch("interrupt_between_files");
         let stopped = Arc::new(AtomicBool::new(false));
         let total = files.len();
-        let err =
-            download_files_with_signal(&Client::new(), files, total, 1, None, false, &stopped)
-                .await
-                .unwrap_err();
+        let err = download_files_with_signal(
+            &Client::new(),
+            files,
+            total,
+            1,
+            None,
+            false,
+            None,
+            &stopped,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, IaGetError::Interrupted),
             "an interrupted batch must fail, got {err:?}"

@@ -13,15 +13,18 @@ use ia_get::archive_metadata::{
 };
 use ia_get::cookie::cookie_header_value;
 use ia_get::display::{
-    create_spinner, finish_spinner, last_glyph, print_downloaded_line, print_file_banner,
+    create_spinner, finish_spinner, format_size, last_glyph, print_downloaded_line,
+    print_file_banner,
 };
-use ia_get::downloader;
+use ia_get::downloader::{self, DownloadTask, parse_rate};
 use ia_get::error::io_error_with_path;
 use ia_get::file_filter::FileFilter;
-use ia_get::plan::{join_output_dir, plan_download_tasks, select_files};
+use ia_get::fs::available_space;
+use ia_get::plan::{join_output_dir, plan_download_tasks, required_download_space, select_files};
+use ia_get::verbose;
 use ia_get::{IaGetError, Result};
 use indicatif::ProgressBar;
-use reqwest::{Client, Url};
+use reqwest::{Client, Proxy, Url};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -55,15 +58,105 @@ const XML_FILE_NUMBER: usize = 1;
 /// HTTP client for the download session: a bounded connection timeout,
 /// plus a per-read idle timeout that resets after each successful read, so
 /// a stalled mid-transfer becomes a retryable error instead of a hang.
-fn build_client() -> Result<Client> {
-    Ok(Client::builder()
+///
+/// `proxy`, when present, routes every request through it.
+fn build_client(proxy: Option<&Proxy>) -> Result<Client> {
+    let mut builder = Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(CONNECTION_TIMEOUT_SECS))
         .read_timeout(Duration::from_secs(READ_TIMEOUT_SECS))
         .pool_idle_timeout(Duration::from_secs(POOL_IDLE_TIMEOUT_SECS))
         .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
-        .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_SECS))
-        .build()?)
+        .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_SECS));
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy.clone());
+    }
+    Ok(builder.build()?)
+}
+
+/// Resolves the proxy the session should use: an explicit `--proxy` value
+/// always wins, otherwise the `HTTPS_PROXY` (or `https_proxy`) environment
+/// variable is used. A bare `host:port` is treated as an `http://` proxy.
+fn resolve_proxy(cli: Option<&str>) -> Result<Option<Proxy>> {
+    let value = match cli {
+        Some(explicit) if !explicit.trim().is_empty() => Some(explicit.to_string()),
+        _ => std::env::var("HTTPS_PROXY")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                std::env::var("https_proxy")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            }),
+    };
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+
+    let url = if raw.contains("://") {
+        raw.clone()
+    } else {
+        format!("http://{raw}")
+    };
+    let proxy = Proxy::all(&url)
+        .map_err(|e| IaGetError::InvalidProxy(format!("cannot use proxy {raw:?}: {e}")))?;
+    verbose::log(&format!("proxy: {url}"));
+    Ok(Some(proxy))
+}
+
+/// Parses the `--limit-rate` value into bytes/second, or `None` when the
+/// flag was not given (unlimited). `0` is kept as `Some(0)`, which the
+/// rate limiter treats as "no limit".
+fn parse_rate_limit(input: Option<&str>) -> Result<Option<u64>> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+    let bytes = parse_rate(input)?;
+    if bytes > 0 {
+        verbose::log(&format!(
+            "rate limit: {bytes} bytes/s (~{}/s)",
+            format_size(bytes)
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+/// Fails the run before downloading anything when the plan cannot fit on the
+/// target volume.
+///
+/// `required_download_space` is a lower bound (files with unknown sizes are
+/// excluded, files already present at their expected size are not counted),
+/// so this is a "will it clearly not fit" guard, not a hard guarantee. The
+/// check is skipped — never fatal — when the free space cannot be read.
+fn check_disk_space(output_dir: &str, tasks: &[DownloadTask]) -> Result<()> {
+    let required = required_download_space(tasks);
+    if required == 0 {
+        return Ok(());
+    }
+    // The output directory exists by the time this runs (ensure_output_dir
+    // already created it); "" means the current directory.
+    let probe = if output_dir.is_empty() {
+        Path::new(".")
+    } else {
+        Path::new(output_dir)
+    };
+    let Some(available) = available_space(probe) else {
+        return Ok(());
+    };
+    verbose::log(&format!(
+        "disk space in {}: need ~{}, {} free",
+        probe.display(),
+        format_size(required),
+        format_size(available)
+    ));
+    if available < required {
+        return Err(IaGetError::InsufficientDiskSpace {
+            required: format_size(required),
+            available: format_size(available),
+            path: probe.display().to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Finishes `spinner` with a red ✘ and the error's message when it is still
@@ -200,6 +293,18 @@ struct Cli {
     /// Stop at the first failed file instead of continuing with the rest
     #[arg(long)]
     stop_on_error: bool,
+    /// Cap the download throughput in bytes/second, e.g. "1M", "512K" or a
+    /// plain number; unlimited when omitted (0 disables the cap)
+    #[arg(long, value_name = "RATE")]
+    limit_rate: Option<String>,
+    /// Proxy to route requests through, e.g. "http://127.0.0.1:3128"; falls
+    /// back to the HTTPS_PROXY (or https_proxy) environment variable
+    #[arg(long, value_name = "URL")]
+    proxy: Option<String>,
+    /// Enable diagnostic logging to stderr: request URLs, HTTP status codes
+    /// and the session settings (proxy, rate limit, disk space)
+    #[arg(long)]
+    verbose: bool,
 }
 
 /// Main application entry point
@@ -212,6 +317,7 @@ struct Cli {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    verbose::set_enabled(cli.verbose);
     if run(&cli).await.is_err() {
         // The failure was already printed by run's spinner; just exit
         // non-zero so a shell or wrapping script sees it.
@@ -229,7 +335,12 @@ async fn run(cli: &Cli) -> Result<()> {
     // Start a single spinner for the entire initialization process
     let spinner = create_spinner(&format!("Processing archive.org URL: {}", cli.url.bold()));
 
-    let client = init_step(&spinner, build_client())?;
+    // Session settings are resolved up front so a bad --proxy or
+    // --limit-rate fails before any network work, and build the client
+    // against the resolved proxy.
+    let proxy = init_step(&spinner, resolve_proxy(cli.proxy.as_deref()))?;
+    let rate_limit = init_step(&spinner, parse_rate_limit(cli.limit_rate.as_deref()))?;
+    let client = init_step(&spinner, build_client(proxy.as_ref()))?;
 
     // Parse the URL into its target: the item identifier plus, for a URL
     // with a file path, the single file it names
@@ -313,6 +424,10 @@ async fn run(cli: &Cli) -> Result<()> {
         plan_download_tasks(candidates, &base_url, &output_dir, &target),
     )?;
 
+    // Fail fast if the plan clearly cannot fit on the target volume, before
+    // any bytes cross the network (and before the metadata is saved).
+    init_step(&spinner, check_disk_space(&output_dir, &plan.tasks))?;
+
     let total_files = plan.tasks.len() + usize::from(whole_item);
 
     // Persist the freshly fetched _files.xml (overwriting any previous copy)
@@ -378,6 +493,7 @@ async fn run(cli: &Cli) -> Result<()> {
         first_file_number,
         cookie_header.as_ref(),
         cli.stop_on_error,
+        rate_limit,
     )
     .await?;
 
@@ -410,5 +526,45 @@ mod tests {
                 "{arg:?} must be an InvalidOutputDir error"
             );
         }
+    }
+
+    #[test]
+    fn resolve_proxy_uses_the_explicit_value() {
+        // An explicit http:// URL passes through and yields a proxy.
+        assert!(
+            resolve_proxy(Some("http://127.0.0.1:3128"))
+                .unwrap()
+                .is_some()
+        );
+        // A bare host:port is treated as an http proxy.
+        assert!(resolve_proxy(Some("127.0.0.1:3128")).unwrap().is_some());
+        // An unparseable proxy is a clean error, not a panic.
+        assert!(matches!(
+            resolve_proxy(Some("http://")).unwrap_err(),
+            IaGetError::InvalidProxy(_)
+        ));
+    }
+
+    #[test]
+    fn parse_rate_limit_maps_the_flag_to_bytes() {
+        assert_eq!(parse_rate_limit(None).unwrap(), None);
+        assert_eq!(parse_rate_limit(Some("1M")).unwrap(), Some(1024 * 1024));
+        // 0 is kept as Some(0): the limiter treats it as "no limit".
+        assert_eq!(parse_rate_limit(Some("0")).unwrap(), Some(0));
+        assert!(parse_rate_limit(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn check_disk_space_skips_when_nothing_is_needed() {
+        // A file with an unknown size needs 0 bytes, so the check passes no
+        // matter how little space is left.
+        let task = DownloadTask {
+            url: "https://archive.org/download/item/file.bin".into(),
+            file_path: "ia-get-disk-space-never-created.bin".into(),
+            expected_md5: None,
+            expected_size: None,
+            expected_mtime: None,
+        };
+        assert!(check_disk_space("", &[task]).is_ok());
     }
 }

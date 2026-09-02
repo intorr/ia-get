@@ -16,8 +16,10 @@ use crate::Result;
 use crate::cookie::with_cookie;
 use crate::display::{branch_glyph, create_progress_bar, last_glyph, print_downloaded_line};
 use crate::downloader::mtime::parse_last_modified;
+use crate::downloader::rate::RateLimiter;
 use crate::downloader::retry::{INTERRUPT_CHECK_INTERVAL, RetryTracker, parse_retry_after};
 use crate::error::IaGetError;
+use crate::verbose;
 
 /// Resolves once the batch has been asked to stop, so a stalled body read
 /// can be aborted at the next check instead of waiting for the next chunk
@@ -42,6 +44,7 @@ async fn stream_response_body(
     base_size: u64,
     pb: &ProgressBar,
     running: &Arc<AtomicBool>,
+    rate: &mut RateLimiter,
 ) -> Result<u64> {
     let mut downloaded_bytes: u64 = 0;
 
@@ -50,8 +53,12 @@ async fn stream_response_body(
             chunk = response.chunk() => match chunk {
                 Ok(Some(chunk)) => {
                     file.write_all(&chunk)?;
-                    downloaded_bytes += chunk.len() as u64;
+                    let chunk_len = chunk.len() as u64;
+                    downloaded_bytes += chunk_len;
                     pb.set_position(base_size + downloaded_bytes);
+                    // Pace the transfer to the configured rate, if any, so a
+                    // limited download does not saturate the connection.
+                    rate.pace(chunk_len).await;
                 }
                 Ok(None) => break,
                 Err(e) => return Err(e.into()),
@@ -239,6 +246,10 @@ fn assess_streamed_body(
 ///
 /// Returns, when the server sent one on the final successful response, the
 /// parsed `Last-Modified` header value.
+///
+/// `rate_limit` (bytes/second, from `--limit-rate`) throttles the streamed
+/// body when `Some(_ > 0)`; `None` or `Some(0)` leaves it unlimited.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_file_content(
     client: &Client,
     url: &str,
@@ -247,8 +258,10 @@ pub(crate) async fn download_file_content(
     cookie_header: Option<&HeaderValue>,
     expected_size: Option<u64>,
     retry_delay: fn(u32) -> Duration,
+    rate_limit: Option<u64>,
 ) -> Result<Option<SystemTime>> {
     let mut retry = RetryTracker::new(retry_delay);
+    let mut rate = RateLimiter::new(rate_limit);
 
     loop {
         // Re-check file size at start of each attempt (in case of retry)
@@ -256,10 +269,16 @@ pub(crate) async fn download_file_content(
         let resuming = current_file_size > 0;
         let mut download_action = download_action_label(resuming);
 
+        verbose::log(&match resuming {
+            true => format!("GET {url} (Range: bytes={current_file_size}-)"),
+            false => format!("GET {url}"),
+        });
+
         let request = resume_request(client, url, cookie_header, current_file_size)?;
         let mut response = match request.send().await {
             Ok(response) => response,
             Err(e) => {
+                verbose::log(&format!("  connection error: {e}"));
                 // Request failed before we even got a response
                 retry
                     .record("Connection error", &e.to_string(), None, running)
@@ -269,6 +288,7 @@ pub(crate) async fn download_file_content(
         };
 
         let status = response.status();
+        verbose::log(&format!("  -> HTTP {status}"));
         let retry_after = response
             .headers()
             .get(RETRY_AFTER)
@@ -308,7 +328,7 @@ pub(crate) async fn download_file_content(
         pb.set_position(base_size);
 
         let start_time = Instant::now();
-        match stream_response_body(&mut response, file, base_size, &pb, running).await {
+        match stream_response_body(&mut response, file, base_size, &pb, running, &mut rate).await {
             Ok(downloaded_bytes) => {
                 match assess_streamed_body(downloaded_bytes, base_size, expected_size) {
                     StreamedBody::Complete => {

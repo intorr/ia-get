@@ -42,13 +42,15 @@ src/
 ├── cookie.rs            # Cookie header from raw string or Netscape cookies.txt, and applying it to requests
 ├── display.rs           # Terminal output (spinner, progress bars, banners, status lines, size/duration formatting)
 ├── filename.rs          # Filename sanitization for cross-platform filesystems
-├── fs.rs                # Filesystem write-safety: refuse to write through pre-planted symlinks
+├── fs.rs                # Filesystem write-safety: refuse to write through pre-planted symlinks; free-space lookup (fs2)
 ├── error.rs             # Custom error types (thiserror)
+├── verbose.rs           # Opt-in --verbose diagnostic logging, gated to stderr
 ├── test_support.rs      # Shared test helpers (scripted local HTTP mock server, TempDir, download fixtures)
 └── downloader/
     ├── mod.rs           # Batch orchestration: DownloadTask, .part lifecycle, per-file pipeline
     ├── stream.rs        # Streaming HTTP body to file, Range/resume, retry decisions
     ├── retry.rs         # Exponential backoff + jitter, RetryTracker, Retry-After
+    ├── rate.rs          # --limit-rate throughput pacing (RateLimiter) and rate parsing
     ├── verify.rs        # Size + MD5 verification, ExistingFileStatus
     ├── signal.rs        # Ctrl+C handler (graceful stop, then hard exit)
     └── mtime.rs         # Last-Modified / <mtime> parsing and filetime sync

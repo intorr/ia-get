@@ -66,6 +66,33 @@ Archive.org's edge servers occasionally return error pages, empty responses, or 
 ia-get --stop-on-error https://archive.org/details/<identifier>
 ```
 
+## Session options 🧰
+
+A few flags shape how a download behaves on your network and disk. None of them change what gets downloaded — only how.
+
+**Disk-space pre-check.** Before any bytes cross the network, `ia-get` adds up the size of the files that still need downloading (files already present at their expected size are skipped, and a leftover `<name>.part` only counts its missing remainder). If the target volume clearly cannot hold them, the run stops immediately with a `Not enough disk space` error rather than failing mid-transfer. Files whose size the metadata does not report are not counted, so the check is a lower-bound guard, not a hard guarantee.
+
+**`--limit-rate`.** Cap the throughput to be polite on a metered or shared connection. The value is bytes/second, with an optional `K`/`M`/`G` suffix (case-insensitive, `B` allowed):
+
+```shell
+ia-get --limit-rate 1M https://archive.org/details/<identifier>   # ~1 MiB/s
+ia-get --limit-rate 512K https://archive.org/details/<identifier>
+```
+
+Unlimited when omitted. `--limit-rate 0` also disables the cap.
+
+**`--proxy`.** Route requests through a proxy. A bare `host:port` is treated as an `http://` proxy. When the flag is omitted, `ia-get` falls back to the `HTTPS_PROXY` (or `https_proxy`) environment variable:
+
+```shell
+ia-get --proxy http://127.0.0.1:3128 https://archive.org/details/<identifier>
+```
+
+**`--verbose`.** Log diagnostics to `stderr` — the resolved proxy and rate limit, the free-space figures, each request URL and HTTP status code. The normal progress output still goes to `stdout`, so the two can be captured separately:
+
+```shell
+ia-get --verbose https://archive.org/details/<identifier> 2> ia-get.log
+```
+
 ## Why? 🤔💭
 
 I wanted to download high-quality scans of [ZZap!64 magazine](https://en.wikipedia.org/wiki/Zzap!64) and some read-only memory from archive.org.
@@ -89,6 +116,10 @@ So I co-authored `ia-get` to automate the download process.
 - 🔑 Supports private items via `--cookies` (a raw header or a Netscape `cookies.txt`)
 - 📄 `--list` previews the files and sizes without downloading
 - 📊 Saves the archive's own `<id>_files.xml` locally alongside the files
+- 💾 Fails fast when the target volume clearly lacks the space for the planned download
+- 🐌 `--limit-rate` caps the download throughput (e.g. `1M`, `512K`); unlimited by default
+- 🌐 `--proxy` routes requests through a proxy, falling back to the `HTTPS_PROXY` env var
+- 🔎 `--verbose` logs request URLs and HTTP status codes to stderr for diagnosis
 - 📦️ Available for **Linux** 🐧 **macOS** 🍏 and **Windows** 🪟
 
 ### Sharing is caring 🤝
