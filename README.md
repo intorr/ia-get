@@ -19,6 +19,24 @@ Simply pass the URL of an [archive.org](https://archive.org) details page you wa
 ia-get https://archive.org/details/<identifier>
 ```
 
+To download a single file, pass a download URL that names it. The path is percent-decoded and matched against the archive's metadata; its parent directories are recreated locally. If the item does not contain the file, `ia-get` fails without downloading anything.
+
+```shell
+ia-get https://archive.org/download/<identifier>/<path/to/file.ext>
+```
+
+Narrow a whole-item download with `--include` and `--exclude` — repeatable globs matched against the archive's original file names, before sanitization. `*` matches any run of characters, across `/` separators, and `?` matches one character. With no `--include`, every file is a candidate; the `--exclude` patterns then remove from it. A run whose filters keep nothing fails without downloading anything.
+
+```shell
+ia-get --include "*.pdf" --exclude "*draft*" https://archive.org/details/<identifier>
+```
+
+Write the files somewhere else than the current directory with `-o`/`--output-dir`; the directory (and any missing parents) is created if needed. In a whole-item download the saved `<id>_files.xml` lands in the same directory as the files.
+
+```shell
+ia-get -o ia-get-<identifier> https://archive.org/details/<identifier>
+```
+
 Pass cookies for archive.org items that require a logged-in session.
 `--cookies`/`-b` accepts either a raw Cookie header string or a Netscape `cookies.txt` file exported from your browser.
 
@@ -59,6 +77,8 @@ So I co-authored `ia-get` to automate the download process.
 ### Features ✨
 
 - 🔽 Reliably downloads files from the Internet Archive
+- 🎯 Downloads a single file via a download URL, or narrows a whole-item download with `--include`/`--exclude` globs
+- 📂 `-o`/`--output-dir` writes the files into a target directory (created if missing)
 - 🌳 Preserves the archive's directory structure
 - 🔄 Resumes interrupted downloads from `<name>.part` files
 - 🔏 Verifies size and MD5 hash before installing a file

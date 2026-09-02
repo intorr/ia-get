@@ -9,14 +9,16 @@ use clap::Parser;
 use colored::*;
 use ia_get::archive_metadata::{
     XmlFiles, XmlMetadata, fetch_and_parse_xml, get_xml_url, list_file_rows, list_summary,
-    save_xml_metadata, validate_archive_url, xml_file_name_of,
+    parse_archive_url, save_xml_metadata, xml_file_name_of,
 };
 use ia_get::cookie::cookie_header_value;
 use ia_get::display::{
     create_spinner, finish_spinner, last_glyph, print_downloaded_line, print_file_banner,
 };
 use ia_get::downloader;
-use ia_get::plan::{files_to_download, plan_download_tasks};
+use ia_get::error::io_error_with_path;
+use ia_get::file_filter::FileFilter;
+use ia_get::plan::{join_output_dir, plan_download_tasks, select_files};
 use ia_get::{IaGetError, Result};
 use indicatif::ProgressBar;
 use reqwest::{Client, Url};
@@ -96,19 +98,46 @@ fn init_step<T>(spinner: &ProgressBar, step: Result<T>) -> Result<T> {
 /// the planned tasks plus this saved copy.
 fn save_and_announce_xml(
     base_url: &Url,
+    output_dir: &str,
     content: &str,
     last_modified: Option<SystemTime>,
     total_files: usize,
 ) -> Result<()> {
-    let xml_file_name = xml_file_name_of(base_url);
-    save_xml_metadata(Path::new(xml_file_name), content, last_modified)?;
+    let xml_path = join_output_dir(output_dir, xml_file_name_of(base_url));
+    save_xml_metadata(Path::new(&xml_path), content, last_modified)?;
 
     println!(" ");
-    print_file_banner(xml_file_name, XML_FILE_NUMBER, total_files);
+    print_file_banner(&xml_path, XML_FILE_NUMBER, total_files);
     // The file never crossed the network, so its line carries no time/rate
     print_downloaded_line(last_glyph(), content.len() as u64, None);
 
     Ok(())
+}
+
+/// Normalizes the `-o` argument into the bare directory the files land in:
+/// "" for the current directory, trailing separators trimmed away (only
+/// trailing: a leading separator still means "root of the filesystem").
+/// A path that is nothing but separators (or empty) names no directory.
+fn normalize_output_dir(arg: Option<&str>) -> Result<String> {
+    let Some(dir) = arg else {
+        return Ok(String::new());
+    };
+    let trimmed = dir.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return Err(IaGetError::InvalidOutputDir(dir.to_string()));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Creates the `-o` directory (with its parents) so the metadata save and
+/// the downloads can write into it; "" means the current directory, which
+/// already exists. The directory is user-chosen, so following a symlink the
+/// user pointed at is their intent, not a pre-planted one.
+fn ensure_output_dir(output_dir: &str) -> Result<()> {
+    if output_dir.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(output_dir).map_err(|e| io_error_with_path(output_dir, e))
 }
 
 /// Lists parsed filenames from XML metadata when --list/-l is used
@@ -151,14 +180,23 @@ fn list_files(files: &XmlFiles, spinner: &ProgressBar, xml_file_name: &str) {
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(author = env!("CARGO_PKG_AUTHORS"))]
 struct Cli {
-    /// URL to an archive.org details page
+    /// archive.org URL: a details page (whole item) or a download URL naming a single file
     url: String,
-    /// List files parsed from archive metadata XML and exit
+    /// List files parsed from archive metadata XML and exit; lists the whole item even for a single-file URL
     #[arg(short = 'l', long = "list")]
     list: bool,
     /// Cookie header or Netscape cookies.txt file for authenticated downloads
     #[arg(short = 'b', long = "cookies", value_name = "COOKIES")]
     cookies: Option<String>,
+    /// Directory the files are written into, created if missing (default: the current directory)
+    #[arg(short = 'o', long = "output-dir", value_name = "DIR")]
+    output_dir: Option<String>,
+    /// Only download files whose name matches this glob; repeatable. '*' matches any run of characters across '/', '?' one character. With no --include, every file is a candidate
+    #[arg(long, value_name = "PATTERN")]
+    include: Vec<String>,
+    /// Skip files whose name matches this glob; repeatable. Patterns match the archive's original names, before sanitization
+    #[arg(long, value_name = "PATTERN")]
+    exclude: Vec<String>,
     /// Stop at the first failed file instead of continuing with the rest
     #[arg(long)]
     stop_on_error: bool,
@@ -193,14 +231,15 @@ async fn run(cli: &Cli) -> Result<()> {
 
     let client = init_step(&spinner, build_client())?;
 
-    // Validate URL format using consolidated function
-    init_step(&spinner, validate_archive_url(&cli.url))?;
+    // Parse the URL into its target: the item identifier plus, for a URL
+    // with a file path, the single file it names
+    let target = init_step(&spinner, parse_archive_url(&cli.url))?;
 
     // The cookie header is computed once against the download URL — the
     // scope every metadata and file request uses — and reused for the
     // metadata fetch and the file downloads, so a path-scoped cookie
     // applies consistently across the run.
-    let xml_url = init_step(&spinner, get_xml_url(&cli.url))?;
+    let xml_url = init_step(&spinner, get_xml_url(&target.identifier))?;
     let cookie_header = init_step(
         &spinner,
         cookie_header_value(cli.cookies.as_deref(), &xml_url),
@@ -227,10 +266,42 @@ async fn run(cli: &Cli) -> Result<()> {
     )?;
 
     // If requested, list parsed filenames and exit: a read-only preview,
-    // nothing is written to the working directory
+    // nothing is written to the working directory (the whole item, even
+    // for a single-file URL)
     if cli.list {
         list_files(&files, &spinner, xml_file_name_of(&base_url));
         return Ok(());
+    }
+
+    // A whole-item run saves the freshly fetched _files.xml as file #1;
+    // a single-file run never does and numbers its one file as #1.
+    let whole_item = target.file_path.is_none();
+
+    // Where the files land: the current directory by default, or the -o
+    // directory (created if missing) when one was given.
+    let output_dir = init_step(&spinner, normalize_output_dir(cli.output_dir.as_deref()))?;
+    init_step(&spinner, ensure_output_dir(&output_dir))?;
+
+    // Narrow the archive's entries to this run's candidates: the URL's
+    // selection first, then the name filters — so excluded files never
+    // take part in collision detection either.
+    let filter = FileFilter::new(cli.include.clone(), cli.exclude.clone());
+    let xml_file_name = xml_file_name_of(&base_url);
+    let selected = init_step(&spinner, select_files(files.files, xml_file_name, &target))?;
+    let selected_total = selected.len();
+    let candidates = selected
+        .into_iter()
+        .filter(|file| filter.matches(&file.name))
+        .collect::<Vec<_>>();
+    let filtered_out = selected_total - candidates.len();
+
+    if candidates.is_empty() {
+        return init_step(
+            &spinner,
+            Err(IaGetError::NoFilesSelected {
+                identifier: target.identifier.clone(),
+            }),
+        );
     }
 
     // Convert the metadata into the download plan before anything is
@@ -239,22 +310,20 @@ async fn run(cli: &Cli) -> Result<()> {
     // never appear in the numbering).
     let plan = init_step(
         &spinner,
-        plan_download_tasks(
-            files_to_download(files.files, xml_file_name_of(&base_url)),
-            &base_url,
-        ),
+        plan_download_tasks(candidates, &base_url, &output_dir, &target),
     )?;
 
-    // The saved _files.xml occupies file #1; the planned tasks follow
-    // right after it.
-    let total_files = plan.tasks.len() + 1;
+    let total_files = plan.tasks.len() + usize::from(whole_item);
 
     // Persist the freshly fetched _files.xml (overwriting any previous copy)
-    // with the server's Last-Modified time, and announce it as file #1
-    init_step(
-        &spinner,
-        save_and_announce_xml(&base_url, &content, last_modified, total_files),
-    )?;
+    // with the server's Last-Modified time, and announce it as file #1 —
+    // whole-item runs only.
+    if whole_item {
+        init_step(
+            &spinner,
+            save_and_announce_xml(&base_url, &output_dir, &content, last_modified, total_files),
+        )?;
+    }
 
     // Successfully finished initialization; separate the banner from the
     // saved-metadata block above.
@@ -287,17 +356,59 @@ async fn run(cli: &Cli) -> Result<()> {
         );
     }
 
+    // A summary of what the name filters kept out, like the sanitized one
+    if !filter.is_empty() && filtered_out > 0 {
+        println!(
+            "\n{} {} {} of {} files by --include/--exclude",
+            "ⓘ".blue().bold(),
+            "Filtered out".bold(),
+            filtered_out.to_string().bold(),
+            selected_total
+        );
+    }
+
     // Download all files with integrated signal handling; numbering starts
-    // right after the _files.xml saved above.
+    // right after the _files.xml saved above (or at 1 in a single-file run,
+    // which never saves it).
+    let first_file_number = if whole_item { XML_FILE_NUMBER + 1 } else { 1 };
     downloader::download_files(
         &client,
         plan.tasks,
         total_files,
-        XML_FILE_NUMBER + 1,
+        first_file_number,
         cookie_header.as_ref(),
         cli.stop_on_error,
     )
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_output_dir_trims_trailing_separators() {
+        assert_eq!(normalize_output_dir(None).unwrap(), "");
+        assert_eq!(normalize_output_dir(Some("out")).unwrap(), "out");
+        assert_eq!(normalize_output_dir(Some("out/")).unwrap(), "out");
+        assert_eq!(normalize_output_dir(Some("out/sub\\")).unwrap(), "out/sub");
+        assert_eq!(normalize_output_dir(Some("out/sub/")).unwrap(), "out/sub");
+        // A leading separator is kept: it names a root-level directory
+        assert_eq!(normalize_output_dir(Some("/out/")).unwrap(), "/out");
+    }
+
+    #[test]
+    fn normalize_output_dir_rejects_paths_that_name_no_directory() {
+        for arg in ["", "/", "\\", "///"] {
+            assert!(
+                matches!(
+                    normalize_output_dir(Some(arg)),
+                    Err(IaGetError::InvalidOutputDir(_))
+                ),
+                "{arg:?} must be an InvalidOutputDir error"
+            );
+        }
+    }
 }

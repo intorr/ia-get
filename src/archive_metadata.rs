@@ -16,12 +16,28 @@ use std::time::{Duration, SystemTime};
 /// Maximum length for XML content in debug output (characters)
 const XML_DEBUG_TRUNCATE_LEN: usize = 1000;
 
-/// Regex pattern for validating archive.org details URLs
-const URL_PATTERN: &str = r"^https://archive\.org/details/[a-zA-Z0-9_\-.@]+/?$";
+/// Regex pattern for accepted archive.org URLs: a details page (whole
+/// item) or a download URL optionally naming a single file inside the
+/// item. Group 1 is the identifier; group 2 (optional) is the raw, still
+/// percent-encoded file path.
+const URL_PATTERN: &str =
+    r"^https://archive\.org/(?:details|download)/([a-zA-Z0-9_\-.@]+)(?:/(.+))?/?$";
 
 /// Compiled regex for URL validation (initialized once)
 static URL_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(URL_PATTERN).expect("Invalid URL regex pattern"));
+
+/// What an accepted archive.org URL points at: a whole item — a details
+/// page, or a download URL with no file path — or a single file inside
+/// an item, named by a download URL with a path after the identifier.
+#[derive(Debug, Clone)]
+pub struct ArchiveTarget {
+    /// The archive.org item identifier
+    pub identifier: String,
+    /// The file's path inside the item (percent-decoded) for a
+    /// single-file URL; `None` for a whole-item URL.
+    pub file_path: Option<String>,
+}
 
 /// Root structure for parsing the XML files list from archive.org
 /// The actual XML structure has a `files` root element containing multiple `file` elements
@@ -216,58 +232,97 @@ pub async fn is_url_accessible(
     Ok(())
 }
 
-/// Validates an archive.org details URL format
+/// Parses an accepted archive.org URL into its target: the item
+/// identifier plus, for a URL with a file path, the single file it names
+/// (percent-decoded, leading and trailing separators trimmed away).
+///
+/// Accepts `https://archive.org/details/<identifier>` (a whole item) and
+/// `https://archive.org/download/<identifier>/<file>` (one file); a
+/// details URL with a path after the identifier is read the same way as a
+/// download one.
 ///
 /// # Arguments
-/// * `url` - The URL to validate
+/// * `url` - The URL to parse
 ///
 /// # Returns
-/// * `Ok(())` if the URL is valid
+/// * `Ok(ArchiveTarget)` if the URL is valid
 /// * `Err(IaGetError::UrlFormat)` if the URL format is invalid
 ///
 /// # Examples
 /// ```
-/// use ia_get::archive_metadata::validate_archive_url;
+/// use ia_get::archive_metadata::parse_archive_url;
 ///
-/// assert!(validate_archive_url("https://archive.org/details/valid-item").is_ok());
-/// assert!(validate_archive_url("https://archive.org/details/valid-item/").is_ok());
-/// assert!(validate_archive_url("https://example.com/invalid").is_err());
+/// let target = parse_archive_url("https://archive.org/details/valid-item")
+///     .expect("a details URL");
+/// assert_eq!(target.identifier, "valid-item");
+/// assert!(target.file_path.is_none());
+///
+/// let target = parse_archive_url("https://archive.org/download/valid-item/scan/01%20.pdf")
+///     .expect("a download URL");
+/// assert_eq!(target.file_path.as_deref(), Some("scan/01 .pdf"));
+///
+/// assert!(parse_archive_url("https://example.com/invalid").is_err());
 /// ```
-pub fn validate_archive_url(url: &str) -> Result<()> {
-    // The anchored pattern already requires a non-empty identifier right
-    // after "details/" and nothing after it.
-    if URL_REGEX.is_match(url) {
-        return Ok(());
-    }
-    Err(IaGetError::UrlFormat(url.to_string()))
+pub fn parse_archive_url(url: &str) -> Result<ArchiveTarget> {
+    let Some(caps) = URL_REGEX.captures(url) else {
+        return Err(IaGetError::UrlFormat(url.to_string()));
+    };
+
+    let identifier = caps[1].to_string();
+    let file_path = match caps.get(2) {
+        None => None,
+        Some(raw) => {
+            // A path that decodes to nothing readable names no file
+            let Some(decoded) = percent_decode(raw.as_str()) else {
+                return Err(IaGetError::UrlFormat(url.to_string()));
+            };
+            // Leading and trailing separators do not belong to a file name
+            let path = decoded.trim_matches('/');
+            if path.is_empty() {
+                return Err(IaGetError::UrlFormat(url.to_string()));
+            }
+            Some(path.to_string())
+        }
+    };
+
+    Ok(ArchiveTarget {
+        identifier,
+        file_path,
+    })
 }
 
-/// Converts a details URL to the corresponding XML files list URL
-///
-/// Takes an archive.org details URL and converts it to the XML metadata URL
-/// by replacing "details" with "download" and appending "_files.xml"
+/// Percent-decodes the raw file path a URL carries. An escape without two
+/// hex digits after the '%' (e.g. a lone '%') passes through literally;
+/// `None` is returned when the decoded bytes are not a valid UTF-8 name.
+fn percent_decode(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 3 <= bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&raw[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Builds the XML files-list URL for an item identifier:
+/// "https://archive.org/download/<identifier>/<identifier>_files.xml"
 ///
 /// # Arguments
-/// * `original_url` - The archive.org details URL
+/// * `identifier` - The archive.org item identifier (already validated by
+///   `parse_archive_url`)
 ///
 /// # Returns
 /// The corresponding XML files list URL
-pub fn get_xml_url(original_url: &str) -> Result<Url> {
-    // Remove trailing slash if present to get a consistent base for identifier extraction
-    let trimmed_url = original_url.trim_end_matches('/');
-
-    // The identifier is the last segment of the trimmed URL. The caller has
-    // validated the URL structure, but a segment-less input must fail here
-    // instead of building a malformed download URL.
-    let Some(identifier) = trimmed_url
-        .rsplit('/')
-        .next()
-        .filter(|segment| !segment.is_empty())
-    else {
-        return Err(IaGetError::UrlFormat(original_url.to_string()));
-    };
-
-    // The XML URL is "https://archive.org/download/{identifier}/{identifier}_files.xml"
+pub fn get_xml_url(identifier: &str) -> Result<Url> {
     Url::parse(&format!(
         "https://archive.org/download/{identifier}/{identifier}_files.xml"
     ))
@@ -612,55 +667,86 @@ mod tests {
     }
 
     #[test]
-    fn check_valid_pattern() {
-        assert!(validate_archive_url("https://archive.org/details/Valid-Pattern").is_ok());
-        assert!(validate_archive_url("https://archive.org/details/Valid-Pattern/").is_ok());
-        assert!(validate_archive_url("https://archive.org/details/test123").is_ok());
-        assert!(validate_archive_url("https://archive.org/details/test123/").is_ok());
-        assert!(validate_archive_url("https://archive.org/details/test_file-name.data").is_ok());
-        assert!(validate_archive_url("https://archive.org/details/test_file-name.data/").is_ok());
-        assert!(validate_archive_url("https://archive.org/details/user@domain").is_ok());
-        assert!(validate_archive_url("https://archive.org/details/user@domain/").is_ok());
+    fn parse_archive_url_reads_item_urls_without_a_file() {
+        for (url, identifier) in [
+            ("https://archive.org/details/Valid-Pattern", "Valid-Pattern"),
+            (
+                "https://archive.org/details/Valid-Pattern/",
+                "Valid-Pattern",
+            ),
+            ("https://archive.org/details/test123", "test123"),
+            ("https://archive.org/details/test123/", "test123"),
+            (
+                "https://archive.org/details/test_file-name.data",
+                "test_file-name.data",
+            ),
+            ("https://archive.org/details/user@domain", "user@domain"),
+            ("https://archive.org/download/item1", "item1"),
+            ("https://archive.org/download/item1/", "item1"),
+        ] {
+            let target = parse_archive_url(url).expect("{url} must parse");
+            assert_eq!(target.identifier, identifier, "{url}");
+            assert!(target.file_path.is_none(), "{url} must name no file");
+        }
     }
 
     #[test]
-    fn check_invalid_pattern() {
-        assert!(validate_archive_url("https://archive.org/details/Invalid-Pattern-*").is_err());
-        assert!(validate_archive_url("https://archive.org/details/").is_err());
-        assert!(validate_archive_url("https://example.com/details/test").is_err());
-        assert!(validate_archive_url("http://archive.org/details/test").is_err());
-        assert!(validate_archive_url("https://archive.org/details/test/extra").is_err());
-        assert!(validate_archive_url("https://archive.org/details/test//").is_err());
+    fn parse_archive_url_reads_the_file_path_from_urls_with_one() {
+        let target = parse_archive_url("https://archive.org/download/item1/scan/01.pdf")
+            .expect("a download URL with a file path");
+        assert_eq!(target.identifier, "item1");
+        assert_eq!(target.file_path.as_deref(), Some("scan/01.pdf"));
+
+        // A details URL with a path is read like a download one; a
+        // trailing separator names the same file
+        let target = parse_archive_url("https://archive.org/details/item1/scan/01.pdf/").unwrap();
+        assert_eq!(target.file_path.as_deref(), Some("scan/01.pdf"));
     }
 
     #[test]
-    fn get_xml_url_converts_details_url() {
+    fn parse_archive_url_percent_decodes_file_paths() {
+        // Spaces and URL-special characters arrive percent-encoded and
+        // must decode back to the archive's original names
+        let target =
+            parse_archive_url("https://archive.org/download/item1/Season%201/clip%231.mp4")
+                .unwrap();
+        assert_eq!(target.file_path.as_deref(), Some("Season 1/clip#1.mp4"));
+
+        // A literal '%' in a name is encoded as %25 and decodes to '%'
+        let target = parse_archive_url("https://archive.org/download/item1/100%25off.mp4").unwrap();
+        assert_eq!(target.file_path.as_deref(), Some("100%off.mp4"));
+
+        // An escape without two hex digits passes through literally
+        let target =
+            parse_archive_url("https://archive.org/download/item1/weird%name.bin").unwrap();
+        assert_eq!(target.file_path.as_deref(), Some("weird%name.bin"));
+    }
+
+    #[test]
+    fn parse_archive_url_rejects_invalid_urls() {
+        for url in [
+            "https://archive.org/details/",
+            "https://archive.org/details/Invalid-Pattern-*",
+            "https://example.com/details/test",
+            "http://archive.org/details/test",
+            "https://archive.org/details/test//",
+            "https://archive.org/download/item1/%ff",
+            "archive.org/details/test",
+        ] {
+            assert!(parse_archive_url(url).is_err(), "{url} must be rejected");
+        }
+    }
+
+    #[test]
+    fn get_xml_url_builds_the_files_list_url_from_the_identifier() {
         assert_eq!(
-            get_xml_url("https://archive.org/details/item1")
-                .unwrap()
-                .as_str(),
+            get_xml_url("item1").unwrap().as_str(),
             "https://archive.org/download/item1/item1_files.xml"
         );
         assert_eq!(
-            get_xml_url("https://archive.org/details/item1/")
-                .unwrap() // With trailing slash
-                .as_str(),
-            "https://archive.org/download/item1/item1_files.xml"
-        );
-        assert_eq!(
-            get_xml_url("https://archive.org/details/another-item_v2.0")
-                .unwrap()
-                .as_str(),
+            get_xml_url("another-item_v2.0").unwrap().as_str(),
             "https://archive.org/download/another-item_v2.0/another-item_v2.0_files.xml"
         );
-        assert_eq!(
-            get_xml_url("https://archive.org/details/another-item_v2.0/")
-                .unwrap() // With trailing slash
-                .as_str(),
-            "https://archive.org/download/another-item_v2.0/another-item_v2.0_files.xml"
-        );
-        // A segment-less input must fail instead of building a malformed URL
-        assert!(get_xml_url("").is_err());
     }
 
     #[test]

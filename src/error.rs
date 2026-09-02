@@ -28,9 +28,22 @@ pub enum IaGetError {
 
     /// URL format or parsing errors
     #[error(
-        "Invalid archive.org URL: {0}. Expected format: https://archive.org/details/<identifier>[/]"
+        "Invalid archive.org URL: {0}. Expected https://archive.org/details/<identifier> or https://archive.org/download/<identifier>/<file>"
     )]
     UrlFormat(String),
+
+    /// The URL named a file the archive's `_files.xml` metadata does not list
+    #[error("File not found in archive: {path} — item {identifier} does not contain it")]
+    FileNotFoundInArchive { identifier: String, path: String },
+
+    /// No file survived selection for the download: the item lists none,
+    /// or the `--include`/`--exclude` filters matched nothing
+    #[error("No files selected for download in {identifier}")]
+    NoFilesSelected { identifier: String },
+
+    /// The `-o`/`--output-dir` argument names no directory
+    #[error("Invalid output directory: {0} — the path must name a directory")]
+    InvalidOutputDir(String),
 
     /// XML parsing errors
     #[error("Failed to parse XML: {0}")]

@@ -1,7 +1,8 @@
 //! Converting parsed archive metadata into a concrete download plan:
-//! filtering out the archive's self-referencing `_files.xml` entry,
-//! building each file's absolute URL and sanitized local path, and
-//! detecting collisions that would cause one file to overwrite another.
+//! selecting the files a URL and the name filters target, building each
+//! file's absolute URL and sanitized local path (under the output
+//! directory, when one was given), and detecting collisions that would
+//! cause one file to overwrite another.
 
 use std::collections::HashMap;
 
@@ -9,8 +10,9 @@ use colored::*;
 use reqwest::Url;
 
 use crate::Result;
-use crate::archive_metadata::{XmlFile, encode_download_path, xml_file_name_of};
+use crate::archive_metadata::{ArchiveTarget, XmlFile, encode_download_path, xml_file_name_of};
 use crate::downloader::DownloadTask;
+use crate::error::IaGetError;
 use crate::filename::sanitize_filename;
 
 /// Filters out the archive's self-referencing `_files.xml` entry, whose
@@ -20,6 +22,41 @@ pub fn files_to_download(files: Vec<XmlFile>, xml_file_name: &str) -> Vec<XmlFil
         .into_iter()
         .filter(|file| file.name != xml_file_name)
         .collect()
+}
+
+/// Narrows the archive's file list to the candidates of one run: for a
+/// whole-item URL every file except the self-referencing `_files.xml`
+/// entry (kept out by [`files_to_download`]); for a single-file URL,
+/// exactly the entry the URL names, whatever it is.
+///
+/// A single-file URL naming a file the metadata does not list is an error,
+/// not an empty plan: the user asked for that file specifically.
+pub fn select_files(
+    files: Vec<XmlFile>,
+    xml_file_name: &str,
+    target: &ArchiveTarget,
+) -> Result<Vec<XmlFile>> {
+    if let Some(file_path) = target.file_path.as_deref() {
+        return files
+            .into_iter()
+            .find(|file| file.name == file_path)
+            .map(|file| vec![file])
+            .ok_or(IaGetError::FileNotFoundInArchive {
+                identifier: target.identifier.clone(),
+                path: file_path.to_string(),
+            });
+    }
+    Ok(files_to_download(files, xml_file_name))
+}
+
+/// Joins the output directory ("", "out", "out/sub") onto an
+/// archive-relative local path; with no directory the path is kept as is.
+pub fn join_output_dir(output_dir: &str, path: &str) -> String {
+    if output_dir.is_empty() {
+        path.to_string()
+    } else {
+        format!("{output_dir}/{path}")
+    }
 }
 
 /// Normalised key for local-path collision detection.
@@ -113,8 +150,13 @@ pub struct DownloadPlan {
 }
 
 /// Converts the parsed metadata into download tasks: builds each file's
-/// absolute URL and its sanitized local path, collecting a warning line
-/// for every rename, collision or skip.
+/// absolute URL and its sanitized local path (prefixed by `output_dir`
+/// when one was given), collecting a warning line for every rename,
+/// collision or skip.
+///
+/// A whole-item run reserves the locally saved `_files.xml` name, so an
+/// entry that sanitizes to it never overwrites the metadata; a
+/// single-file run reserves nothing.
 ///
 /// Entries whose name encodes to an empty URL path (an empty name, or
 /// slashes only) are skipped: joining `""` would resolve to the metadata
@@ -127,7 +169,12 @@ pub struct DownloadPlan {
 ///
 /// A failed URL join aborts the run: silently keeping the base URL would
 /// download the metadata file under the file's name.
-pub fn plan_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<DownloadPlan> {
+pub fn plan_download_tasks(
+    files: Vec<XmlFile>,
+    base_url: &Url,
+    output_dir: &str,
+    target: &ArchiveTarget,
+) -> Result<DownloadPlan> {
     let mut sanitized_count = 0;
     let mut tasks: Vec<DownloadTask> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -141,8 +188,12 @@ pub fn plan_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<Downlo
     // The locally saved "<id>_files.xml" occupies the item root too: an
     // entry that sanitizes to that name (differing only by case on
     // case-insensitive filesystems) would silently overwrite the metadata.
-    let xml_file_name = xml_file_name_of(base_url);
-    planned_files.insert(local_path_key(xml_file_name), xml_file_name.to_string());
+    // A single-file run never saves the metadata document, so it reserves
+    // nothing — the file itself may be the _files.xml entry.
+    if target.file_path.is_none() {
+        let xml_file_name = xml_file_name_of(base_url);
+        planned_files.insert(local_path_key(xml_file_name), xml_file_name.to_string());
+    }
 
     for file in files {
         // Percent-encode the name first so '?' / '#' / '%' characters in
@@ -202,7 +253,9 @@ pub fn plan_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<Downlo
 
         tasks.push(DownloadTask {
             url: absolute_url.to_string(),
-            file_path: sanitized_name,
+            // The output directory (when given) prefixes every local
+            // path; the URLs are archive-absolute and stay unprefixed.
+            file_path: join_output_dir(output_dir, &sanitized_name),
             expected_md5: file.md5,
             expected_size: file.size,
             expected_mtime: file.mtime,
@@ -220,6 +273,22 @@ pub fn plan_download_tasks(files: Vec<XmlFile>, base_url: &Url) -> Result<Downlo
 mod tests {
     use super::*;
     use crate::test_support::xml_file;
+
+    /// The whole-item target of the "item1" fixture archives
+    fn whole_item() -> ArchiveTarget {
+        ArchiveTarget {
+            identifier: "item1".to_string(),
+            file_path: None,
+        }
+    }
+
+    /// The single-file target of the "item1" fixture archives
+    fn single_file(path: &str) -> ArchiveTarget {
+        ArchiveTarget {
+            identifier: "item1".to_string(),
+            file_path: Some(path.to_string()),
+        }
+    }
 
     #[test]
     fn files_to_download_excludes_xml_self_reference() {
@@ -251,7 +320,7 @@ mod tests {
             xml_file("//", None),
             xml_file("ok.bin", Some(5)),
         ];
-        let plan = plan_download_tasks(files, &base).expect("plan must build");
+        let plan = plan_download_tasks(files, &base, "", &whole_item()).expect("plan must build");
 
         assert_eq!(plan.sanitized_count, 0);
         assert_eq!(
@@ -280,7 +349,7 @@ mod tests {
             xml_file("file:1.mp4", Some(1)),
             xml_file("file_1.mp4", Some(2)),
         ];
-        let plan = plan_download_tasks(files, &base).expect("plan must build");
+        let plan = plan_download_tasks(files, &base, "", &whole_item()).expect("plan must build");
 
         assert_eq!(plan.sanitized_count, 1, "only the colon name is sanitized");
         assert_eq!(plan.tasks.len(), 1, "the colliding entry must be skipped");
@@ -303,6 +372,8 @@ mod tests {
                 xml_file("notes/file.txt", Some(2)),
             ],
             &base,
+            "",
+            &whole_item(),
         )
         .expect("plan must build");
         assert_eq!(
@@ -325,6 +396,8 @@ mod tests {
                 xml_file("notes", Some(2)),
             ],
             &base,
+            "",
+            &whole_item(),
         )
         .expect("plan must build");
         assert_eq!(
@@ -343,6 +416,8 @@ mod tests {
         let plan = plan_download_tasks(
             vec![xml_file("a/b.txt", Some(1)), xml_file("a/c.txt", Some(2))],
             &base,
+            "",
+            &whole_item(),
         )
         .expect("plan must build");
         assert_eq!(plan.tasks.len(), 2, "sibling files must both be planned");
@@ -359,7 +434,7 @@ mod tests {
             xml_file("Report.PDF", Some(1)),
             xml_file("report.pdf", Some(2)),
         ];
-        let plan = plan_download_tasks(files, &base).expect("plan must build");
+        let plan = plan_download_tasks(files, &base, "", &whole_item()).expect("plan must build");
 
         #[cfg(target_os = "linux")]
         {
@@ -389,7 +464,7 @@ mod tests {
             xml_file("Item1_Files.XML", Some(1)),
             xml_file("scan.jpg", Some(2)),
         ];
-        let plan = plan_download_tasks(files, &base).expect("plan must build");
+        let plan = plan_download_tasks(files, &base, "", &whole_item()).expect("plan must build");
 
         #[cfg(target_os = "linux")]
         assert_eq!(
@@ -414,5 +489,94 @@ mod tests {
         assert_eq!(local_path_key("A/b.pdf"), "A/b.pdf");
         #[cfg(not(target_os = "linux"))]
         assert_eq!(local_path_key("A/b.PDF"), "a/b.pdf");
+    }
+
+    #[test]
+    fn select_files_keeps_all_but_the_xml_entry_for_whole_items() {
+        let files = vec![
+            xml_file("item1_files.xml", Some(1)),
+            xml_file("scan.jpg", Some(2)),
+            xml_file("notes.txt", Some(3)),
+        ];
+
+        let selected =
+            select_files(files, "item1_files.xml", &whole_item()).expect("selection must work");
+
+        assert_eq!(
+            selected.iter().map(|file| &file.name).collect::<Vec<_>>(),
+            vec!["scan.jpg", "notes.txt"]
+        );
+    }
+
+    #[test]
+    fn select_files_picks_the_named_entry_for_single_file_urls() {
+        // Even the _files.xml entry itself is selectable: the user asked
+        // for it explicitly, so no self-reference filter applies.
+        let files = vec![
+            xml_file("item1_files.xml", Some(1)),
+            xml_file("scan.jpg", Some(2)),
+        ];
+
+        let selected = select_files(files, "item1_files.xml", &single_file("item1_files.xml"))
+            .expect("the named file must be found");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "item1_files.xml");
+    }
+
+    #[test]
+    fn select_files_missing_name_is_an_error() {
+        let err = select_files(
+            vec![xml_file("scan.jpg", Some(2))],
+            "item1_files.xml",
+            &single_file("nope.bin"),
+        )
+        .expect_err("an unknown file must not yield an empty plan");
+
+        assert!(
+            matches!(err, IaGetError::FileNotFoundInArchive { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn plan_download_tasks_prefixes_the_output_dir() {
+        let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
+        let files = vec![xml_file("a/b.txt", Some(1)), xml_file("c.txt", Some(2))];
+        let plan =
+            plan_download_tasks(files, &base, "out/item", &whole_item()).expect("plan must build");
+
+        assert_eq!(plan.tasks[0].file_path, "out/item/a/b.txt");
+        assert_eq!(plan.tasks[1].file_path, "out/item/c.txt");
+        // The URLs are archive-absolute and unaffected by the output dir
+        assert_eq!(
+            plan.tasks[0].url,
+            "https://archive.org/download/item1/a/b.txt"
+        );
+    }
+
+    #[test]
+    fn plan_download_tasks_single_file_run_does_not_reserve_the_xml_name() {
+        // Requesting "<id>_files.xml" as the single file must be planned,
+        // not skipped as a collision with the saved metadata.
+        let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
+        let plan = plan_download_tasks(
+            vec![xml_file("item1_files.xml", Some(3))],
+            &base,
+            "",
+            &single_file("item1_files.xml"),
+        )
+        .expect("plan must build");
+
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].file_path, "item1_files.xml");
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn join_output_dir_keeps_the_path_bare_without_a_directory() {
+        assert_eq!(join_output_dir("", "a/b.txt"), "a/b.txt");
+        assert_eq!(join_output_dir("out", "a/b.txt"), "out/a/b.txt");
+        assert_eq!(join_output_dir("out/sub", "c.txt"), "out/sub/c.txt");
     }
 }
