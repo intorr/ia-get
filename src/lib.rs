@@ -7,6 +7,7 @@
 //! support for resumable downloads and MD5 hash verification.
 
 pub mod archive_metadata;
+pub mod check;
 pub mod cookie;
 pub mod display;
 pub mod downloader;

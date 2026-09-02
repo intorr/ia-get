@@ -31,7 +31,7 @@ pub(crate) fn digest_hex(digest: impl AsRef<[u8]>) -> String {
 }
 
 /// Calculates the MD5 hash of a file
-fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
+pub(crate) fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Result<String> {
     let file = File::open(file_path).map_err(|e| io_error_with_path(file_path, e))?;
     let file_size = file
         .metadata()

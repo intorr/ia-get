@@ -11,6 +11,7 @@ use ia_get::archive_metadata::{
     XmlFiles, XmlMetadata, fetch_and_parse_xml, get_xml_url, list_file_rows, list_summary,
     parse_archive_url, save_xml_metadata, xml_file_name_of,
 };
+use ia_get::check::check_directory;
 use ia_get::cookie::cookie_header_value;
 use ia_get::display::{
     create_spinner, finish_spinner, format_size, last_glyph, print_downloaded_line,
@@ -305,6 +306,19 @@ struct Cli {
     /// and the session settings (proxy, rate limit, disk space)
     #[arg(long)]
     verbose: bool,
+    /// Verify the files in the `-o` directory (or the current directory)
+    /// against the archive's metadata instead of downloading; nothing is
+    /// written
+    #[arg(long)]
+    check: bool,
+    /// In --check mode, also verify each file's MD5 hash (slower; off by
+    /// default)
+    #[arg(long)]
+    md5: bool,
+    /// In --check mode, treat date and extra-file mismatches as errors, not
+    /// warnings
+    #[arg(long)]
+    strict: bool,
 }
 
 /// Main application entry point
@@ -382,6 +396,84 @@ async fn run(cli: &Cli) -> Result<()> {
     if cli.list {
         list_files(&files, &spinner, xml_file_name_of(&base_url));
         return Ok(());
+    }
+
+    // In --check mode we verify an existing directory against the metadata
+    // instead of writing one: resolve the same output dir a download would
+    // use, narrow to the same candidates, build the same plan, then compare
+    // it with the disk. Nothing is downloaded or created.
+    if cli.check {
+        let output_dir = init_step(&spinner, normalize_output_dir(cli.output_dir.as_deref()))?;
+        // Unlike a download, check must not create the directory: it is the
+        // thing being verified, so a missing one is a clear error.
+        let probe = if output_dir.is_empty() {
+            Path::new(".")
+        } else {
+            Path::new(&output_dir)
+        };
+        if !probe.is_dir() {
+            return init_step(
+                &spinner,
+                Err(IaGetError::CheckDirectoryNotFound(
+                    probe.display().to_string(),
+                )),
+            );
+        }
+
+        let whole_item = target.file_path.is_none();
+        let xml_file_name = xml_file_name_of(&base_url);
+        let filter = FileFilter::new(cli.include.clone(), cli.exclude.clone());
+        let selected = init_step(&spinner, select_files(files.files, xml_file_name, &target))?;
+        let candidates = selected
+            .into_iter()
+            .filter(|file| filter.matches(&file.name))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return init_step(
+                &spinner,
+                Err(IaGetError::NoFilesSelected {
+                    identifier: target.identifier.clone(),
+                }),
+            );
+        }
+        let plan = init_step(
+            &spinner,
+            plan_download_tasks(candidates, &base_url, &output_dir, &target),
+        )?;
+
+        finish_spinner(
+            &spinner,
+            &format!(
+                "{} Verifying {} file{} in {}",
+                "⚙".blue(),
+                plan.tasks.len().to_string().bold(),
+                if plan.tasks.len() == 1 { "" } else { "s" },
+                probe.display().to_string().bold()
+            ),
+        );
+
+        let report = check_directory(&plan, xml_file_name, whole_item, &output_dir, cli.md5)?;
+        report.print();
+
+        if report.is_clean(cli.strict) {
+            println!(
+                "\n{} {}",
+                "✔".green().bold(),
+                "Directory matches the archive".green().bold()
+            );
+            return Ok(());
+        }
+
+        println!(
+            "\n{} {}",
+            "✘".red().bold(),
+            format!("{} problem(s) found", report.failing_count(cli.strict))
+                .red()
+                .bold()
+        );
+        return Err(IaGetError::CheckFailed {
+            problems: report.failing_count(cli.strict),
+        });
     }
 
     // A whole-item run saves the freshly fetched _files.xml as file #1;

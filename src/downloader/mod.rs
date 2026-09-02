@@ -32,7 +32,6 @@ use crate::display::{
 };
 use crate::downloader::mtime::mtime_from_xml;
 use crate::downloader::retry::backoff_delay;
-use crate::downloader::signal::setup_signal_handler;
 use crate::downloader::verify::{
     ExistingFileStatus, check_existing_file, print_verified_hash, verify_downloaded_file,
 };
@@ -42,7 +41,9 @@ use crate::fs::ensure_not_symlink;
 // Re-export the items that form this module's public API.
 pub use mtime::{parse_last_modified, sync_file_mtime};
 pub use rate::parse_rate;
+pub(crate) use signal::setup_signal_handler;
 pub(crate) use stream::download_file_content;
+pub(crate) use verify::calculate_md5;
 #[cfg(test)]
 pub(crate) use verify::digest_hex;
 

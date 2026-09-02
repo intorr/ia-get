@@ -65,6 +65,16 @@ pub enum IaGetError {
         path: String,
     },
 
+    /// A `--check` run found the directory does not match the archive's
+    /// metadata; the per-file findings were already printed, this only carries
+    /// the failure count so the process exits non-zero
+    #[error("Directory check found {problems} problem(s)")]
+    CheckFailed { problems: usize },
+
+    /// The directory given to `--check` does not exist
+    #[error("Directory to check not found: {0}")]
+    CheckDirectoryNotFound(String),
+
     /// XML parsing errors
     #[error("Failed to parse XML: {0}")]
     XmlParsing(String),

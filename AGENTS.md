@@ -39,6 +39,7 @@ src/
 ├── plan.rs              # Download plan: file selection (whole item vs single file), output-dir prefixing, URL building, collision detection, structured warnings
 ├── file_filter.rs       # --include/--exclude glob matching (FileFilter, glob_match)
 ├── archive_metadata.rs  # _files.xml fetch/parse/persist + the archive.org URL contract (parse_archive_url/get_xml_url/encode)
+├── check.rs             # --check: verify a directory against the metadata (presence, size, mtime, extras, .part handling, optional md5)
 ├── cookie.rs            # Cookie header from raw string or Netscape cookies.txt, and applying it to requests
 ├── display.rs           # Terminal output (spinner, progress bars, banners, status lines, size/duration formatting)
 ├── filename.rs          # Filename sanitization for cross-platform filesystems

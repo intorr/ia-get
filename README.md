@@ -93,6 +93,24 @@ ia-get --proxy http://127.0.0.1:3128 https://archive.org/details/<identifier>
 ia-get --verbose https://archive.org/details/<identifier> 2> ia-get.log
 ```
 
+## Verifying a download 🔎
+
+`--check` verifies that a directory holds what a download of the item would have produced, without downloading or writing anything. It fetches the same `_files.xml`, maps each entry to the local path it would take (sanitized names, under the `-o` directory), and compares with what is on disk:
+
+```shell
+ia-get --check https://archive.org/details/<identifier>
+ia-get --check -o my-downloads https://archive.org/details/<identifier>
+```
+
+- By default every file is checked for **presence**, **size** and **last-modified time**, and the directory is scanned for **unexpected files**. `--include`/`--exclude` narrow the check the same way they narrow a download.
+- A file that is listed but absent, or present at the wrong size, fails the run (non-zero exit).
+- **Date** and **extra-file** findings are warnings by default: the downloader stores the server's `Last-Modified`, which can legitimately differ from the `_files.xml` `<mtime>`. Add `--strict` to make those fail too.
+- `--md5` additionally hashes each file against the metadata's MD5 (off by default, as it is the slow check).
+- `.part` files are understood: a `.part` whose final file is missing is reported as *incomplete* (not missing, not extra), and a `.part` next to a complete file is reported as a stale leftover.
+- The archive's own `<id>_files.xml` entry is excluded from the size/date/hash comparison (its self-referencing metadata is unreliable) but is still recognized, so it is not flagged as an unexpected file.
+
+A `--check` run that finds problems exits non-zero and prints a per-file report plus a summary; a clean run exits `0`.
+
 ## Why? 🤔💭
 
 I wanted to download high-quality scans of [ZZap!64 magazine](https://en.wikipedia.org/wiki/Zzap!64) and some read-only memory from archive.org.
@@ -115,6 +133,7 @@ So I co-authored `ia-get` to automate the download process.
 - 🌱 Safe to re-run: verified files are kept, stale ones are re-downloaded
 - 🔑 Supports private items via `--cookies` (a raw header or a Netscape `cookies.txt`)
 - 📄 `--list` previews the files and sizes without downloading
+- 🔎 `--check` verifies a directory against the archive's metadata (size, mtime, extras; `--md5` for hashes, `--strict` for hard dates/extras)
 - 📊 Saves the archive's own `<id>_files.xml` locally alongside the files
 - 💾 Fails fast when the target volume clearly lacks the space for the planned download
 - 🐌 `--limit-rate` caps the download throughput (e.g. `1M`, `512K`); unlimited by default
