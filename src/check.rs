@@ -22,7 +22,7 @@ use colored::*;
 use crate::Result;
 use crate::display::format_size;
 use crate::downloader::{calculate_md5, setup_signal_handler};
-use crate::plan::DownloadPlan;
+use crate::plan::{DownloadPlan, local_path_key};
 
 /// The findings of a directory check, grouped by kind.
 ///
@@ -191,28 +191,40 @@ pub fn check_directory(
     let mut files: Vec<String> = Vec::new();
     let mut dirs: Vec<String> = Vec::new();
     walk_into(root, "", &mut files, &mut dirs);
-    let file_set: HashSet<&str> = files.iter().map(String::as_str).collect();
-    let dir_set: HashSet<&str> = dirs.iter().map(String::as_str).collect();
+    // The sets are keyed like the plan's collision detection: disk names
+    // and metadata names differing only by case are one path on
+    // case-insensitive filesystems, not "missing + extra"
+    let file_set: HashSet<String> = files.iter().map(|file| local_path_key(file)).collect();
+    let dir_set: HashSet<String> = dirs.iter().map(|dir| local_path_key(dir)).collect();
 
     let expected_rel: Vec<String> = plan
         .tasks
         .iter()
         .map(|task| expected_rel(&task.file_path, output_dir))
         .collect();
-    let expected_set: HashSet<&str> = expected_rel.iter().map(String::as_str).collect();
+    let expected_set: HashSet<String> =
+        expected_rel.iter().map(|rel| local_path_key(rel)).collect();
 
     let mut report = CheckReport::default();
 
+    // A whole-item run always saves the metadata file: its absence means
+    // the directory is not what a download would have produced (it stays
+    // excluded from the size/date/hash comparison, whose self-metadata is
+    // unreliable)
+    if whole_item && !file_set.contains(&local_path_key(xml_file_name)) {
+        report.missing.push(xml_file_name.to_string());
+    }
+
     // Classify each planned file against what is on disk.
     for (task, rel) in plan.tasks.iter().zip(expected_rel.iter()) {
-        if dir_set.contains(rel.as_str()) {
+        if dir_set.contains(&local_path_key(rel)) {
             // A directory where a file is expected can never be right.
             report.type_mismatch.push(rel.clone());
             continue;
         }
-        if !file_set.contains(rel.as_str()) {
+        if !file_set.contains(&local_path_key(rel)) {
             let part = format!("{rel}.part");
-            if file_set.contains(part.as_str()) {
+            if file_set.contains(&local_path_key(&part)) {
                 let have = fs::metadata(root.join(&part))
                     .ok()
                     .map(|meta| meta.len())
@@ -238,7 +250,7 @@ pub fn check_directory(
 
         // A .part next to a complete file is a stale leftover.
         let part = format!("{rel}.part");
-        if file_set.contains(part.as_str()) {
+        if file_set.contains(&local_path_key(&part)) {
             report.extra.push(part);
         }
 
@@ -294,13 +306,16 @@ pub fn check_directory(
 
     // Classify the directory's files: anything a planned entry (or its .part)
     // does not account for is unexpected. The metadata file is recognized for
-    // whole-item runs (it is always saved), so it is not flagged as extra.
+    // whole-item runs (it is always saved and reported above when absent),
+    // so it is not flagged as extra.
     for rel in &files {
-        if expected_set.contains(rel.as_str()) || (whole_item && rel == xml_file_name) {
+        if expected_set.contains(&local_path_key(rel))
+            || (whole_item && local_path_key(rel) == local_path_key(xml_file_name))
+        {
             continue;
         }
         if let Some(base) = rel.strip_suffix(".part")
-            && expected_set.contains(base)
+            && expected_set.contains(&local_path_key(base))
         {
             // A .part for a planned file is in progress (final still missing)
             // or stale (already reported above) — either way not "extra".
@@ -626,6 +641,73 @@ mod tests {
             vec!["item_files.xml".to_string()],
             "a single-file run never saves the metadata, so it is unexpected"
         );
+    }
+
+    #[test]
+    fn differing_case_file_matches_the_metadata() {
+        // The disk holds "A.BIN" while the metadata names "a.bin": on
+        // case-insensitive filesystems (Windows, default macOS) that is one
+        // path, not "missing + extra"
+        let (dir, output_dir) = harness("check_case");
+        fs::write(dir.join("A.BIN"), vec![0u8; 10]).unwrap();
+        let report = check_directory(
+            &plan(vec![task(
+                "https://x/a.bin",
+                path_str(&dir, "a.bin"),
+                None,
+                Some(10),
+                None,
+            )]),
+            "item_files.xml",
+            false,
+            &output_dir,
+            false,
+        )
+        .unwrap();
+
+        #[cfg(target_os = "linux")]
+        {
+            // Linux: genuinely two different paths — missing + extra
+            assert_eq!(report.missing, vec!["a.bin".to_string()]);
+            assert_eq!(report.extra, vec!["A.BIN".to_string()]);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(report.ok, vec!["a.bin".to_string()], "{report:?}");
+            assert!(report.missing.is_empty(), "{:?}", report.missing);
+            assert!(report.extra.is_empty(), "{:?}", report.extra);
+        }
+    }
+
+    #[test]
+    fn missing_metadata_file_fails_a_whole_item_check() {
+        // A whole-item download always saves <id>_files.xml: its absence
+        // must fail the check even though its size/date/hash are exempt
+        let (dir, output_dir) = harness("check_xml_missing");
+        let a = make_file(&dir, "a.bin", 10);
+        let report = check_directory(
+            &plan(vec![task("https://x/a.bin", a, None, Some(10), None)]),
+            "item_files.xml",
+            true,
+            &output_dir,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.missing, vec!["item_files.xml".to_string()]);
+        assert!(!report.is_clean(false), "the metadata file is required");
+
+        // A single-file run never saves it, so its absence is no finding
+        let b = make_file(&dir, "b.bin", 5);
+        let single = check_directory(
+            &plan(vec![task("https://x/b.bin", b, None, Some(5), None)]),
+            "item_files.xml",
+            false,
+            &output_dir,
+            false,
+        )
+        .unwrap();
+        assert!(single.missing.is_empty(), "{:?}", single.missing);
     }
 
     #[test]

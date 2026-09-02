@@ -23,9 +23,9 @@ use std::time::SystemTime;
 
 use colored::*;
 use reqwest::Client;
-use reqwest::header::HeaderValue;
 
 use crate::Result;
+use crate::cookie::CookieSource;
 use crate::display::{
     print_complete_part_verification, print_download_interrupted, print_download_summary,
     print_file_banner, print_mtime_warning, print_redownload_from_scratch,
@@ -137,10 +137,17 @@ fn remove_part_file(part_path: &str) {
 }
 
 /// Re-creates the `.part` file from scratch after a failed verification:
-/// the old contents are removed best-effort, then a fresh handle is opened.
-/// The caller's previous handle is closed by the shadowing assignment.
+/// the old contents must be removed — a failed removal must not degrade
+/// into an append to the corrupt data — and only then is a fresh handle
+/// opened. The previous attempt's handle is closed by its per-iteration
+/// binding in `run_download_attempts` (a Windows `.part` cannot be
+/// replaced reliably while it is still open).
 fn reprepare_part_file(part_path: &str) -> Result<File> {
-    remove_part_file(part_path);
+    match fs::remove_file(part_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_error_with_path(part_path, e)),
+    }
     prepare_file_for_download(part_path)
 }
 
@@ -249,7 +256,7 @@ async fn process_file(
     number: usize,
     total_files: usize,
     running: &Arc<AtomicBool>,
-    cookie_header: Option<&HeaderValue>,
+    cookie_source: Option<&CookieSource>,
     rate_limit: Option<u64>,
     output_dir: &str,
 ) -> Result<FileOutcome> {
@@ -261,6 +268,17 @@ async fn process_file(
 
     println!(" ");
     print_file_banner(file_path, number, total_files);
+
+    // Refuse a planted symlink at a directory component before the
+    // existing-file checks: a "stale" final file reached through it would
+    // be removed (or re-timestamped on verification) at the link's external
+    // target. The .part lives in the same directory, so the final file's
+    // parent chain covers both.
+    if let Err(e) = ensure_parent_directories(file_path, output_dir) {
+        return Ok(FileOutcome::Failed(format!(
+            "could not prepare parent directories: {e}"
+        )));
+    }
 
     let part_path = format!("{}.part", file_path);
 
@@ -282,7 +300,7 @@ async fn process_file(
         url,
         &part_path,
         running,
-        cookie_header,
+        cookie_source,
         expected_md5,
         expected_size,
         rate_limit,
@@ -373,8 +391,8 @@ enum OffsetRejected {
 /// One exception: a 416 for `bytes=N-` also fires when the part already
 /// holds the whole file (a previous run was interrupted after the body
 /// finished but before verification) — a part of exactly the expected size
-/// that also hashes correctly is verified in place instead of being
-/// discarded and re-downloaded.
+/// is verified in place (its hash, when the metadata provides one) instead
+/// of being discarded and re-downloaded.
 fn handle_rejected_offset(
     file: &File,
     part_path: &str,
@@ -384,12 +402,13 @@ fn handle_rejected_offset(
 ) -> Result<OffsetRejected> {
     let complete_part = expected_size
         .is_some_and(|expected| file.metadata().is_ok_and(|meta| meta.len() == expected));
-    if complete_part && expected_md5.is_some() {
+    if complete_part {
         print_complete_part_verification();
         match verify_part(part_path, expected_md5, expected_size, running)? {
             PartVerification::Valid => return Ok(OffsetRejected::Verified),
-            // The size matched but the hash did not: size alone is not
-            // proof, so fall through and re-download from scratch.
+            // The size matched but the hash did not (MD5 in the metadata):
+            // size alone is not proof, so fall through and re-download from
+            // scratch.
             PartVerification::Mismatch => {}
             PartVerification::Unreadable(reason) => {
                 return Ok(OffsetRejected::Failed {
@@ -412,7 +431,7 @@ async fn run_download_attempts(
     url: &str,
     part_path: &str,
     running: &Arc<AtomicBool>,
-    cookie_header: Option<&HeaderValue>,
+    cookie_source: Option<&CookieSource>,
     expected_md5: Option<&str>,
     expected_size: Option<u64>,
     rate_limit: Option<u64>,
@@ -427,16 +446,6 @@ async fn run_download_attempts(
             discard_part: false,
         });
     }
-    let mut file = match prepare_file_for_download(part_path) {
-        Ok(file) => file,
-        Err(e) => {
-            return Ok(DownloadOutcome::Failed {
-                reason: format!("could not prepare .part file: {e}"),
-                discard_part: false,
-            });
-        }
-    };
-
     let mut last_reason = String::new();
     // True when the .part file does not hold a valid prefix and must not be
     // kept for resuming; reset whenever the file is re-created below
@@ -452,8 +461,22 @@ async fn run_download_attempts(
             };
         }
 
-        if attempt > 1 {
-            file = match reprepare_part_file(part_path) {
+        // This attempt's .part handle, scoped to the iteration: it closes
+        // at the iteration's end — before the next attempt's re-create
+        // (a Windows .part cannot be replaced reliably while still open)
+        // and before the caller's rename.
+        let mut file = if attempt == 1 {
+            match prepare_file_for_download(part_path) {
+                Ok(file) => file,
+                Err(e) => {
+                    break DownloadOutcome::Failed {
+                        reason: format!("could not prepare .part file: {e}"),
+                        discard_part: false,
+                    };
+                }
+            }
+        } else {
+            match reprepare_part_file(part_path) {
                 Ok(file) => file,
                 // The re-create failed, so the on-disk .part is unchanged:
                 // if an earlier 416 already proved it is not a valid prefix,
@@ -464,7 +487,9 @@ async fn run_download_attempts(
                         discard_part,
                     };
                 }
-            };
+            }
+        };
+        if attempt > 1 {
             // The .part file is re-created from scratch, so an earlier
             // range reject no longer applies to it.
             discard_part = false;
@@ -476,7 +501,7 @@ async fn run_download_attempts(
             url,
             &mut file,
             running,
-            cookie_header,
+            cookie_source,
             expected_size,
             backoff_delay,
             rate_limit,
@@ -532,9 +557,8 @@ async fn run_download_attempts(
             }
         }
     };
-
-    // Close the handle before renaming (Windows refuses to rename open files)
-    drop(file);
+    // The last attempt's handle closed at its iteration's end, so the
+    // caller can rename (Windows refuses to replace an open file)
 
     Ok(outcome)
 }
@@ -566,7 +590,7 @@ pub async fn download_files(
     files: Vec<DownloadTask>,
     total_files: usize,
     file_number_start: usize,
-    cookie_header: Option<&HeaderValue>,
+    cookie_source: Option<&CookieSource>,
     stop_on_error: bool,
     rate_limit: Option<u64>,
     output_dir: &str,
@@ -579,7 +603,7 @@ pub async fn download_files(
         files,
         total_files,
         file_number_start,
-        cookie_header,
+        cookie_source,
         stop_on_error,
         rate_limit,
         output_dir,
@@ -601,7 +625,7 @@ async fn download_files_with_signal(
     tasks: Vec<DownloadTask>,
     total_files: usize,
     file_number_start: usize,
-    cookie_header: Option<&HeaderValue>,
+    cookie_source: Option<&CookieSource>,
     stop_on_error: bool,
     rate_limit: Option<u64>,
     output_dir: &str,
@@ -624,7 +648,7 @@ async fn download_files_with_signal(
             index + file_number_start,
             total_files,
             running,
-            cookie_header,
+            cookie_source,
             rate_limit,
             output_dir,
         )
@@ -1258,6 +1282,79 @@ mod tests {
         );
         assert_eq!(server.ranges(), vec![Some(stale.len() as u64), None]);
         assert_eq!(fs::read(&part).unwrap(), fresh);
+    }
+
+    #[tokio::test]
+    async fn complete_part_416_without_md5_is_verified_in_place() {
+        // A known-size part that already holds the whole file must verify
+        // in place on 416 even without an MD5: the size is the only signal
+        // the metadata provides, and verify_part accepts it.
+        let full = b"no-md5-complete-part";
+        let (server, dir) = file_server(
+            "complete_part_416_no_md5",
+            VecDeque::from(vec![MockResponse::new(416, MockBody::Full(vec![]))]),
+            MockResponse::new(200, MockBody::Full(full.to_vec())),
+        );
+        let part = dir.join("file.bin.part");
+        fs::write(&part, full).unwrap();
+        let outcome = run_download_attempts(
+            &Client::new(),
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            &test_running(),
+            None,
+            None,
+            Some(full.len() as u64),
+            None,
+            dir.to_str().unwrap(),
+        )
+        .await
+        .expect("a complete known-size .part must verify in place");
+
+        assert!(matches!(outcome, DownloadOutcome::Verified { .. }));
+        assert_eq!(
+            server.request_count(),
+            1,
+            "a complete .part without MD5 must not trigger a re-download"
+        );
+        assert_eq!(server.ranges(), vec![Some(full.len() as u64)]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planted_symlink_parent_is_refused_before_existing_file_checks() {
+        // A symlinked directory component below the output dir must fail
+        // the file up front: the stale-file removal and the mtime sync of
+        // the existing-file check must not reach the link's external target.
+        let (server, dir) = ok_bin_server("planted_symlink_parent");
+        let external = dir.join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("ok.bin"), b"external-precious").unwrap();
+        let planted = dir.join("blocked");
+        std::os::unix::fs::symlink(&external, &planted).unwrap();
+
+        let task = task(
+            server.url("/ok.bin"),
+            planted.join("ok.bin").to_str().unwrap().to_string(),
+            Some(md5_hex(b"totally-different")),
+            Some(99),
+            None,
+        );
+        let err = run_batch(&dir, vec![task], false).await.unwrap_err();
+        match err {
+            IaGetError::BatchFailed { details, .. } => {
+                assert!(
+                    details.contains("could not prepare parent directories"),
+                    "{details}"
+                );
+            }
+            other => panic!("expected BatchFailed, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(external.join("ok.bin")).unwrap(),
+            b"external-precious",
+            "the file behind the planted link must be untouched"
+        );
     }
 
     #[tokio::test]

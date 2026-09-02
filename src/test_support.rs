@@ -147,6 +147,18 @@ pub async fn run_download(
     expected_size: Option<u64>,
     running: &Arc<AtomicBool>,
 ) -> crate::Result<Option<SystemTime>> {
+    run_download_with_rate(url, part_path, expected_size, running, None).await
+}
+
+/// Like `run_download`, but with a `--limit-rate` value (bytes/second)
+/// driving the pacing, for interrupt-during-pace scenarios.
+pub async fn run_download_with_rate(
+    url: &str,
+    part_path: &str,
+    expected_size: Option<u64>,
+    running: &Arc<AtomicBool>,
+    rate_limit: Option<u64>,
+) -> crate::Result<Option<SystemTime>> {
     let client = Client::new();
     let mut file = prepare_file_for_download(part_path)?;
     let result = download_file_content(
@@ -157,7 +169,7 @@ pub async fn run_download(
         None,
         expected_size,
         fast_retry,
-        None,
+        rate_limit,
     )
     .await;
     drop(file);
@@ -441,7 +453,14 @@ fn resolve_response(
             true,
             response.extra_headers.clone(),
         ),
-        MockBody::Ranged(data) => ranged_response(data, range),
+        MockBody::Ranged(data) => {
+            // A ranged response's status/Content-Range are derived from the
+            // request, but extra headers (Last-Modified, Retry-After, ...)
+            // are scripted facts about the server and ride along
+            let (status, announced, body, stalled, mut headers) = ranged_response(data, range);
+            headers.extend(response.extra_headers.iter().cloned());
+            (status, announced, body, stalled, headers)
+        }
     }
 }
 

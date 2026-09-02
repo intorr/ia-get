@@ -69,7 +69,11 @@ fn mark_reserved_name(component: &mut String) -> bool {
 fn sanitize_component(component: &str) -> (String, bool) {
     let (mut sanitized, mut was_modified) = replace_invalid_chars(component);
 
-    let trimmed = sanitized.trim().trim_end_matches('.');
+    // Trailing dots and the whitespace they uncover are stripped together
+    // ("file ." must not leave a trailing space, which Windows rejects)
+    let trimmed = sanitized
+        .trim()
+        .trim_end_matches(|c: char| c == '.' || c.is_whitespace());
     if trimmed.len() != sanitized.len() {
         sanitized = trimmed.to_string();
         was_modified = true;
@@ -291,6 +295,19 @@ mod tests {
 
         let (result, modified) = sanitize_filename("folder./file.txt");
         assert_eq!(result, "folder/file.txt");
+        assert!(modified);
+    }
+
+    #[test]
+    fn test_sanitize_trailing_dots_and_spaces() {
+        // A space before a trailing dot must not survive the dot removal
+        // (Windows rejects names ending in a space)
+        let (result, modified) = sanitize_filename("file .");
+        assert_eq!(result, "file");
+        assert!(modified);
+
+        let (result, modified) = sanitize_filename("a/ b . ./c.txt");
+        assert_eq!(result, "a/b/c.txt");
         assert!(modified);
     }
 

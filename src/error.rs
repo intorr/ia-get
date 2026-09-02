@@ -37,7 +37,8 @@ pub enum IaGetError {
     FileNotFoundInArchive { identifier: String, path: String },
 
     /// No file survived selection for the download: the item lists none,
-    /// or the `--include`/`--exclude` filters matched nothing
+    /// the `--include`/`--exclude` filters matched nothing, or every
+    /// candidate name encodes to an empty path
     #[error("No files selected for download in {identifier}")]
     NoFilesSelected { identifier: String },
 

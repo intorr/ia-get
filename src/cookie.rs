@@ -21,14 +21,14 @@ const COOKIE_HOST: &str = "archive.org";
 
 /// One entry of a Netscape cookies.txt file
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct NetscapeCookie {
-    domain: String,
-    include_subdomains: bool,
-    path: String,
-    secure: bool,
-    expires: Option<u64>,
-    name: String,
-    value: String,
+pub struct NetscapeCookie {
+    pub(crate) domain: String,
+    pub(crate) include_subdomains: bool,
+    pub(crate) path: String,
+    pub(crate) secure: bool,
+    pub(crate) expires: Option<u64>,
+    pub(crate) name: String,
+    pub(crate) value: String,
 }
 
 /// Reads a cookie file, naming it in I/O errors and refusing to buffer a
@@ -44,7 +44,33 @@ fn read_cookie_file(input: &str) -> Result<String> {
     fs::read_to_string(input).map_err(|e| io_error_with_path(input, e))
 }
 
-/// Builds an HTTP Cookie header value from a raw cookie string or cookies.txt path.
+/// The session's cookie source: a raw `--cookies` string applies to every
+/// request as is, while a parsed cookies.txt is scoped against each request
+/// URL (RFC 6265 domain/path/expiry/secure) — a cookie scoped to one file
+/// path must not ride along on unrelated requests, and vice versa.
+#[derive(Debug, Clone)]
+pub enum CookieSource {
+    /// A raw cookie header string: one prebuilt header for all requests
+    Raw(HeaderValue),
+    /// Parsed cookies.txt entries (unencodable ones already dropped),
+    /// matched against each request URL
+    Netscape(Vec<NetscapeCookie>),
+}
+
+/// Builds an HTTP Cookie header value from a raw cookie string or cookies.txt
+/// path for a single `url` — the one-shot form. A session that requests many
+/// URLs should use [`cookie_source`] + [`cookie_header_for`] instead, so each
+/// URL sees exactly the cookies scoped to it.
+pub fn cookie_header_from_input(input: &str, url: &Url) -> Result<String> {
+    let source = cookie_source(Some(input))?;
+    let header = cookie_header_for(source.as_ref(), url)?;
+    Ok(header
+        .map(|header| header.to_str().unwrap_or_default().to_string())
+        .unwrap_or_default())
+}
+
+/// Resolves the `--cookies` CLI input (a raw string or a cookies.txt path)
+/// into a session cookie source, or `None` when no cookies were given.
 ///
 /// The input is only treated as a file when it names an existing file that
 /// either holds at least one recognizable Netscape cookie line or does not
@@ -52,32 +78,58 @@ fn read_cookie_file(input: &str) -> Result<String> {
 /// collides with a filename in the working directory is kept as a cookie
 /// string instead of being silently swallowed as an empty cookies.txt.
 ///
-/// A file that holds cookies but none of them apply to `url` (all expired,
-/// or scoped to another domain/path) yields an empty header; a warning is
-/// printed so an unauthenticated-looking 401/403 has an obvious cause.
-pub fn cookie_header_from_input(input: &str, url: &Url) -> Result<String> {
-    if Path::new(input).is_file() {
-        let cookie_file = read_cookie_file(input)?;
+/// A file whose cookies could apply to no archive.org request (all expired,
+/// or scoped to another domain) yields a warning so an
+/// unauthenticated-looking 401/403 has an obvious cause.
+pub fn cookie_source(cookie_input: Option<&str>) -> Result<Option<CookieSource>> {
+    let Some(cookie_input) = cookie_input else {
+        return Ok(None);
+    };
+    if Path::new(cookie_input).is_file() {
+        let cookie_file = read_cookie_file(cookie_input)?;
         let cookies = parse_netscape_cookies(&cookie_file);
-        // The file must either hold at least one recognizable Netscape
-        // cookie line or look nothing like a raw cookie pair (no `=`);
-        // otherwise a raw cookie string that merely collides with a
-        // filename in the working directory would be swallowed as an
-        // empty cookies.txt.
-        if !cookies.is_empty() || !input.contains('=') {
-            let header = cookie_header_from_cookies(&cookies, url)?;
-            if header.is_empty() {
+        if !cookies.is_empty() || !cookie_input.contains('=') {
+            let cookies = filter_encodable(cookies);
+            let now = now_secs()?;
+            if !cookies
+                .iter()
+                .any(|c| c.expires.is_none_or(|e| e > now) && is_archive_org_domain(&c.domain))
+            {
                 println!(
                     "{} {} {}",
                     "⚠".yellow().bold(),
                     "No applicable cookies found in".yellow(),
-                    input.dimmed()
+                    cookie_input.dimmed()
                 );
             }
-            return Ok(header);
+            return Ok(Some(CookieSource::Netscape(cookies)));
         }
     }
-    Ok(input.trim().to_string())
+    let header = HeaderValue::from_str(cookie_input.trim())
+        .map_err(|e| IaGetError::InvalidCookie(e.to_string()))?;
+    Ok(Some(CookieSource::Raw(header)))
+}
+
+/// The `Cookie` header for one request URL, from the session source: the
+/// raw string applies as is, the cookies.txt entries are scoped against
+/// `url` (an empty result is `None` — the request goes without a Cookie
+/// header rather than carrying a cookie that does not belong to the path).
+pub fn cookie_header_for(source: Option<&CookieSource>, url: &Url) -> Result<Option<HeaderValue>> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    match source {
+        CookieSource::Raw(header) => Ok(Some(header.clone())),
+        CookieSource::Netscape(cookies) => {
+            let header = cookie_header_from_cookies(cookies, url)?;
+            if header.is_empty() {
+                return Ok(None);
+            }
+            let value = HeaderValue::from_str(&header)
+                .map_err(|e| IaGetError::InvalidCookie(e.to_string()))?;
+            Ok(Some(value))
+        }
+    }
 }
 
 /// Parses Netscape cookies.txt content into the cookies it defines,
@@ -165,62 +217,74 @@ fn cookie_applies_to_url(cookie: &NetscapeCookie, url: &Url, now: u64) -> bool {
     cookie_domain_matches(cookie, url) && cookie_path_matches(cookie, url)
 }
 
-/// Parses Netscape cookies.txt content into an HTTP Cookie header value.
-pub fn cookie_header_from_netscape_file(content: &str, url: &Url) -> Result<String> {
-    cookie_header_from_cookies(&parse_netscape_cookies(content), url)
+/// The current unix seconds (cookie expiry checks); a clock before the
+/// epoch is a hard error, like the old inline version was.
+fn now_secs() -> Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(IaGetError::SystemTime)
+        .map(|now| now.as_secs())
+}
+
+/// Keeps the cookies that can become an HTTP header value; an unencodable
+/// one (a control character or DEL, e.g. from a corrupted browser export)
+/// is dropped with a warning instead of failing the whole run — the
+/// remaining cookies still authenticate the request.
+fn filter_encodable(cookies: Vec<NetscapeCookie>) -> Vec<NetscapeCookie> {
+    cookies
+        .into_iter()
+        .filter(|cookie| {
+            let pair = format!("{}={}", cookie.name, cookie.value);
+            match HeaderValue::from_str(&pair) {
+                Ok(_) => true,
+                Err(_) => {
+                    println!(
+                        "{} {} {}: the cookie value cannot be encoded as an HTTP header",
+                        "⚠".yellow().bold(),
+                        "Skipped cookie".yellow(),
+                        cookie.name.dimmed()
+                    );
+                    false
+                }
+            }
+        })
+        .collect()
 }
 
 /// Builds the HTTP Cookie header value from the parsed cookies that apply
-/// to `url` (domain, path, expiry, `secure` scheme).
+/// to `url` (domain, path, expiry, `secure` scheme). The callers pass
+/// encodable cookies only (see `filter_encodable`).
 ///
-/// A cookie whose name or value cannot become an HTTP header value
-/// (a control character or DEL, e.g. from a corrupted browser export)
-/// is dropped with a warning instead of failing the whole run: the
-/// remaining cookies still authenticate the request.
+/// When several applicable cookies share a name, servers commonly read the
+/// first one in the header: the list is ordered longest path first (RFC
+/// 6265 §5.4), so the most specific value leads. Ties keep the file order
+/// (stable sort).
 fn cookie_header_from_cookies(cookies: &[NetscapeCookie], url: &Url) -> Result<String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(IaGetError::SystemTime)?
-        .as_secs();
-
-    let mut header_parts: Vec<String> = Vec::new();
-    for cookie in cookies
+    let now = now_secs()?;
+    let mut applicable: Vec<&NetscapeCookie> = cookies
         .iter()
         .filter(|cookie| cookie_applies_to_url(cookie, url, now))
-    {
-        let pair = format!("{}={}", cookie.name, cookie.value);
-        match HeaderValue::from_str(&pair) {
-            Ok(_) => header_parts.push(pair),
-            Err(_) => {
-                println!(
-                    "{} {} {}: the cookie value cannot be encoded as an HTTP header",
-                    "⚠".yellow().bold(),
-                    "Skipped cookie".yellow(),
-                    cookie.name.dimmed()
-                );
-            }
-        }
-    }
+        .collect();
+    applicable.sort_by_key(|cookie| std::cmp::Reverse(cookie.path.len()));
 
-    Ok(header_parts.join("; "))
+    Ok(applicable
+        .iter()
+        .map(|cookie| format!("{}={}", cookie.name, cookie.value))
+        .collect::<Vec<_>>()
+        .join("; "))
+}
+
+/// Parses Netscape cookies.txt content into an HTTP Cookie header value.
+pub fn cookie_header_from_netscape_file(content: &str, url: &Url) -> Result<String> {
+    let cookies = filter_encodable(parse_netscape_cookies(content));
+    cookie_header_from_cookies(&cookies, url)
 }
 
 /// Resolves the `--cookies` CLI input (raw string or cookies.txt path) into
 /// a `Cookie` header value for requests to `url`, or `None` when no cookies
-/// apply.
+/// apply — the one-shot form of [`cookie_source`] + [`cookie_header_for`].
 pub fn cookie_header_value(cookie_input: Option<&str>, url: &Url) -> Result<Option<HeaderValue>> {
-    let Some(cookie_input) = cookie_input else {
-        return Ok(None);
-    };
-
-    let cookie_header = cookie_header_from_input(cookie_input, url)?;
-    if cookie_header.is_empty() {
-        return Ok(None);
-    }
-
-    let value = HeaderValue::from_str(&cookie_header)
-        .map_err(|e| IaGetError::InvalidCookie(e.to_string()))?;
-    Ok(Some(value))
+    cookie_header_for(cookie_source(cookie_input)?.as_ref(), url)
 }
 
 /// Adds the `Cookie` header to a request builder when a cookie value is
@@ -283,13 +347,33 @@ archive.org\tFALSE\t/download/private\tFALSE\t2145916800\tprivate-only\tsecret\n
             "download-root=yes"
         );
 
+        // Two applicable cookies: the most specific path leads
         assert_eq!(
             cookie_header_from_netscape_file(
                 cookies,
                 &cookie_test_url("/download/private/file.zip")
             )
             .unwrap(),
-            "download-root=yes; private-only=secret"
+            "private-only=secret; download-root=yes"
+        );
+    }
+
+    #[test]
+    fn cookie_header_orders_same_name_by_path_specificity() {
+        // A server that reads only the first value of a repeated name must
+        // see the file-scoped cookie, not the route-wide one: longest path
+        // first (RFC 6265 §5.4), ties keeping the file order.
+        let cookies = "# Netscape HTTP Cookie File\n\
+archive.org\tFALSE\t/download/item1\tFALSE\t2145916800\tsession\tfile-scope\n\
+archive.org\tFALSE\t/\tFALSE\t2145916800\tsession\troute-scope\n";
+
+        assert_eq!(
+            cookie_header_from_netscape_file(
+                cookies,
+                &cookie_test_url("/download/item1/item1_files.xml")
+            )
+            .unwrap(),
+            "session=file-scope; session=route-scope"
         );
     }
 
@@ -398,6 +482,45 @@ archive.org\tFALSE\t/\tFALSE\t2145916800\tcurrent\tvalue\n";
             header,
             input.trim(),
             "the cookie-looking input must survive"
+        );
+    }
+
+    #[test]
+    fn cookie_source_scopes_each_request_url_its_own_way() {
+        // A file with a route cookie and an item-path cookie: each request
+        // URL is matched on its own, so the file under item1 sees both
+        // (most specific first) and the unrelated item2 sees only the route
+        // one.
+        let dir = TempDir::new("cookie_source_scope");
+        let input = cookie_input_file(
+            &dir,
+            "cookies.txt",
+            "# Netscape HTTP Cookie File\n\
+archive.org\tFALSE\t/\tFALSE\t2145916800\tlogin\troot\n\
+archive.org\tFALSE\t/download/item1\tFALSE\t2145916800\tlogin\titem-scope\n",
+        );
+        let source = cookie_source(Some(&input))
+            .expect("the file must parse into a source")
+            .expect("cookies were given");
+
+        let xml_url = cookie_test_url("/download/item1/item1_files.xml");
+        let other_item_url = cookie_test_url("/download/item2/other.bin");
+        assert_eq!(
+            cookie_header_for(Some(&source), &xml_url)
+                .unwrap()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "login=item-scope; login=root"
+        );
+        assert_eq!(
+            cookie_header_for(Some(&source), &other_item_url)
+                .unwrap()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "login=root",
+            "the item-scoped cookie must not ride along on item2"
         );
     }
 }

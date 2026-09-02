@@ -132,27 +132,44 @@ pub(crate) fn check_existing_file(
     expected_size: Option<u64>,
     running: &Arc<AtomicBool>,
 ) -> Result<ExistingFileStatus> {
-    if !Path::new(file_path).exists() {
-        return Ok(ExistingFileStatus::Missing);
-    }
-    // A symlink at the final path would be followed by every check below
-    // (size, hash, and the mtime sync that the caller performs on a
-    // verified file), reaching whatever the link points at: treat it like
-    // the directory case — unreadable, left in place.
-    if Path::new(file_path)
-        .symlink_metadata()
-        .is_ok_and(|m| m.file_type().is_symlink())
-    {
-        return Ok(ExistingFileStatus::Unreadable(
-            "a symlink occupies the file path".to_string(),
-        ));
-    }
-    // A directory at the final path can neither be verified as a file nor
-    // safely removed: report it as unreadable and leave it in place.
-    if Path::new(file_path).is_dir() {
-        return Ok(ExistingFileStatus::Unreadable(
-            "a directory occupies the file path".to_string(),
-        ));
+    let path = Path::new(file_path);
+    match fs::symlink_metadata(path) {
+        // A symlink at the final path — valid or dangling (exists() follows
+        // the link and would misreport a dangling one as Missing) — would
+        // be followed by every check below (size, hash, and the mtime sync
+        // or removal the caller performs): unreadable, left in place.
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Ok(ExistingFileStatus::Unreadable(
+                "a symlink occupies the file path".to_string(),
+            ));
+        }
+        // A directory at the final path can neither be verified as a file
+        // nor safely removed: report it as unreadable and leave it in
+        // place.
+        Ok(meta) if meta.file_type().is_dir() => {
+            return Ok(ExistingFileStatus::Unreadable(
+                "a directory occupies the file path".to_string(),
+            ));
+        }
+        // Only a regular file can be verified: a FIFO (or other special
+        // file) would hang the size/hash reads below indefinitely.
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Ok(ExistingFileStatus::Unreadable(
+                "a non-regular file occupies the file path".to_string(),
+            ));
+        }
+        // Absent: download from scratch.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ExistingFileStatus::Missing);
+        }
+        // Unreadable even to stat (e.g. no permission): nothing can be
+        // verified, the file is kept and the problem reported.
+        Err(e) => {
+            return Ok(ExistingFileStatus::Unreadable(format!(
+                "could not read file: {e}"
+            )));
+        }
+        Ok(_) => {}
     }
 
     let mismatch = match size_mismatch(file_path, expected_size) {
@@ -342,5 +359,55 @@ mod tests {
             other => panic!("expected Unreadable, got {other:?}"),
         }
         assert!(link.exists(), "the symlink must be left in place");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_at_final_path_is_unreadable_not_missing() {
+        // exists() follows the link and would misreport a dangling one as
+        // Missing: a download would then run pointlessly and only fail at
+        // the install step. The link itself must be reported.
+        let dir = TempDir::new("dangling_symlink");
+        let gone = dir.join("gone.bin");
+        let link = dir.join("file.bin");
+        std::os::unix::fs::symlink(&gone, &link).unwrap();
+
+        let status =
+            check_existing_file(link.to_str().unwrap(), None, Some(16), &test_running()).unwrap();
+
+        match status {
+            ExistingFileStatus::Unreadable(reason) => {
+                assert!(reason.contains("symlink"), "got: {reason}");
+            }
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_at_final_path_is_unreadable() {
+        // A FIFO (or other special file) where the file is expected must
+        // not be opened for reading: a size/hash read on it would block.
+        let dir = TempDir::new("fifo_final");
+        let fifo = dir.join("file.bin");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("skipping: mkfifo unavailable");
+            return;
+        }
+
+        let status =
+            check_existing_file(fifo.to_str().unwrap(), None, Some(16), &test_running()).unwrap();
+
+        match status {
+            ExistingFileStatus::Unreadable(reason) => {
+                assert!(reason.contains("non-regular"), "got: {reason}");
+            }
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
     }
 }

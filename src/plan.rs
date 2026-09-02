@@ -67,7 +67,11 @@ pub fn join_output_dir(output_dir: &str, path: &str) -> String {
 /// A case-sensitive macOS volume is treated like the default: entries
 /// differing only by case are still skipped — the conservative choice,
 /// since a volume's case sensitivity is not detectable portably.
-fn local_path_key(path: &str) -> String {
+///
+/// Also shared by `check.rs`: disk names and metadata names must be
+/// compared with the same normalization or a differing case reads as
+/// "missing + extra" on case-insensitive filesystems.
+pub(crate) fn local_path_key(path: &str) -> String {
     #[cfg(target_os = "linux")]
     {
         path.to_string()
@@ -143,6 +147,7 @@ fn warning_line(label: &str, details: String) -> String {
 /// The download plan: the tasks that will actually run, how many file
 /// names were sanitized, and the warning lines (sanitized, collided and
 /// skipped entries) that the caller prints.
+#[derive(Debug)]
 pub struct DownloadPlan {
     pub tasks: Vec<DownloadTask>,
     pub sanitized_count: usize,
@@ -259,6 +264,14 @@ pub fn plan_download_tasks(
             expected_md5: file.md5,
             expected_size: file.size,
             expected_mtime: file.mtime,
+        });
+    }
+
+    // Every candidate was skipped (each name encodes to an empty URL
+    // path): an empty plan must not read as "nothing to do, success"
+    if tasks.is_empty() {
+        return Err(IaGetError::NoFilesSelected {
+            identifier: target.identifier.clone(),
         });
     }
 
@@ -380,6 +393,20 @@ mod tests {
             plan.warnings.len(),
             2,
             "each skipped entry must leave a warning line"
+        );
+    }
+
+    #[test]
+    fn plan_download_tasks_rejects_a_plan_where_every_entry_skips() {
+        // All names encode to an empty URL path: the plan is empty, and an
+        // empty plan must not read as "nothing to do, success"
+        let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
+        let files = vec![xml_file("", Some(10)), xml_file("//", None)];
+        let err = plan_download_tasks(files, &base, "", &whole_item())
+            .expect_err("an all-skipped plan must fail the run");
+        assert!(
+            matches!(err, IaGetError::NoFilesSelected { .. }),
+            "got: {err:?}"
         );
     }
 

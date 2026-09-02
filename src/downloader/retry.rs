@@ -58,16 +58,23 @@ pub(crate) fn backoff_delay(attempt: u32) -> Duration {
     Duration::from_millis(jitter_ms(capped_ms))
 }
 
-/// Parses a Retry-After header value given as an integer number of seconds.
-///
-/// HTTP-date forms are not supported and yield `None`. The result is capped
-/// at `MAX_RETRY_AFTER_SECS`.
+/// Parses a Retry-After header value (RFC 7231): a delta-seconds integer,
+/// or an HTTP-date read as "that moment minus now" (a date already in the
+/// past means wait no more). The result is capped at `MAX_RETRY_AFTER_SECS`;
+/// an unparseable value yields `None`.
 pub(crate) fn parse_retry_after(value: &str) -> Option<u64> {
-    value
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(|secs| secs.min(MAX_RETRY_AFTER_SECS))
+    let trimmed = value.trim();
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(secs.min(MAX_RETRY_AFTER_SECS));
+    }
+    let date = httpdate::parse_http_date(trimmed).ok()?;
+    let now = SystemTime::now();
+    Some(
+        date.duration_since(now)
+            .unwrap_or_default()
+            .as_secs()
+            .min(MAX_RETRY_AFTER_SECS),
+    )
 }
 
 /// Tracks how many times a file transfer has been retried and how long to
@@ -110,6 +117,13 @@ impl RetryTracker {
         print_retry_notice(kind, self.count, MAX_RETRIES, detail);
         print_retry_wait(&delay, retry_after_secs.is_some());
 
+        // A zero delay (e.g. Retry-After: 0) skips the wait loop below
+        // entirely: check the flag here so a stop already requested is
+        // honored before the next request goes out.
+        if !running.load(Ordering::SeqCst) {
+            return Err(IaGetError::Interrupted);
+        }
+
         // Sleep in slices and check the flag at each slice boundary: a
         // Ctrl+C during a long wait (a server-requested Retry-After of up
         // to 15 min) must stop the retry loop without sleeping the whole
@@ -139,7 +153,30 @@ mod tests {
         assert_eq!(parse_retry_after("999999"), Some(MAX_RETRY_AFTER_SECS));
         assert_eq!(parse_retry_after(""), None);
         assert_eq!(parse_retry_after("next tuesday"), None);
-        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_http_date() {
+        // A past HTTP-date means "wait no more" (RFC 7231: a Retry-After
+        // date earlier than the current time is equivalent to 0)
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), Some(0));
+
+        // A date a few minutes out yields that many seconds (the
+        // parse-to-compare window allows a second of drift)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("valid clock")
+            .as_secs();
+        let date = httpdate::fmt_http_date(UNIX_EPOCH + Duration::from_secs(now + 300));
+        let secs = parse_retry_after(&date).expect("an HTTP-date must parse");
+        assert!(
+            (299..=301).contains(&secs),
+            "a 300s-out date must yield ~300s, got {secs}"
+        );
+
+        // Beyond the cap the date is clamped
+        let far = httpdate::fmt_http_date(UNIX_EPOCH + Duration::from_secs(now + 86_400));
+        assert_eq!(parse_retry_after(&far), Some(MAX_RETRY_AFTER_SECS));
     }
 
     #[test]

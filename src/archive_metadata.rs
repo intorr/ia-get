@@ -1,4 +1,4 @@
-use crate::cookie::with_cookie;
+use crate::cookie::{CookieSource, cookie_header_for, with_cookie};
 use crate::display::{format_size, print_mtime_warning};
 use crate::downloader::{parse_last_modified, sync_file_mtime};
 use crate::fs::ensure_not_symlink;
@@ -239,7 +239,9 @@ pub async fn is_url_accessible(
 /// Accepts `https://archive.org/details/<identifier>` (a whole item) and
 /// `https://archive.org/download/<identifier>/<file>` (one file); a
 /// details URL with a path after the identifier is read the same way as a
-/// download one.
+/// download one. A query or fragment is URL structure, never file-name
+/// content (a name's `?`/`#` would arrive percent-encoded), so it is
+/// dropped before matching.
 ///
 /// # Arguments
 /// * `url` - The URL to parse
@@ -264,7 +266,10 @@ pub async fn is_url_accessible(
 /// assert!(parse_archive_url("https://example.com/invalid").is_err());
 /// ```
 pub fn parse_archive_url(url: &str) -> Result<ArchiveTarget> {
-    let Some(caps) = URL_REGEX.captures(url) else {
+    // A literal '?' or '#' delimits the query/fragment (RFC 3986); only
+    // the path names the item and the file
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let Some(caps) = URL_REGEX.captures(path) else {
         return Err(IaGetError::UrlFormat(url.to_string()));
     };
 
@@ -393,20 +398,23 @@ pub struct XmlMetadata {
 
 /// Fetches, downloads and parses a `_files.xml` document from an explicit URL.
 ///
-/// The `Cookie` header (if any) is precomputed by the caller against the
-/// download URL, so the metadata fetch and the file downloads of one run
-/// share a single header.
+/// The session's cookie source (if any) is scoped against this URL — a raw
+/// header applies as is, a parsed cookies.txt contributes exactly the
+/// cookies whose path/domain cover it — so the metadata fetch and the file
+/// downloads of one run each carry the right header for their URL.
 pub async fn fetch_and_parse_xml(
     xml_url: &Url,
     client: &Client,
-    cookie_header: Option<&HeaderValue>,
+    cookie_source: Option<&CookieSource>,
 ) -> Result<XmlMetadata> {
+    let cookie_header = cookie_header_for(cookie_source, xml_url)?;
+
     // The accessibility pre-check's failure (a definitive 404/410) is
     // reported by the caller's spinner error path, which carries the full
     // detail (e.g. "the archive identifier may be incorrect").
-    is_url_accessible(xml_url, client, cookie_header).await?;
+    is_url_accessible(xml_url, client, cookie_header.as_ref()).await?;
 
-    let request = with_cookie(client.get(xml_url.clone()), cookie_header);
+    let request = with_cookie(client.get(xml_url.clone()), cookie_header.as_ref());
 
     // The HEAD check above can pass while the GET still fails (throttling,
     // transient edge errors): surface it as a network error instead of
@@ -704,6 +712,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_archive_url_drops_query_and_fragment() {
+        // A query or fragment is URL structure: it must not leak into the
+        // file path (where it would fail the metadata match)
+        let target =
+            parse_archive_url("https://archive.org/download/item1/scan/01.pdf?session=abc#top")
+                .expect("a URL with query and fragment must parse");
+        assert_eq!(target.identifier, "item1");
+        assert_eq!(target.file_path.as_deref(), Some("scan/01.pdf"));
+
+        let target = parse_archive_url("https://archive.org/details/item1?x=1").expect("details");
+        assert_eq!(target.identifier, "item1");
+        assert!(target.file_path.is_none());
+    }
+
+    #[test]
     fn parse_archive_url_percent_decodes_file_paths() {
         // Spaces and URL-special characters arrive percent-encoded and
         // must decode back to the archive's original names
@@ -929,9 +952,9 @@ mod tests {
             ],
         );
         let client = Client::new();
-        let header = HeaderValue::from_static("session=abc123");
+        let source = CookieSource::Raw(HeaderValue::from_static("session=abc123"));
 
-        fetch_and_parse_xml(&url, &client, Some(&header))
+        fetch_and_parse_xml(&url, &client, Some(&source))
             .await
             .expect("metadata fetch should succeed");
         assert_eq!(

@@ -90,23 +90,28 @@ pub fn print_file_banner(file_path: &str, number: usize, total: usize) {
 /// A configured spinner
 pub fn create_spinner(message: &str) -> ProgressBar {
     let spinner = ProgressBar::new_spinner();
+    // The template is a constant: user-controlled text (the archive URL)
+    // rides in the {msg} property, never in the template itself — a '{'
+    // in the URL would otherwise break the template parser and panic
+    // before URL validation.
     spinner.set_style(
         ProgressStyle::default_spinner()
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-            .template(&format!("{} {}", "{spinner}".yellow().bold(), message))
-            .expect("Failed to set spinner style"),
+            .template("{spinner:.yellow} {msg}")
+            .expect("constant spinner template"),
     );
+    spinner.set_message(message.to_string());
     spinner.enable_steady_tick(Duration::from_millis(SPINNER_TICK_INTERVAL));
     spinner
 }
 
 /// Restyles a running spinner as a static completion message and finishes it
 pub fn finish_spinner(spinner: &ProgressBar, message: &str) {
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template(message)
-            .expect("Failed to set spinner style"),
-    );
+    // Constant template, message via the property: the completion text
+    // (which may carry user input, e.g. the -o directory) must not be
+    // parsed as template syntax
+    spinner.set_style(ProgressStyle::with_template("{msg}").expect("constant style template"));
+    spinner.set_message(message.to_string());
     spinner.finish();
 }
 
@@ -292,5 +297,20 @@ pub fn format_size(size: u64) -> String {
     } else {
         let (value, unit) = scaled_unit(size as f64);
         format!("{value:.2}{unit}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spinner_templates_survive_user_controlled_braces() {
+        // A URL (or -o path) carrying '{' must not break the template
+        // parser: user text rides in the message property, the templates
+        // are constants
+        let spinner =
+            create_spinner("Processing archive.org URL: https://archive.org/details/{bad}");
+        finish_spinner(&spinner, "Verifying 1 file in {weird}");
     }
 }

@@ -13,13 +13,14 @@ use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderValue, RANGE, RETRY_AFTER}
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 
 use crate::Result;
-use crate::cookie::with_cookie;
+use crate::cookie::{CookieSource, cookie_header_for, with_cookie};
 use crate::display::{branch_glyph, create_progress_bar, last_glyph, print_downloaded_line};
 use crate::downloader::mtime::parse_last_modified;
 use crate::downloader::rate::RateLimiter;
 use crate::downloader::retry::{INTERRUPT_CHECK_INTERVAL, RetryTracker, parse_retry_after};
 use crate::error::IaGetError;
 use crate::verbose;
+use url::Url;
 
 /// Resolves once the batch has been asked to stop, so a stalled body read
 /// can be aborted at the next check instead of waiting for the next chunk
@@ -58,7 +59,16 @@ async fn stream_response_body(
                     pb.set_position(base_size + downloaded_bytes);
                     // Pace the transfer to the configured rate, if any, so a
                     // limited download does not saturate the connection.
-                    rate.pace(chunk_len).await;
+                    // The pacing sleep is raced against the stop flag: with a
+                    // low --limit-rate a chunk's budget can be minutes long,
+                    // and a Ctrl+C must not wait it out.
+                    tokio::select! {
+                        _ = rate.pace(chunk_len) => {}
+                        _ = wait_for_stop(running) => {
+                            pb.finish_and_clear();
+                            return Err(IaGetError::Interrupted);
+                        }
+                    }
                 }
                 Ok(None) => break,
                 Err(e) => return Err(e.into()),
@@ -119,11 +129,11 @@ fn is_disk_full_error(err: &IaGetError) -> bool {
 /// `Range: bytes=<size>-` resume request when the local prefix is non-empty.
 fn resume_request(
     client: &Client,
-    url: &str,
+    url: &Url,
     cookie_header: Option<&HeaderValue>,
     current_file_size: u64,
 ) -> Result<RequestBuilder> {
-    let mut request = with_cookie(client.get(url), cookie_header);
+    let mut request = with_cookie(client.get(url.clone()), cookie_header);
     if current_file_size > 0 {
         request = request.header(
             RANGE,
@@ -255,11 +265,20 @@ pub(crate) async fn download_file_content(
     url: &str,
     file: &mut File,
     running: &Arc<AtomicBool>,
-    cookie_header: Option<&HeaderValue>,
+    cookie_source: Option<&CookieSource>,
     expected_size: Option<u64>,
     retry_delay: fn(u32) -> Duration,
     rate_limit: Option<u64>,
 ) -> Result<Option<SystemTime>> {
+    // The session's cookies may be path-scoped (a parsed cookies.txt):
+    // resolve the header for this URL once, so exactly the cookies that
+    // cover it ride along on every retry attempt
+    let url = Url::parse(url).map_err(|e| IaGetError::Network {
+        detail: format!("invalid URL {url:?}: {e}"),
+        source: None,
+    })?;
+    let cookie_header = cookie_header_for(cookie_source, &url)?;
+
     let mut retry = RetryTracker::new(retry_delay);
     let mut rate = RateLimiter::new(rate_limit);
 
@@ -274,7 +293,7 @@ pub(crate) async fn download_file_content(
             false => format!("GET {url}"),
         });
 
-        let request = resume_request(client, url, cookie_header, current_file_size)?;
+        let request = resume_request(client, &url, cookie_header.as_ref(), current_file_size)?;
         let mut response = match request.send().await {
             Ok(response) => response,
             Err(e) => {
@@ -427,7 +446,8 @@ mod tests {
     use super::*;
     use crate::downloader::retry::MAX_RETRIES;
     use crate::test_support::{
-        MockBody, MockResponse, file_server, ok_empty, run_download, test_running,
+        MockBody, MockResponse, file_server, ok_empty, run_download, run_download_with_rate,
+        test_running,
     };
     use std::collections::VecDeque;
     use std::fs;
@@ -886,6 +906,48 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "the abort must land within one interrupt check, not the read timeout: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_rate_pacing_stops_waiting() {
+        // At 1 byte/s a 10-byte body paces ~10s: a Ctrl+C must cut the
+        // pacing sleep, not wait the chunk's budget out.
+        let content = b"0123456789";
+        let (server, dir) = file_server(
+            "interrupt_pacing",
+            VecDeque::from(vec![MockResponse::new(
+                200,
+                MockBody::Full(content.to_vec()),
+            )]),
+            ok_empty(),
+        );
+        let part = dir.join("file.bin.part");
+        let running = Arc::new(AtomicBool::new(true));
+        let flag = running.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            flag.store(false, Ordering::SeqCst);
+        });
+
+        let start = Instant::now();
+        let result = run_download_with_rate(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            Some(content.len() as u64),
+            &running,
+            Some(1),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(IaGetError::Interrupted)),
+            "a Ctrl+C during pacing must abort the download, got {result:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "the pacing delay must not hold the interrupt: {:?}",
             start.elapsed()
         );
     }

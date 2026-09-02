@@ -12,7 +12,7 @@ use ia_get::archive_metadata::{
     parse_archive_url, save_xml_metadata, xml_file_name_of,
 };
 use ia_get::check::check_directory;
-use ia_get::cookie::cookie_header_value;
+use ia_get::cookie::cookie_source;
 use ia_get::display::{
     create_spinner, finish_spinner, format_size, last_glyph, print_downloaded_line,
     print_file_banner,
@@ -168,7 +168,10 @@ fn check_disk_space(output_dir: &str, tasks: &[DownloadTask]) -> Result<()> {
 /// the same line, so the call is skipped in that case.
 fn report_spinner_error(spinner: &ProgressBar, error: &IaGetError) {
     if !spinner.is_finished() {
-        spinner.finish_with_message(format!("{} {}", "✘".red().bold(), error));
+        // finish_spinner (not finish_with_message): the error text may
+        // carry user input, and the constant "{msg}" template is the only
+        // one that cannot misparse it
+        finish_spinner(spinner, &format!("{} {}", "✘".red().bold(), error));
     }
 }
 
@@ -217,6 +220,13 @@ fn normalize_output_dir(arg: Option<&str>) -> Result<String> {
         return Ok(String::new());
     };
     let trimmed = dir.trim_end_matches(['/', '\\']);
+    // On Windows "C:\\" trims to "C:", which is drive-relative (the current
+    // directory on that drive), not the requested root: restore the
+    // separator for a bare drive root.
+    #[cfg(windows)]
+    if trimmed.len() == 2 && trimmed.ends_with(':') && trimmed.as_bytes()[0].is_ascii_alphabetic() {
+        return Ok(format!("{trimmed}\\"));
+    }
     if trimmed.is_empty() {
         return Err(IaGetError::InvalidOutputDir(dir.to_string()));
     }
@@ -360,15 +370,11 @@ async fn run(cli: &Cli) -> Result<()> {
     // with a file path, the single file it names
     let target = init_step(&spinner, parse_archive_url(&cli.url))?;
 
-    // The cookie header is computed once against the download URL — the
-    // scope every metadata and file request uses — and reused for the
-    // metadata fetch and the file downloads, so a path-scoped cookie
-    // applies consistently across the run.
+    // The cookie source is resolved once, and each request then picks the
+    // cookies scoped to its own URL, so a path-scoped cookie applies where
+    // it belongs and nowhere else.
     let xml_url = init_step(&spinner, get_xml_url(&target.identifier))?;
-    let cookie_header = init_step(
-        &spinner,
-        cookie_header_value(cli.cookies.as_deref(), &xml_url),
-    )?;
+    let cookie_source = init_step(&spinner, cookie_source(cli.cookies.as_deref()))?;
 
     // The spinner switches from "processing the URL" to the parsing stage
     // before the metadata is fetched: any failure (the accessibility
@@ -387,7 +393,7 @@ async fn run(cli: &Cli) -> Result<()> {
         last_modified,
     } = init_step(
         &spinner,
-        fetch_and_parse_xml(&xml_url, &client, cookie_header.as_ref()).await,
+        fetch_and_parse_xml(&xml_url, &client, cookie_source.as_ref()).await,
     )?;
 
     // If requested, list parsed filenames and exit: a read-only preview,
@@ -583,7 +589,7 @@ async fn run(cli: &Cli) -> Result<()> {
         plan.tasks,
         total_files,
         first_file_number,
-        cookie_header.as_ref(),
+        cookie_source.as_ref(),
         cli.stop_on_error,
         rate_limit,
         &output_dir,
@@ -606,6 +612,13 @@ mod tests {
         assert_eq!(normalize_output_dir(Some("out/sub/")).unwrap(), "out/sub");
         // A leading separator is kept: it names a root-level directory
         assert_eq!(normalize_output_dir(Some("/out/")).unwrap(), "/out");
+        // A bare drive root keeps its separator: "C:" alone is
+        // drive-relative on Windows, not the requested root
+        #[cfg(windows)]
+        {
+            assert_eq!(normalize_output_dir(Some("C:\\")).unwrap(), "C:\\");
+            assert_eq!(normalize_output_dir(Some("c://")).unwrap(), "c:\\");
+        }
     }
 
     #[test]
