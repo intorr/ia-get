@@ -22,7 +22,7 @@ use colored::*;
 use crate::Result;
 use crate::display::format_size;
 use crate::downloader::{calculate_md5, setup_signal_handler};
-use crate::plan::{DownloadPlan, local_path_key};
+use crate::plan::DownloadPlan;
 
 /// The findings of a directory check, grouped by kind.
 ///
@@ -191,19 +191,33 @@ pub fn check_directory(
     let mut files: Vec<String> = Vec::new();
     let mut dirs: Vec<String> = Vec::new();
     walk_into(root, "", &mut files, &mut dirs);
-    // The sets are keyed like the plan's collision detection: disk names
-    // and metadata names differing only by case are one path on
-    // case-insensitive filesystems, not "missing + extra"
-    let file_set: HashSet<String> = files.iter().map(|file| local_path_key(file)).collect();
-    let dir_set: HashSet<String> = dirs.iter().map(|dir| local_path_key(dir)).collect();
+    // Key disk names and metadata names the way the volume treats them:
+    // lowercased on a case-insensitive volume (a case difference is one
+    // path, not "missing + extra"), identity on a case-sensitive one
+    // (collapsing them there would verify the wrong file or pass a check
+    // for a file that does not exist under its expected spelling)
+    let ci = volume_case_insensitive(root, &files);
+    let key = |name: &str| -> String {
+        if ci {
+            name.to_lowercase()
+        } else {
+            name.to_string()
+        }
+    };
+
+    let file_set: HashSet<String> = files.iter().map(|file| key(file)).collect();
+    let dir_set: HashSet<String> = dirs.iter().map(|dir| key(dir)).collect();
 
     let expected_rel: Vec<String> = plan
         .tasks
         .iter()
         .map(|task| expected_rel(&task.file_path, output_dir))
         .collect();
-    let expected_set: HashSet<String> =
-        expected_rel.iter().map(|rel| local_path_key(rel)).collect();
+    let expected_set: HashSet<String> = expected_rel.iter().map(|rel| key(rel)).collect();
+
+    // The `.part` suffix obeys the volume's case rules too, so a leftover
+    // spelled `A.BIN.PART` pairs with its `a.bin` exactly once instead of
+    // being classified both "incomplete" and "extra" (see part_base).
 
     let mut report = CheckReport::default();
 
@@ -211,20 +225,20 @@ pub fn check_directory(
     // the directory is not what a download would have produced (it stays
     // excluded from the size/date/hash comparison, whose self-metadata is
     // unreliable)
-    if whole_item && !file_set.contains(&local_path_key(xml_file_name)) {
+    if whole_item && !file_set.contains(&key(xml_file_name)) {
         report.missing.push(xml_file_name.to_string());
     }
 
     // Classify each planned file against what is on disk.
     for (task, rel) in plan.tasks.iter().zip(expected_rel.iter()) {
-        if dir_set.contains(&local_path_key(rel)) {
+        if dir_set.contains(&key(rel)) {
             // A directory where a file is expected can never be right.
             report.type_mismatch.push(rel.clone());
             continue;
         }
-        if !file_set.contains(&local_path_key(rel)) {
+        if !file_set.contains(&key(rel)) {
             let part = format!("{rel}.part");
-            if file_set.contains(&local_path_key(&part)) {
+            if file_set.contains(&key(&part)) {
                 let have = fs::metadata(root.join(&part))
                     .ok()
                     .map(|meta| meta.len())
@@ -250,7 +264,7 @@ pub fn check_directory(
 
         // A .part next to a complete file is a stale leftover.
         let part = format!("{rel}.part");
-        if file_set.contains(&local_path_key(&part)) {
+        if file_set.contains(&key(&part)) {
             report.extra.push(part);
         }
 
@@ -309,13 +323,11 @@ pub fn check_directory(
     // whole-item runs (it is always saved and reported above when absent),
     // so it is not flagged as extra.
     for rel in &files {
-        if expected_set.contains(&local_path_key(rel))
-            || (whole_item && local_path_key(rel) == local_path_key(xml_file_name))
-        {
+        if expected_set.contains(&key(rel)) || (whole_item && key(rel) == key(xml_file_name)) {
             continue;
         }
-        if let Some(base) = rel.strip_suffix(".part")
-            && expected_set.contains(&local_path_key(base))
+        if let Some(base) = part_base(ci, rel)
+            && expected_set.contains(&key(base))
         {
             // A .part for a planned file is in progress (final still missing)
             // or stale (already reported above) — either way not "extra".
@@ -383,6 +395,62 @@ fn walk_into(dir: &Path, rel_prefix: &str, files: &mut Vec<String>, dirs: &mut V
         }
         // Symlinks and other types are skipped: a symlink where a file is
         // expected surfaces as "missing", which is the safe call.
+    }
+}
+
+/// Whether `root`'s volume treats names differing only by case as one path.
+///
+/// Probed read-only (a check never writes): the first walked file that
+/// carries an ASCII letter is stat-ed under a spelling with that letter's
+/// case flipped — the stat resolves iff the volume is case-insensitive. A
+/// root without such a file cannot be probed: it stays case-sensitively
+/// keyed, the conservative direction (a case difference then reports as
+/// missing + extra instead of silently verifying the other spelling). A
+/// volume that somehow holds both spellings of one name probes as
+/// case-insensitive and collapses them — an accepted corner of a read-only
+/// probe.
+fn volume_case_insensitive(root: &Path, files: &[String]) -> bool {
+    files
+        .iter()
+        .find_map(|rel| {
+            let flipped = flip_first_ascii_letter(rel)?;
+            Some(fs::metadata(root.join(&flipped)).is_ok())
+        })
+        .unwrap_or(false)
+}
+
+/// `rel` with its first ASCII letter's case flipped, or `None` when it
+/// holds no ASCII letter to flip.
+fn flip_first_ascii_letter(rel: &str) -> Option<String> {
+    let mut flipped = false;
+    let out = rel
+        .chars()
+        .map(|c| {
+            if !flipped && c.is_ascii_alphabetic() {
+                flipped = true;
+                if c.is_ascii_uppercase() {
+                    c.to_ascii_lowercase()
+                } else {
+                    c.to_ascii_uppercase()
+                }
+            } else {
+                c
+            }
+        })
+        .collect::<String>();
+    if flipped { Some(out) } else { None }
+}
+
+/// The planned name a `.part` leftover stands for: the `.part` suffix is
+/// matched the way the volume treats case — lowercased on a
+/// case-insensitive one (so `A.BIN.PART` pairs with `a.bin`), exactly on a
+/// case-sensitive one.
+fn part_base(ci: bool, rel: &str) -> Option<&str> {
+    if ci {
+        rel.to_lowercase().strip_suffix(".part")?;
+        Some(&rel[..rel.len() - 5])
+    } else {
+        rel.strip_suffix(".part")
     }
 }
 
@@ -677,6 +745,54 @@ mod tests {
             assert!(report.missing.is_empty(), "{:?}", report.missing);
             assert!(report.extra.is_empty(), "{:?}", report.extra);
         }
+    }
+
+    #[test]
+    fn differing_case_part_is_classified_once() {
+        // A leftover spelled "A.BIN.PART" for the expected "a.bin": on a
+        // case-insensitive volume it is the same .part — exactly one finding
+        // (incomplete), not incomplete + extra
+        let (dir, output_dir) = harness("check_case_part");
+        fs::write(dir.join("A.BIN.PART"), vec![0u8; 40]).unwrap();
+        let report = check_directory(
+            &plan(vec![task(
+                "https://x/a.bin",
+                path_str(&dir, "a.bin"),
+                None,
+                Some(100),
+                None,
+            )]),
+            "item_files.xml",
+            false,
+            &output_dir,
+            false,
+        )
+        .unwrap();
+
+        #[cfg(target_os = "linux")]
+        {
+            // Linux: "A.BIN.PART" is a different name — missing + extra
+            assert_eq!(report.missing, vec!["a.bin".to_string()]);
+            assert_eq!(report.extra, vec!["A.BIN.PART".to_string()]);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(report.incomplete, vec![("a.bin".to_string(), 40, 100)]);
+            assert!(report.extra.is_empty(), "{:?}", report.extra);
+            assert!(report.missing.is_empty(), "{:?}", report.missing);
+        }
+    }
+
+    #[test]
+    fn flip_first_ascii_letter_flips_only_the_first() {
+        assert_eq!(flip_first_ascii_letter("A.BIN"), Some("a.BIN".to_string()));
+        assert_eq!(flip_first_ascii_letter("a.bin"), Some("A.bin".to_string()));
+        // A non-ASCII prefix is skipped, the first ASCII letter flips
+        assert_eq!(
+            flip_first_ascii_letter("файл.bin"),
+            Some("файл.Bin".to_string())
+        );
+        assert_eq!(flip_first_ascii_letter("123"), None);
     }
 
     #[test]

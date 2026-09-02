@@ -62,7 +62,7 @@ pub enum CookieSource {
 /// URLs should use [`cookie_source`] + [`cookie_header_for`] instead, so each
 /// URL sees exactly the cookies scoped to it.
 pub fn cookie_header_from_input(input: &str, url: &Url) -> Result<String> {
-    let source = cookie_source(Some(input))?;
+    let source = cookie_source(Some(input), url)?;
     let header = cookie_header_for(source.as_ref(), url)?;
     Ok(header
         .map(|header| header.to_str().unwrap_or_default().to_string())
@@ -78,10 +78,12 @@ pub fn cookie_header_from_input(input: &str, url: &Url) -> Result<String> {
 /// collides with a filename in the working directory is kept as a cookie
 /// string instead of being silently swallowed as an empty cookies.txt.
 ///
-/// A file whose cookies could apply to no archive.org request (all expired,
-/// or scoped to another domain) yields a warning so an
-/// unauthenticated-looking 401/403 has an obvious cause.
-pub fn cookie_source(cookie_input: Option<&str>) -> Result<Option<CookieSource>> {
+/// A file whose cookies could apply to no request of this session (all
+/// expired, or scoped to another host — the requests use the host of `url`
+/// exactly, so a subdomain-scoped cookie like `www.archive.org` counts as
+/// inapplicable) yields a warning so an unauthenticated-looking 401/403 has
+/// an obvious cause.
+pub fn cookie_source(cookie_input: Option<&str>, url: &Url) -> Result<Option<CookieSource>> {
     let Some(cookie_input) = cookie_input else {
         return Ok(None);
     };
@@ -93,7 +95,7 @@ pub fn cookie_source(cookie_input: Option<&str>) -> Result<Option<CookieSource>>
             let now = now_secs()?;
             if !cookies
                 .iter()
-                .any(|c| c.expires.is_none_or(|e| e > now) && is_archive_org_domain(&c.domain))
+                .any(|c| c.expires.is_none_or(|e| e > now) && cookie_domain_matches(c, url))
             {
                 println!(
                     "{} {} {}",
@@ -284,7 +286,7 @@ pub fn cookie_header_from_netscape_file(content: &str, url: &Url) -> Result<Stri
 /// a `Cookie` header value for requests to `url`, or `None` when no cookies
 /// apply — the one-shot form of [`cookie_source`] + [`cookie_header_for`].
 pub fn cookie_header_value(cookie_input: Option<&str>, url: &Url) -> Result<Option<HeaderValue>> {
-    cookie_header_for(cookie_source(cookie_input)?.as_ref(), url)
+    cookie_header_for(cookie_source(cookie_input, url)?.as_ref(), url)
 }
 
 /// Adds the `Cookie` header to a request builder when a cookie value is
@@ -486,6 +488,32 @@ archive.org\tFALSE\t/\tFALSE\t2145916800\tcurrent\tvalue\n";
     }
 
     #[test]
+    fn cookie_source_keeps_subdomain_scoped_cookies_but_never_sends_them() {
+        // A cookie scoped to www.archive.org can apply to no request of this
+        // session (every request uses the archive.org host): the warning
+        // must not be suppressed by subdomain acceptance, and the cookie
+        // must never reach a header
+        let dir = TempDir::new("cookie_source_www");
+        let input = cookie_input_file(
+            &dir,
+            "cookies.txt",
+            "# Netscape HTTP Cookie File\n\
+www.archive.org\tTRUE\t/\tFALSE\t2145916800\tsession\tvalue\n",
+        );
+        let source = cookie_source(
+            Some(&input),
+            &cookie_test_url("/download/item1/item1_files.xml"),
+        )
+        .expect("the entry must still be retained")
+        .expect("a source was given");
+        assert_eq!(
+            cookie_header_for(Some(&source), &cookie_test_url("/download/item1/file.bin")).unwrap(),
+            None,
+            "a www-scoped cookie must never reach an archive.org request"
+        );
+    }
+
+    #[test]
     fn cookie_source_scopes_each_request_url_its_own_way() {
         // A file with a route cookie and an item-path cookie: each request
         // URL is matched on its own, so the file under item1 sees both
@@ -499,9 +527,12 @@ archive.org\tFALSE\t/\tFALSE\t2145916800\tcurrent\tvalue\n";
 archive.org\tFALSE\t/\tFALSE\t2145916800\tlogin\troot\n\
 archive.org\tFALSE\t/download/item1\tFALSE\t2145916800\tlogin\titem-scope\n",
         );
-        let source = cookie_source(Some(&input))
-            .expect("the file must parse into a source")
-            .expect("cookies were given");
+        let source = cookie_source(
+            Some(&input),
+            &cookie_test_url("/download/item1/item1_files.xml"),
+        )
+        .expect("the file must parse into a source")
+        .expect("cookies were given");
 
         let xml_url = cookie_test_url("/download/item1/item1_files.xml");
         let other_item_url = cookie_test_url("/download/item2/other.bin");

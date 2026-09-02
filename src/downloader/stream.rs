@@ -270,14 +270,14 @@ pub(crate) async fn download_file_content(
     retry_delay: fn(u32) -> Duration,
     rate_limit: Option<u64>,
 ) -> Result<Option<SystemTime>> {
-    // The session's cookies may be path-scoped (a parsed cookies.txt):
-    // resolve the header for this URL once, so exactly the cookies that
-    // cover it ride along on every retry attempt
+    // The session's cookies may be path-scoped (a parsed cookies.txt): the
+    // header is resolved against this URL on every attempt — a cookies.txt
+    // entry can expire while a retry wait is out (up to the 15-minute
+    // Retry-After cap), and a stale Cookie header must not outlive it
     let url = Url::parse(url).map_err(|e| IaGetError::Network {
         detail: format!("invalid URL {url:?}: {e}"),
         source: None,
     })?;
-    let cookie_header = cookie_header_for(cookie_source, &url)?;
 
     let mut retry = RetryTracker::new(retry_delay);
     let mut rate = RateLimiter::new(rate_limit);
@@ -293,6 +293,7 @@ pub(crate) async fn download_file_content(
             false => format!("GET {url}"),
         });
 
+        let cookie_header = cookie_header_for(cookie_source, &url)?;
         let request = resume_request(client, &url, cookie_header.as_ref(), current_file_size)?;
         let mut response = match request.send().await {
             Ok(response) => response,

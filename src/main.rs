@@ -374,7 +374,7 @@ async fn run(cli: &Cli) -> Result<()> {
     // cookies scoped to its own URL, so a path-scoped cookie applies where
     // it belongs and nowhere else.
     let xml_url = init_step(&spinner, get_xml_url(&target.identifier))?;
-    let cookie_source = init_step(&spinner, cookie_source(cli.cookies.as_deref()))?;
+    let cookie_source = init_step(&spinner, cookie_source(cli.cookies.as_deref(), &xml_url))?;
 
     // The spinner switches from "processing the URL" to the parsing stage
     // before the metadata is fetched: any failure (the accessibility
