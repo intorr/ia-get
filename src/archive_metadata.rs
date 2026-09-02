@@ -994,11 +994,16 @@ mod tests {
             ],
         };
 
+        // The expected marker is built with the same colored primitive the
+        // function under test uses, so the assertion holds whether colored
+        // renders ANSI (a TTY, or CLICOLOR_FORCE on a developer's box) or
+        // stays plain (captured/pipe output) — and the dimmed styling of
+        // the marker stays pinned
         assert_eq!(
             list_file_rows(&files, "item1_files.xml"),
             vec![
                 "  12.06KB cover.jpg".to_string(),
-                "      23B item1_files.xml (metadata)".to_string(),
+                format!("      23B item1_files.xml {}", "(metadata)".dimmed()),
             ]
         );
     }
