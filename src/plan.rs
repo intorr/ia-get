@@ -164,13 +164,14 @@ pub struct DownloadPlan {
 /// single-file run reserves nothing.
 ///
 /// Entries whose name encodes to an empty URL path (an empty name, or
-/// slashes only) are skipped: joining `""` would resolve to the metadata
-/// URL itself. Likewise, an entry whose sanitized local path collides with
-/// an earlier entry's is skipped, so one file never overwrites another and
-/// a file never lands where another entry needs a directory (or the
-/// reverse). Collisions are compared case-insensitively on case-insensitive
-/// filesystems (Windows, default macOS), where "a.pdf" and "A.pdf" are the
-/// same path.
+/// slashes only), and entries carrying a `.` / `..` component (which would
+/// encode to a different file than the one named) are skipped with a
+/// warning: joining `""` would resolve to the metadata URL itself. Likewise,
+/// an entry whose sanitized local path collides with an earlier entry's is
+/// skipped, so one file never overwrites another and a file never lands
+/// where another entry needs a directory (or the reverse). Collisions are
+/// compared case-insensitively on case-insensitive filesystems (Windows,
+/// default macOS), where "a.pdf" and "A.pdf" are the same path.
 ///
 /// A failed URL join aborts the run: silently keeping the base URL would
 /// download the metadata file under the file's name.
@@ -201,6 +202,22 @@ pub fn plan_download_tasks(
     }
 
     for file in files {
+        // A "." / ".." component encodes away: the URL that would be
+        // requested names a different file than the entry (and the local
+        // path sanitizes the same way), so downloading it would silently
+        // fetch the wrong bytes — skip the entry explicitly
+        if file
+            .name
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+        {
+            warnings.push(warning_line(
+                "Skipped",
+                format!("{} (dot-segment name)", file.name.dimmed()),
+            ));
+            continue;
+        }
+
         // Percent-encode the name first so '?' / '#' / '%' characters in
         // it cannot split the URL into query or fragment components.
         let encoded_name = encode_download_path(&file.name);
@@ -307,10 +324,13 @@ fn remaining_bytes_for(task: &DownloadTask) -> u64 {
         return 0;
     };
 
-    // A final copy already at the expected size is assumed complete; the
-    // downloader's cheap size check would not re-fetch it.
+    // A final copy already at the expected size is assumed complete — but
+    // only when the metadata gives no hash to prove otherwise: with an MD5,
+    // a size-matched file may still be corrupt, in which case the
+    // downloader removes it and re-downloads the full size
     if let Ok(meta) = std::fs::metadata(&task.file_path)
         && meta.len() == expected
+        && task.expected_md5.is_none()
     {
         return 0;
     }
@@ -696,6 +716,57 @@ mod tests {
             required_download_space(&[done]),
             0,
             "a final file already at its expected size needs no space"
+        );
+    }
+
+    #[test]
+    fn required_download_space_counts_a_size_matched_file_with_md5() {
+        // With an MD5 in the metadata, a size-matched file may still be
+        // corrupt: the downloader would remove it and re-download the full
+        // size, so its bytes count toward the need
+        let dir = TempDir::new("required_space_md5");
+        let path = dir.join("done.md5");
+        std::fs::write(&path, vec![0u8; 1000]).unwrap();
+        let done = task(
+            "https://archive.org/download/item/done.md5",
+            path.to_str().unwrap().to_string(),
+            Some("0123456789abcdef0123456789abcdef".to_string()),
+            Some(1000),
+            None,
+        );
+        assert_eq!(
+            required_download_space(&[done]),
+            1000,
+            "a hash-checked file at its expected size must still count"
+        );
+    }
+
+    #[test]
+    fn plan_download_tasks_skips_dot_segment_names() {
+        // "../outside.mp4" would encode to "outside.mp4" — a different file
+        // than the entry names; the entry must be skipped with a warning,
+        // not silently planned under the re-encoded URL
+        let base = Url::parse("https://archive.org/download/item1/item1_files.xml").unwrap();
+        let files = vec![
+            xml_file("../outside.mp4", Some(1)),
+            xml_file("a/./b.mp4", Some(2)),
+            xml_file("ok.bin", Some(3)),
+        ];
+        let plan = plan_download_tasks(files, &base, "", &whole_item()).expect("plan must build");
+
+        assert_eq!(
+            plan.tasks.len(),
+            1,
+            "dot-segment entries must be skipped, not re-encoded: {:?}",
+            plan.tasks
+        );
+        assert_eq!(plan.tasks[0].file_path, "ok.bin");
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|line| line.contains("dot-segment")),
+            "each skipped entry must leave a warning: {:?}",
+            plan.warnings
         );
     }
 

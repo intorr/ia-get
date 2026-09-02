@@ -68,7 +68,11 @@ fn build_client(proxy: Option<&Proxy>) -> Result<Client> {
         .read_timeout(Duration::from_secs(READ_TIMEOUT_SECS))
         .pool_idle_timeout(Duration::from_secs(POOL_IDLE_TIMEOUT_SECS))
         .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
-        .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_SECS));
+        .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_SECS))
+        // Redirects are followed manually (downloader::stream::
+        // send_following_redirects) so the Cookie header is re-resolved
+        // against each target URL instead of riding along fixed
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(proxy) = proxy {
         builder = builder.proxy(proxy.clone());
     }

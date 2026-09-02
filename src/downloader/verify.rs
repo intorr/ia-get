@@ -55,16 +55,20 @@ pub(crate) fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Resul
     let mut bytes_processed: u64 = 0;
 
     loop {
+        // Checked before every read and again before the EOF break: a stop
+        // requested while the final chunk is being read (or on an empty
+        // file, which would otherwise return its digest without any check)
+        // must not let the run report success
+        if !running.load(Ordering::SeqCst) {
+            finish_progress_bar(&pb);
+            return Err(IaGetError::Interrupted);
+        }
+
         let bytes_read = reader
             .read(&mut buffer)
             .map_err(|e| io_error_with_path(file_path, e))?;
         if bytes_read == 0 {
             break;
-        }
-
-        if !running.load(Ordering::SeqCst) {
-            finish_progress_bar(&pb);
-            return Err(IaGetError::Interrupted);
         }
 
         context.update(&buffer[..bytes_read]);
@@ -330,6 +334,23 @@ mod tests {
             other => panic!("expected Unreadable, got {other:?}"),
         }
         assert!(path.exists(), "an unreadable file must not be deleted");
+    }
+
+    #[test]
+    fn interrupted_before_hashing_an_empty_file() {
+        // An empty file hits EOF on the first read: without a pre-read
+        // interrupt check its digest would be returned for an already
+        // stopped run
+        let dir = TempDir::new("md5_interrupt_empty");
+        let path = dir.join("empty.bin");
+        fs::write(&path, b"").unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+
+        let err = calculate_md5(path.to_str().unwrap(), &stopped).unwrap_err();
+        assert!(
+            matches!(err, IaGetError::Interrupted),
+            "a stop before the first read must abort the hash, got {err:?}"
+        );
     }
 
     #[cfg(unix)]

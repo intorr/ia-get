@@ -3,12 +3,35 @@
 //! edge whitespace and dots, marking reserved device names, and dropping
 //! `.`/`..` components that could escape the working directory.
 
-/// Windows reserved device names (case-insensitive). A path component whose
-/// base name matches one of these gets an underscore appended.
+/// Windows reserved device names (case-insensitive, after the superscript
+/// digit normalization of `device_name_base`). A path component whose base
+/// name matches one of these gets an underscore appended: unmarked, the
+/// open could reach a console or serial/parallel device instead of a file.
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$", "COM1", "COM2", "COM3", "COM4",
+    "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
+    "LPT8", "LPT9",
 ];
+
+/// Normalizes a base name for the device-name comparison: Windows'
+/// device-name matching folds Unicode superscript digits to their ASCII
+/// form, so "COM¹" opens the COM1 device.
+fn device_name_base(base: &str) -> String {
+    base.chars()
+        .map(|c| match c {
+            '¹' => '1',
+            '²' => '2',
+            '³' => '3',
+            '⁴' => '4',
+            '⁵' => '5',
+            '⁶' => '6',
+            '⁷' => '7',
+            '⁸' => '8',
+            '⁹' => '9',
+            _ => c,
+        })
+        .collect()
+}
 
 /// Characters that are invalid in file names on Windows or Unix and are
 /// replaced with underscores
@@ -48,7 +71,7 @@ fn mark_reserved_name(component: &mut String) -> bool {
 
     let is_reserved = WINDOWS_RESERVED_NAMES
         .iter()
-        .any(|reserved| base_name.eq_ignore_ascii_case(reserved));
+        .any(|reserved| device_name_base(base_name).eq_ignore_ascii_case(reserved));
 
     if is_reserved {
         match dot_pos {
@@ -231,6 +254,35 @@ mod tests {
 
         let (result, modified) = sanitize_filename("LPT9.txt");
         assert_eq!(result, "LPT9_.txt");
+        assert!(modified);
+    }
+
+    #[test]
+    fn test_sanitize_console_device_aliases() {
+        // The console's extra device aliases are reserved names too
+        let (result, modified) = sanitize_filename("CONIN$");
+        assert_eq!(result, "CONIN$_");
+        assert!(modified);
+
+        let (result, modified) = sanitize_filename("CONOUT$.txt");
+        assert_eq!(result, "CONOUT$_.txt");
+        assert!(modified);
+
+        let (result, modified) = sanitize_filename("clock$");
+        assert_eq!(result, "clock$_");
+        assert!(modified);
+    }
+
+    #[test]
+    fn test_sanitize_superscript_device_names() {
+        // Windows folds Unicode superscript digits in device-name matching:
+        // "COM¹" would open the COM1 device unmarked
+        let (result, modified) = sanitize_filename("COM¹.txt");
+        assert_eq!(result, "COM¹_.txt");
+        assert!(modified);
+
+        let (result, modified) = sanitize_filename("lpt²");
+        assert_eq!(result, "lpt²_");
         assert!(modified);
     }
 

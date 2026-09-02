@@ -1,11 +1,10 @@
-use crate::cookie::{CookieSource, cookie_header_for, with_cookie};
+use crate::cookie::CookieSource;
 use crate::display::{format_size, print_mtime_warning};
-use crate::downloader::{parse_last_modified, sync_file_mtime};
-use crate::fs::ensure_not_symlink;
+use crate::downloader::{parse_last_modified, send_following_redirects, sync_file_mtime};
+use crate::fs::ensure_regular_or_absent;
 use crate::{IaGetError, Result};
 use colored::*;
 use regex::Regex;
-use reqwest::header::HeaderValue;
 use reqwest::{Client, StatusCode, Url};
 use serde::Deserialize;
 use serde_xml_rs::from_str;
@@ -177,9 +176,11 @@ pub fn save_xml_metadata(
     content: &str,
     last_modified: Option<SystemTime>,
 ) -> Result<()> {
-    // Refuse to write through a pre-planted symlink named "<id>_files.xml":
-    // fs::write would silently truncate whatever the link points at.
-    ensure_not_symlink(path)?;
+    // Refuse to write through a pre-planted symlink named "<id>_files.xml"
+    // (fs::write would silently truncate whatever the link points at) or
+    // into a pre-planted FIFO (a write would block or reach the special
+    // target).
+    ensure_regular_or_absent(path)?;
     std::fs::write(path, content).map_err(|e| crate::error::io_error_with_path(path, e))?;
 
     if let Some(target) = last_modified
@@ -205,14 +206,17 @@ const HEAD_CHECK_TIMEOUT_SECS: u64 = 60;
 pub async fn is_url_accessible(
     url: &Url,
     client: &Client,
-    cookie_header: Option<&HeaderValue>,
+    cookie_source: Option<&CookieSource>,
 ) -> Result<()> {
-    let request = with_cookie(client.head(url.clone()), cookie_header);
-
-    let response = match request
-        .timeout(Duration::from_secs(HEAD_CHECK_TIMEOUT_SECS))
-        .send()
-        .await
+    let response = match send_following_redirects(
+        client,
+        reqwest::Method::HEAD,
+        url,
+        None,
+        cookie_source,
+        Some(Duration::from_secs(HEAD_CHECK_TIMEOUT_SECS)),
+    )
+    .await
     {
         Ok(resp) => resp,
         // Connection-level failure (DNS, TLS, timeout): the GET below will
@@ -407,19 +411,25 @@ pub async fn fetch_and_parse_xml(
     client: &Client,
     cookie_source: Option<&CookieSource>,
 ) -> Result<XmlMetadata> {
-    let cookie_header = cookie_header_for(cookie_source, xml_url)?;
-
     // The accessibility pre-check's failure (a definitive 404/410) is
     // reported by the caller's spinner error path, which carries the full
     // detail (e.g. "the archive identifier may be incorrect").
-    is_url_accessible(xml_url, client, cookie_header.as_ref()).await?;
-
-    let request = with_cookie(client.get(xml_url.clone()), cookie_header.as_ref());
+    is_url_accessible(xml_url, client, cookie_source).await?;
 
     // The HEAD check above can pass while the GET still fails (throttling,
     // transient edge errors): surface it as a network error instead of
-    // feeding an error page into the XML parser.
-    let response = request.send().await?.error_for_status()?;
+    // feeding an error page into the XML parser. Redirects are followed
+    // with the cookie header re-resolved per target.
+    let response = send_following_redirects(
+        client,
+        reqwest::Method::GET,
+        xml_url,
+        None,
+        cookie_source,
+        None,
+    )
+    .await?
+    .error_for_status()?;
     let last_modified = parse_last_modified(response.headers());
     let xml_content = response.text().await?;
 
@@ -459,7 +469,13 @@ pub fn list_file_rows(files: &XmlFiles, xml_file_name: &str) -> Vec<String> {
 
 /// Return a summary for `--list` output.
 pub fn list_summary(files: &XmlFiles) -> String {
-    let total_known_size: u64 = files.files.iter().filter_map(|file| file.size).sum();
+    // A hostile or corrupt metadata document could push the sum past
+    // u64::MAX: saturate instead of panicking (debug) or wrapping (release)
+    let total_known_size = files
+        .files
+        .iter()
+        .filter_map(|file| file.size)
+        .fold(0u64, |total, size| total.saturating_add(size));
     let unknown_size_count = files
         .files
         .iter()
@@ -952,7 +968,7 @@ mod tests {
             ],
         );
         let client = Client::new();
-        let source = CookieSource::Raw(HeaderValue::from_static("session=abc123"));
+        let source = CookieSource::Raw(reqwest::header::HeaderValue::from_static("session=abc123"));
 
         fetch_and_parse_xml(&url, &client, Some(&source))
             .await
@@ -1005,6 +1021,23 @@ mod tests {
                 "  12.06KB cover.jpg".to_string(),
                 format!("      23B item1_files.xml {}", "(metadata)".dimmed()),
             ]
+        );
+    }
+
+    #[test]
+    fn list_summary_saturates_on_overflow() {
+        // Two maximal sizes must not panic (debug) or wrap to a small
+        // total (release): the sum saturates at u64::MAX
+        let files = XmlFiles {
+            files: vec![
+                xml_file("a.bin", Some(u64::MAX)),
+                xml_file("b.bin", Some(u64::MAX)),
+            ],
+        };
+        let summary = list_summary(&files);
+        assert!(
+            !summary.contains("0B total"),
+            "a wrapped total must not read as zero: {summary}"
         );
     }
 

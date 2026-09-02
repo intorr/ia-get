@@ -3,7 +3,7 @@
 //! formatting shared by every printed line.
 
 use colored::*;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::time::Duration;
 
 /// Spinner tick interval in milliseconds
@@ -27,6 +27,10 @@ const GB: u64 = MB * 1024;
 /// A configured progress bar
 pub fn create_progress_bar(total: u64, action: &str, color: &str, with_eta: bool) -> ProgressBar {
     let pb = ProgressBar::new(total);
+    // Progress output belongs on stdout (where the status lines go);
+    // indicatif's default target is stderr, which would put the bars into
+    // the `--verbose 2> log` diagnostics capture
+    pb.set_draw_target(ProgressDrawTarget::stdout());
 
     let template =
         format!("{action}{{elapsed_precise}} {{bar:40.{color}}} {{bytes}}/{{total_bytes}}");
@@ -90,6 +94,9 @@ pub fn print_file_banner(file_path: &str, number: usize, total: usize) {
 /// A configured spinner
 pub fn create_spinner(message: &str) -> ProgressBar {
     let spinner = ProgressBar::new_spinner();
+    // Like the progress bars: the spinner is progress output, stdout —
+    // not part of the `--verbose` stderr diagnostics
+    spinner.set_draw_target(ProgressDrawTarget::stdout());
     // The template is a constant: user-controlled text (the archive URL)
     // rides in the {msg} property, never in the template itself — a '{'
     // in the URL would otherwise break the template parser and panic

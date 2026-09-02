@@ -26,9 +26,9 @@ use crate::plan::DownloadPlan;
 
 /// The findings of a directory check, grouped by kind.
 ///
-/// The hard categories (missing, incomplete, size, md5, type) always fail the
-/// run; the soft ones (date, extra) fail it only in `--strict` mode. `notes`
-/// are informational and never fail the run.
+/// The hard categories (missing, incomplete, size, md5, type, read) always
+/// fail the run; the soft ones (date, extra) fail it only in `--strict`
+/// mode. `notes` are informational and never fail the run.
 #[derive(Debug, Default)]
 pub struct CheckReport {
     /// Files that matched the metadata: present, and size/hash (when checked)
@@ -46,6 +46,10 @@ pub struct CheckReport {
     pub md5_mismatch: Vec<(String, String, String)>,
     /// A directory occupies a path the metadata lists as a file.
     pub type_mismatch: Vec<String>,
+    /// Present, but unreadable: the size could not be read, or the `--md5`
+    /// pass could not hash the file. The download would have verified it, so
+    /// an unverifiable copy fails the check.
+    pub read_failed: Vec<String>,
     /// Present, and the on-disk mtime differs from the metadata's `<mtime>`.
     /// The download prefers the server's `Last-Modified`, so this is a warning
     /// by default, not a failure.
@@ -65,7 +69,8 @@ impl CheckReport {
             + self.incomplete.len()
             + self.size_mismatch.len()
             + self.md5_mismatch.len()
-            + self.type_mismatch.len();
+            + self.type_mismatch.len()
+            + self.read_failed.len();
         let warn = self.date_mismatch.len() + self.extra.len();
         hard + if strict { warn } else { 0 }
     }
@@ -121,6 +126,14 @@ impl CheckReport {
                 "a directory occupies this file path".red()
             );
         }
+        for rel in &self.read_failed {
+            println!(
+                "{} {}  {}",
+                "✘".red().bold(),
+                rel,
+                "unreadable; could not be verified".red()
+            );
+        }
         for rel in &self.date_mismatch {
             println!(
                 "{} {}  {}",
@@ -147,10 +160,11 @@ impl CheckReport {
             + self.incomplete.len()
             + self.size_mismatch.len()
             + self.md5_mismatch.len()
-            + self.type_mismatch.len();
+            + self.type_mismatch.len()
+            + self.read_failed.len();
         println!();
         println!(
-            "{} checked {} file{}: {} ok, {} missing, {} incomplete, {} size, {} md5, {} type, {} date⚠, {} extra⚠",
+            "{} checked {} file{}: {} ok, {} missing, {} incomplete, {} size, {} md5, {} type, {} read, {} date⚠, {} extra⚠",
             "Σ".bold(),
             checked,
             if checked == 1 { "" } else { "s" },
@@ -160,6 +174,7 @@ impl CheckReport {
             self.size_mismatch.len(),
             self.md5_mismatch.len(),
             self.type_mismatch.len(),
+            self.read_failed.len(),
             self.date_mismatch.len(),
             self.extra.len()
         );
@@ -190,7 +205,8 @@ pub fn check_directory(
     };
     let mut files: Vec<String> = Vec::new();
     let mut dirs: Vec<String> = Vec::new();
-    walk_into(root, "", &mut files, &mut dirs);
+    let mut others: Vec<String> = Vec::new();
+    walk_into(root, "", &mut files, &mut dirs, &mut others);
     // Key disk names and metadata names the way the volume treats them:
     // lowercased on a case-insensitive volume (a case difference is one
     // path, not "missing + extra"), identity on a case-sensitive one
@@ -256,8 +272,12 @@ pub fn check_directory(
         let abs = root.join(rel);
         let meta = match fs::metadata(&abs) {
             Ok(meta) => meta,
-            Err(e) => {
-                report.notes.push(format!("could not read {rel}: {e}"));
+            // Present on the walk but not stat-able now (a permission that
+            // changed, a vanishing file): the download would have verified
+            // it, so an unverifiable copy fails the check rather than
+            // staying a note
+            Err(_) => {
+                report.read_failed.push(rel.clone());
                 continue;
             }
         };
@@ -282,9 +302,7 @@ pub fn check_directory(
             match &task.expected_md5 {
                 Some(expected) => {
                     let Some(path_str) = abs.to_str() else {
-                        report
-                            .notes
-                            .push(format!("non-UTF-8 path {rel:?}; hash not verified"));
+                        report.read_failed.push(rel.clone());
                         continue;
                     };
                     match calculate_md5(path_str, &running) {
@@ -296,8 +314,10 @@ pub fn check_directory(
                             continue;
                         }
                         Err(e) if matches!(e, crate::IaGetError::Interrupted) => return Err(e),
-                        Err(e) => {
-                            report.notes.push(format!("could not hash {rel}: {e}"));
+                        // --md5 was requested and the hash could not be
+                        // computed: the copy is unverifiable, a hard finding
+                        Err(_) => {
+                            report.read_failed.push(rel.clone());
                             continue;
                         }
                     }
@@ -331,6 +351,17 @@ pub fn check_directory(
         {
             // A .part for a planned file is in progress (final still missing)
             // or stale (already reported above) — either way not "extra".
+            continue;
+        }
+        report.extra.push(rel.clone());
+    }
+
+    // Non-regular entries (symlinks, FIFOs, ...) nothing explains: extras.
+    // A symlink whose name matches a planned file was already ruled
+    // "missing" above (it is not in the regular-file sets), so it is not
+    // double-reported here.
+    for rel in &others {
+        if expected_set.contains(&key(rel)) {
             continue;
         }
         report.extra.push(rel.clone());
@@ -370,10 +401,20 @@ fn expected_rel(file_path: &str, output_dir: &str) -> String {
     }
 }
 
-/// Recursively collects the regular files and directories under `dir` as
-/// relative paths (always with `/` separators), appending to `files` and
-/// `dirs`. `rel_prefix` is the path of `dir` relative to the scan root.
-fn walk_into(dir: &Path, rel_prefix: &str, files: &mut Vec<String>, dirs: &mut Vec<String>) {
+/// Recursively collects the regular files, directories, and every other
+/// entry (symlinks, FIFOs, ...) under `dir` as relative paths (always with
+/// `/` separators), appending to `files`, `dirs` and `others`. Non-regular
+/// entries are recorded but never followed: a symlink where a file is
+/// expected still surfaces as "missing" (the safe call), and an unexpected
+/// one is reported as extra instead of staying invisible. `rel_prefix` is
+/// the path of `dir` relative to the scan root.
+fn walk_into(
+    dir: &Path,
+    rel_prefix: &str,
+    files: &mut Vec<String>,
+    dirs: &mut Vec<String>,
+    others: &mut Vec<String>,
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -389,32 +430,37 @@ fn walk_into(dir: &Path, rel_prefix: &str, files: &mut Vec<String>, dirs: &mut V
         };
         if file_type.is_dir() {
             dirs.push(rel.clone());
-            walk_into(&entry.path(), &rel, files, dirs);
+            walk_into(&entry.path(), &rel, files, dirs, others);
         } else if file_type.is_file() {
             files.push(rel);
+        } else {
+            others.push(rel);
         }
-        // Symlinks and other types are skipped: a symlink where a file is
-        // expected surfaces as "missing", which is the safe call.
     }
 }
 
 /// Whether `root`'s volume treats names differing only by case as one path.
 ///
-/// Probed read-only (a check never writes): the first walked file that
-/// carries an ASCII letter is stat-ed under a spelling with that letter's
-/// case flipped — the stat resolves iff the volume is case-insensitive. A
-/// root without such a file cannot be probed: it stays case-sensitively
-/// keyed, the conservative direction (a case difference then reports as
-/// missing + extra instead of silently verifying the other spelling). A
-/// volume that somehow holds both spellings of one name probes as
-/// case-insensitive and collapses them — an accepted corner of a read-only
-/// probe.
+/// Probed read-only (a check never writes): a walked file that carries an
+/// ASCII letter is stat-ed under a spelling with that letter's case
+/// flipped. A miss settles the question (case-sensitive); a hit is only
+/// case-insensitivity if the flipped spelling is NOT also present as its
+/// own entry — a case-sensitive volume that holds both spellings (twins)
+/// would otherwise probe as insensitive and collapse the two distinct
+/// paths. A root without such a file cannot be probed: it stays
+/// case-sensitively keyed, the conservative direction (a case difference
+/// then reports as missing + extra instead of silently verifying the other
+/// spelling).
 fn volume_case_insensitive(root: &Path, files: &[String]) -> bool {
     files
         .iter()
         .find_map(|rel| {
             let flipped = flip_first_ascii_letter(rel)?;
-            Some(fs::metadata(root.join(&flipped)).is_ok())
+            if fs::metadata(root.join(&flipped)).is_ok() {
+                Some(!files.iter().any(|other| other == &flipped))
+            } else {
+                Some(false)
+            }
         })
         .unwrap_or(false)
 }
@@ -824,6 +870,97 @@ mod tests {
         )
         .unwrap();
         assert!(single.missing.is_empty(), "{:?}", single.missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unexpected_symlink_is_reported_as_extra() {
+        // A non-regular entry the metadata does not explain: extra, not
+        // invisible (the walk records it without following it)
+        let (dir, output_dir) = harness("check_symlink_extra");
+        let a = make_file(&dir, "a.bin", 10);
+        let link = dir.join("stray-link");
+        std::os::unix::fs::symlink(dir.join("absent-target"), &link).unwrap();
+
+        let report = check_directory(
+            &plan(vec![task("https://x/a.bin", a, None, Some(10), None)]),
+            "item_files.xml",
+            false,
+            &output_dir,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.extra, vec!["stray-link".to_string()]);
+        assert!(report.is_clean(false), "a symlink extra stays a warning");
+        assert!(
+            !report.is_clean(true),
+            "a strict check must see the symlink"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn twin_spellings_stay_distinct_findings() {
+        // A case-sensitive volume holding both spellings of one name: the
+        // probe must not mistake the flipped twin for case-insensitivity —
+        // the expected file verifies, the twin stays extra
+        let (dir, output_dir) = harness("check_twins");
+        fs::write(dir.join("a.bin"), vec![0u8; 10]).unwrap();
+        fs::write(dir.join("A.bin"), vec![0u8; 10]).unwrap();
+
+        let report = check_directory(
+            &plan(vec![task(
+                "https://x/a.bin",
+                path_str(&dir, "a.bin"),
+                None,
+                Some(10),
+                None,
+            )]),
+            "item_files.xml",
+            false,
+            &output_dir,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.ok, vec!["a.bin".to_string()]);
+        assert_eq!(report.extra, vec!["A.bin".to_string()]);
+        assert!(report.missing.is_empty(), "{:?}", report.missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn md5_pass_on_an_unreadable_file_is_a_hard_finding() {
+        // --md5 requested, the hash cannot be computed (no read permission):
+        // an unverifiable copy fails the check, it does not stay a note
+        let (dir, output_dir) = harness("check_md5_unreadable");
+        let path = dir.join("a.bin");
+        fs::write(&path, b"hello").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+
+        let report = check_directory(
+            &plan(vec![task(
+                "https://x/a.bin",
+                path.to_str().unwrap().to_string(),
+                Some(md5_hex(b"hello")),
+                Some(5),
+                None,
+            )]),
+            "item_files.xml",
+            false,
+            &output_dir,
+            true,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(report.read_failed, vec!["a.bin".to_string()]);
+        assert!(
+            !report.is_clean(false),
+            "an unreadable file fails the check"
+        );
     }
 
     #[test]

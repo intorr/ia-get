@@ -64,8 +64,15 @@ pub(crate) fn backoff_delay(attempt: u32) -> Duration {
 /// an unparseable value yields `None`.
 pub(crate) fn parse_retry_after(value: &str) -> Option<u64> {
     let trimmed = value.trim();
-    if let Ok(secs) = trimmed.parse::<u64>() {
-        return Some(secs.min(MAX_RETRY_AFTER_SECS));
+    if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        // A digit-only value is a seconds count: in range it parses,
+        // beyond u64 it clamps to the cap — either way it must not fall
+        // through to the HTTP-date parse
+        return trimmed
+            .parse::<u64>()
+            .map(|secs| secs.min(MAX_RETRY_AFTER_SECS))
+            .ok()
+            .or(Some(MAX_RETRY_AFTER_SECS));
     }
     let date = httpdate::parse_http_date(trimmed).ok()?;
     let now = SystemTime::now();
@@ -151,6 +158,12 @@ mod tests {
         assert_eq!(parse_retry_after("  5 "), Some(5));
         assert_eq!(parse_retry_after("0"), Some(0));
         assert_eq!(parse_retry_after("999999"), Some(MAX_RETRY_AFTER_SECS));
+        // All-digit but beyond u64: a seconds count that overflows, clamped
+        // to the cap (not a misparse into the HTTP-date form)
+        assert_eq!(
+            parse_retry_after("18446744073709551616"),
+            Some(MAX_RETRY_AFTER_SECS)
+        );
         assert_eq!(parse_retry_after(""), None);
         assert_eq!(parse_retry_after("next tuesday"), None);
     }

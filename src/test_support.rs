@@ -281,7 +281,11 @@ impl MockServer {
         let handler_state = state.clone();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                handle_connection(stream, &handler_state);
+                // One thread per connection: a stalled body (which holds
+                // its connection open) must not block later requests on
+                // the same server
+                let state = handler_state.clone();
+                thread::spawn(move || handle_connection(stream, &state));
             }
         });
 

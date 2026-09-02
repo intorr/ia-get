@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 use colored::*;
 use indicatif::ProgressBar;
 use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderValue, RANGE, RETRY_AFTER};
-use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use reqwest::{Client, Method, Response, StatusCode};
 
 use crate::Result;
 use crate::cookie::{CookieSource, cookie_header_for, with_cookie};
@@ -125,27 +125,69 @@ fn is_disk_full_error(err: &IaGetError) -> bool {
     )
 }
 
-/// Builds the next attempt's request: a plain GET for a fresh file, or a
-/// `Range: bytes=<size>-` resume request when the local prefix is non-empty.
-fn resume_request(
+/// The redirect cap a manually followed chain may reach (reqwest's default
+/// automatic policy cap)
+const MAX_REDIRECTS: u32 = 10;
+
+/// Sends a request and follows up to `MAX_REDIRECTS` redirects manually,
+/// re-resolving the `Cookie` header against every target URL: reqwest's
+/// automatic policy would carry the original request's fixed header into
+/// each hop, bypassing the path/domain scoping of parsed cookies — and, on
+/// a redirect that leaves archive.org, leaking them to the foreign host.
+/// The caller's client must have automatic following disabled
+/// (`ClientBuilder::redirect(Policy::none())`, see build_client in
+/// main.rs); this function is the only place a 3xx is consumed. The
+/// `Range` header (when any) rides along: redirects here name the same
+/// resource. A `timeout`, when given, applies per hop.
+pub(crate) async fn send_following_redirects(
     client: &Client,
+    method: Method,
     url: &Url,
-    cookie_header: Option<&HeaderValue>,
-    current_file_size: u64,
-) -> Result<RequestBuilder> {
-    let mut request = with_cookie(client.get(url.clone()), cookie_header);
-    if current_file_size > 0 {
-        request = request.header(
-            RANGE,
-            HeaderValue::from_str(&format!("bytes={current_file_size}-")).map_err(|e| {
-                IaGetError::Network {
-                    detail: format!("Invalid range header value: {e}"),
-                    source: Some(Box::new(e)),
-                }
-            })?,
+    range: Option<&HeaderValue>,
+    cookie_source: Option<&CookieSource>,
+    timeout: Option<Duration>,
+) -> Result<Response> {
+    let mut url = url.clone();
+    let mut redirects = 0u32;
+    loop {
+        let cookie_header = cookie_header_for(cookie_source, &url)?;
+        let mut request = with_cookie(
+            client.request(method.clone(), url.clone()),
+            cookie_header.as_ref(),
         );
+        if let Some(range) = range {
+            request = request.header(RANGE, range.clone());
+        }
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request.send().await.map_err(IaGetError::from)?;
+
+        let status = response.status();
+        if !matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
+            return Ok(response);
+        }
+        redirects += 1;
+        if redirects > MAX_REDIRECTS {
+            return Err(IaGetError::Network {
+                detail: format!("redirect limit exceeded ({MAX_REDIRECTS} redirects)"),
+                source: None,
+            });
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(IaGetError::Network {
+                detail: format!("HTTP {status} without a usable Location header"),
+                source: None,
+            })?;
+        url = url.join(location).map_err(|e| IaGetError::Network {
+            detail: format!("invalid redirect target {location:?}: {e}"),
+            source: None,
+        })?;
+        verbose::log(&format!("  -> {status} redirect to {url}"));
     }
-    Ok(request)
 }
 
 /// Handles a non-success response.
@@ -186,13 +228,13 @@ async fn handle_failed_status(
 
 /// Whether the local prefix may be appended to the server's successful
 /// body: only a 206 whose `Content-Range` starts exactly where the file
-/// ends. A full-body 200 replaces the file; any other status (e.g. 204)
-/// carries no resumable body and the prefix is left in place.
+/// ends. A full-body 200 replaces the file. (Only 200/206 reach this
+/// point: every other status is rejected before streaming.)
 fn prefix_trusted(status: StatusCode, headers: &HeaderMap, local_size: u64) -> bool {
     match status {
         StatusCode::OK => false,
         StatusCode::PARTIAL_CONTENT => partial_content_offset(headers, local_size) == Some(true),
-        _ => true,
+        _ => false,
     }
 }
 
@@ -271,9 +313,10 @@ pub(crate) async fn download_file_content(
     rate_limit: Option<u64>,
 ) -> Result<Option<SystemTime>> {
     // The session's cookies may be path-scoped (a parsed cookies.txt): the
-    // header is resolved against this URL on every attempt — a cookies.txt
-    // entry can expire while a retry wait is out (up to the 15-minute
-    // Retry-After cap), and a stale Cookie header must not outlive it
+    // sender resolves the header against every request URL (and every
+    // redirect hop) — a cookies.txt entry can expire while a retry wait is
+    // out (up to the 15-minute Retry-After cap), and a stale Cookie header
+    // must not outlive it
     let url = Url::parse(url).map_err(|e| IaGetError::Network {
         detail: format!("invalid URL {url:?}: {e}"),
         source: None,
@@ -293,9 +336,31 @@ pub(crate) async fn download_file_content(
             false => format!("GET {url}"),
         });
 
-        let cookie_header = cookie_header_for(cookie_source, &url)?;
-        let request = resume_request(client, &url, cookie_header.as_ref(), current_file_size)?;
-        let mut response = match request.send().await {
+        // A plain GET for a fresh file, or a `Range: bytes=<size>-` resume
+        // request when the local prefix is non-empty
+        let range = if resuming {
+            Some(
+                HeaderValue::from_str(&format!("bytes={current_file_size}-")).map_err(|e| {
+                    IaGetError::Network {
+                        detail: format!("Invalid range header value: {e}"),
+                        source: Some(Box::new(e)),
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+
+        let mut response = match send_following_redirects(
+            client,
+            Method::GET,
+            &url,
+            range.as_ref(),
+            cookie_source,
+            None,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(e) => {
                 verbose::log(&format!("  connection error: {e}"));
@@ -327,14 +392,54 @@ pub(crate) async fn download_file_content(
             continue;
         }
 
+        // Only a full body (200) or a verified partial (206) may be
+        // streamed: any other success status (a 204 or 304 to a ranged
+        // request) carries no file data — accepting it would let the
+        // `.part` "complete" on data it does not hold
+        if !matches!(status, StatusCode::OK | StatusCode::PARTIAL_CONTENT) {
+            drop(response);
+            return Err(IaGetError::Network {
+                detail: format!(
+                    "Server responded with HTTP {} {}: not a downloadable body",
+                    status,
+                    status.canonical_reason().unwrap_or("unknown status")
+                ),
+                source: None,
+            });
+        }
+
         if resuming && !prefix_trusted(status, response.headers(), current_file_size) {
-            // The server ignored the Range request and is sending the full
-            // body (200), or the 206's Content-Range does not start where
-            // the local file ends: in either case the local prefix is
-            // untrusted, so the file is reset before the body is streamed.
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            download_action = download_action_label(false);
+            match status {
+                // The server ignored the Range request and is sending the
+                // full body: the local prefix is untrusted, so the file is
+                // reset before the body is streamed.
+                StatusCode::OK => {
+                    file.set_len(0)?;
+                    file.seek(SeekFrom::Start(0))?;
+                    download_action = download_action_label(false);
+                }
+                // A 206 that does not continue the local prefix: its body
+                // is a partial range of the file, not the file — streaming
+                // it (into a reset file or not) can only yield a corrupt
+                // result. Reset the file, discard the response, and retry
+                // with an un-ranged GET.
+                _ => {
+                    file.set_len(0)?;
+                    file.seek(SeekFrom::Start(0))?;
+                    drop(response);
+                    retry
+                        .record(
+                            "Bad 206",
+                            &format!(
+                                "Content-Range does not continue the local prefix ({current_file_size} bytes); re-requesting from scratch"
+                            ),
+                            retry_after,
+                            running,
+                        )
+                        .await?;
+                    continue;
+                }
+            }
         }
         let base_size = file.metadata()?.len();
 
@@ -375,14 +480,15 @@ pub(crate) async fn download_file_content(
                     StreamedBody::Incomplete { received, expected } => {
                         // The body ended before the announced size: the
                         // transfer was truncated, so resume from where it
-                        // stopped.
+                        // stopped — honoring this response's Retry-After
+                        // when the server asked for one.
                         retry_open_file(
                             file,
                             &pb,
                             &mut retry,
                             "Incomplete body",
                             &format!("received {received} of {expected} bytes"),
-                            None,
+                            retry_after,
                             running,
                         )
                         .await?;
@@ -421,24 +527,33 @@ fn is_retryable_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
 }
 
-/// Parses the start offset of a `Content-Range` header of the form
+/// Parses and validates a `Content-Range` header of the form
 /// `bytes <start>-<end>/<total>` (or `bytes <start>-<end>/*`), which a 206
 /// response must carry.
 ///
 /// Returns `Some(true)` when the offset equals `expected_start`,
 /// `Some(false)` when it differs, and `None` when the header is absent or
-/// malformed — in both `None` cases the caller treats the body as untrusted.
+/// malformed in ANY field — the end must parse and reach at least the
+/// start, and a numeric total must reach the end — so a mangled range can
+/// never certify the offset. In the `None` case the caller treats the body
+/// as untrusted.
 fn partial_content_offset(headers: &HeaderMap, expected_start: u64) -> Option<bool> {
     headers
         .get(CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| {
-            let range = value.strip_prefix("bytes ")?.split_once('/')?.0;
-            let start = range.split_once('-')?.0;
-            start
-                .parse::<u64>()
-                .ok()
-                .map(|start| start == expected_start)
+            let rest = value.strip_prefix("bytes ")?;
+            let (range, total) = rest.split_once('/')?;
+            let (start, end) = range.split_once('-')?;
+            let start: u64 = start.parse().ok()?;
+            let end: u64 = end.parse().ok()?;
+            if end < start {
+                return None;
+            }
+            if total != "*" && total.parse::<u64>().ok()? < end {
+                return None;
+            }
+            Some(start == expected_start)
         })
 }
 
@@ -447,8 +562,8 @@ mod tests {
     use super::*;
     use crate::downloader::retry::MAX_RETRIES;
     use crate::test_support::{
-        MockBody, MockResponse, file_server, ok_empty, run_download, run_download_with_rate,
-        test_running,
+        MockBody, MockResponse, MockServer, file_server, ok_empty, run_download,
+        run_download_with_rate, test_running,
     };
     use std::collections::VecDeque;
     use std::fs;
@@ -628,7 +743,9 @@ mod tests {
                 MockResponse::new(206, MockBody::Full(full.to_vec()))
                     .with_header("Content-Range", "bytes 0-9/10"),
             ]),
-            ok_empty(),
+            // The bad 206 is discarded: the retry is an un-ranged GET,
+            // which the fallback serves in full
+            MockResponse::new(200, MockBody::Full(full.to_vec())),
         );
         let part = dir.join("file.bin.part");
         fs::write(&part, b"XXXX").unwrap(); // 4-byte "partial" file
@@ -644,21 +761,22 @@ mod tests {
         assert_eq!(
             fs::read(&part).unwrap(),
             full,
-            "a mismatched 206 body must replace the local prefix, not append to it"
+            "a mismatched 206 must be discarded and re-fetched, not appended"
         );
-        assert_eq!(server.ranges(), vec![Some(4)]);
+        assert_eq!(server.ranges(), vec![Some(4), None]);
     }
 
     #[tokio::test]
     async fn partial_content_without_range_header_resets_file() {
         // A 206 without a Content-Range header is malformed (RFC 7233 makes
-        // it mandatory): the body is untrusted, so the file is reset.
+        // it mandatory): the body is untrusted, the response is discarded,
+        // and the next attempt is an un-ranged GET.
         let full = b"0123456789"; // 10 bytes
 
         let (server, dir) = file_server(
             "cr_missing",
             VecDeque::from(vec![MockResponse::new(206, MockBody::Full(full.to_vec()))]),
-            ok_empty(),
+            MockResponse::new(200, MockBody::Full(full.to_vec())),
         );
         let part = dir.join("file.bin.part");
         fs::write(&part, b"XXXX").unwrap(); // 4-byte "partial" file
@@ -674,7 +792,72 @@ mod tests {
         assert_eq!(
             fs::read(&part).unwrap(),
             full,
-            "a 206 without Content-Range must replace the local prefix, not append to it"
+            "a 206 without Content-Range must be discarded and re-fetched"
+        );
+        assert_eq!(server.ranges(), vec![Some(4), None]);
+    }
+
+    #[tokio::test]
+    async fn http_204_on_a_resume_is_fatal_not_complete() {
+        // A 204 (no content) to a ranged request carries no body: it must
+        // fail, not "complete" the download on the stale .part prefix — in
+        // the unknown-size case nothing would ever contradict it
+        let (server, dir) = file_server(
+            "http_204",
+            VecDeque::from(vec![MockResponse::new(204, MockBody::Full(vec![]))]),
+            ok_empty(),
+        );
+        let part = dir.join("file.bin.part");
+        fs::write(&part, b"XXXX").unwrap();
+        let result = run_download(
+            &server.url("/file.bin"),
+            part.to_str().unwrap(),
+            None,
+            &test_running(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(IaGetError::Network { .. })),
+            "expected a Network error, got {:?}",
+            result.ok()
+        );
+        assert_eq!(server.request_count(), 1, "a 204 must not be retried");
+    }
+
+    #[tokio::test]
+    async fn redirect_target_gets_the_cookie_header() {
+        // The origin redirects; the target request must carry the cookie
+        // header (re-resolved for the target URL), not lose it on the hop
+        let content = b"redirected-content";
+        let (target_server, _target_url) = MockServer::scripted(
+            "/file.bin",
+            vec![MockResponse::new(200, MockBody::Full(content.to_vec()))],
+        );
+        let (_origin_server, origin_url) = MockServer::scripted(
+            "/file.bin",
+            vec![
+                MockResponse::new(302, MockBody::Full(vec![]))
+                    .with_header("Location", target_server.url("/file.bin").as_str()),
+                MockResponse::new(200, MockBody::Full(content.to_vec())),
+            ],
+        );
+        let source = crate::cookie::CookieSource::Raw(HeaderValue::from_static("session=abc"));
+
+        // Automatic following must be off: only then does the helper's
+        // manual loop (and its per-hop cookie re-resolution) run
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client build");
+        send_following_redirects(&client, Method::GET, &origin_url, None, Some(&source), None)
+            .await
+            .expect("the redirect must be followed");
+
+        assert_eq!(
+            target_server.cookies(),
+            vec![Some("session=abc".to_string())],
+            "the redirect target must see the cookie header"
         );
     }
 
@@ -988,6 +1171,23 @@ mod tests {
         assert_eq!(
             partial_content_offset(&headers(Some("bytes 8-19")), 8),
             None
+        );
+        // A malformed END field must not certify the start offset: a
+        // mangled range reads as untrusted, not as "starts at 8"
+        assert_eq!(
+            partial_content_offset(&headers(Some("bytes 8-x/20")), 8),
+            None,
+            "an unparsable end is malformed"
+        );
+        assert_eq!(
+            partial_content_offset(&headers(Some("bytes 9-8/20")), 8),
+            None,
+            "an end before the start is malformed"
+        );
+        assert_eq!(
+            partial_content_offset(&headers(Some("bytes 8-19/10")), 8),
+            None,
+            "a total shorter than the end is malformed"
         );
     }
 

@@ -37,13 +37,13 @@ use crate::downloader::verify::{
     ExistingFileStatus, check_existing_file, print_verified_hash, verify_downloaded_file,
 };
 use crate::error::{IaGetError, io_error_with_path};
-use crate::fs::ensure_not_symlink;
+use crate::fs::{ensure_not_symlink, ensure_regular_or_absent};
 
 // Re-export the items that form this module's public API.
 pub use mtime::{parse_last_modified, sync_file_mtime};
 pub use rate::parse_rate;
 pub(crate) use signal::setup_signal_handler;
-pub(crate) use stream::download_file_content;
+pub(crate) use stream::{download_file_content, send_following_redirects};
 pub(crate) use verify::calculate_md5;
 #[cfg(test)]
 pub(crate) use verify::digest_hex;
@@ -114,7 +114,9 @@ fn ensure_parent_directories(file_path: &str, output_dir: &str) -> Result<()> {
 pub(crate) fn prepare_file_for_download(file_path: &str) -> Result<File> {
     // A pre-planted symlink at the .part path would be opened for writing:
     // every streamed byte would reach the link target instead of the file.
-    ensure_not_symlink(Path::new(file_path))?;
+    // A pre-planted FIFO would block the open itself — waiting for a peer
+    // that never comes — which defeats Ctrl+C and every retry.
+    ensure_regular_or_absent(Path::new(file_path))?;
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -659,10 +661,13 @@ async fn download_files_with_signal(
             if stop_on_error {
                 // The loop ends early here, so the end-of-batch lines
                 // below are never reached: print them in this branch too.
+                // The summary counts only the files actually processed:
+                // the unattempted tail is neither ok nor failed.
+                let processed = index + 1;
                 print_failed_files(&failed_files);
                 print_download_summary(
-                    tasks.len(),
-                    tasks.len() - failed_files.len(),
+                    processed,
+                    processed - failed_files.len(),
                     failed_files.len(),
                 );
                 return Err(batch_failed(&failed_files, tasks.len()));
