@@ -55,10 +55,9 @@ pub(crate) fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Resul
     let mut bytes_processed: u64 = 0;
 
     loop {
-        // Checked before every read and again before the EOF break: a stop
-        // requested while the final chunk is being read (or on an empty
-        // file, which would otherwise return its digest without any check)
-        // must not let the run report success
+        // A stop requested before a read — including on an empty file,
+        // whose first read is EOF and would otherwise return its digest
+        // unchecked — must not let the run report success
         if !running.load(Ordering::SeqCst) {
             finish_progress_bar(&pb);
             return Err(IaGetError::Interrupted);
@@ -67,6 +66,13 @@ pub(crate) fn calculate_md5(file_path: &str, running: &Arc<AtomicBool>) -> Resul
         let bytes_read = reader
             .read(&mut buffer)
             .map_err(|e| io_error_with_path(file_path, e))?;
+        // A stop can land between the check above and this read returning
+        // EOF: re-check before breaking, so the final read cannot report a
+        // digest for an already-stopped run
+        if !running.load(Ordering::SeqCst) {
+            finish_progress_bar(&pb);
+            return Err(IaGetError::Interrupted);
+        }
         if bytes_read == 0 {
             break;
         }

@@ -303,8 +303,8 @@ pub fn plan_download_tasks(
 /// metadata and the files already on disk allow:
 ///
 /// - a final file that already exists at its expected size is taken to be
-///   done (0), mirroring the cheap size check the downloader runs before it
-///   bothers to hash;
+///   done (0): the downloader verifies it in place, or removes it and
+///   re-downloads into the space it freed — net-zero either way, MD5 or not;
 /// - a leftover `<name>.part` holding a valid prefix only needs the
 ///   remainder;
 /// - everything else needs the whole expected size;
@@ -324,13 +324,14 @@ fn remaining_bytes_for(task: &DownloadTask) -> u64 {
         return 0;
     };
 
-    // A final copy already at the expected size is assumed complete — but
-    // only when the metadata gives no hash to prove otherwise: with an MD5,
-    // a size-matched file may still be corrupt, in which case the
-    // downloader removes it and re-downloads the full size
+    // A final copy already at the expected size needs no net new space:
+    // the downloader verifies it in place (a hash match writes nothing),
+    // and if it is corrupt it removes the stale file before re-downloading,
+    // so the re-download's bytes are backed by the space that stale file
+    // freed. An MD5 only decides which of those two net-zero paths runs, so
+    // it does not change the accounting.
     if let Ok(meta) = std::fs::metadata(&task.file_path)
         && meta.len() == expected
-        && task.expected_md5.is_none()
     {
         return 0;
     }
@@ -720,10 +721,12 @@ mod tests {
     }
 
     #[test]
-    fn required_download_space_counts_a_size_matched_file_with_md5() {
-        // With an MD5 in the metadata, a size-matched file may still be
-        // corrupt: the downloader would remove it and re-download the full
-        // size, so its bytes count toward the need
+    fn required_download_space_ignores_a_size_matched_file_with_md5() {
+        // An MD5 only decides verify-in-place vs. remove-and-redownload —
+        // both net-zero space, since the stale file is freed before the
+        // re-download writes its bytes. A size-matched file must therefore
+        // contribute nothing, or an idempotent re-run on a tight disk (no new
+        // bytes actually needed) would be aborted by the pre-download check.
         let dir = TempDir::new("required_space_md5");
         let path = dir.join("done.md5");
         std::fs::write(&path, vec![0u8; 1000]).unwrap();
@@ -736,8 +739,8 @@ mod tests {
         );
         assert_eq!(
             required_download_space(&[done]),
-            1000,
-            "a hash-checked file at its expected size must still count"
+            0,
+            "a size-matched file needs no net new space, MD5 or not"
         );
     }
 

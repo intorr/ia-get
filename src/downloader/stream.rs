@@ -534,9 +534,10 @@ fn is_retryable_status(status: StatusCode) -> bool {
 /// Returns `Some(true)` when the offset equals `expected_start`,
 /// `Some(false)` when it differs, and `None` when the header is absent or
 /// malformed in ANY field — the end must parse and reach at least the
-/// start, and a numeric total must reach the end — so a mangled range can
-/// never certify the offset. In the `None` case the caller treats the body
-/// as untrusted.
+/// start, and a numeric total must exceed the (inclusive) end, since a
+/// range `start-end/total` cannot end at or past the file's last index
+/// (`total - 1`) — so a mangled range can never certify the offset. In the
+/// `None` case the caller treats the body as untrusted.
 fn partial_content_offset(headers: &HeaderMap, expected_start: u64) -> Option<bool> {
     headers
         .get(CONTENT_RANGE)
@@ -550,7 +551,10 @@ fn partial_content_offset(headers: &HeaderMap, expected_start: u64) -> Option<bo
             if end < start {
                 return None;
             }
-            if total != "*" && total.parse::<u64>().ok()? < end {
+            // A known total names the file's last valid index as total - 1,
+            // so the (inclusive) end must stay below it: total == end (or
+            // worse) is a malformed range that must not certify the offset.
+            if total != "*" && total.parse::<u64>().ok()? <= end {
                 return None;
             }
             Some(start == expected_start)
@@ -1188,6 +1192,11 @@ mod tests {
             partial_content_offset(&headers(Some("bytes 8-19/10")), 8),
             None,
             "a total shorter than the end is malformed"
+        );
+        assert_eq!(
+            partial_content_offset(&headers(Some("bytes 8-20/20")), 8),
+            None,
+            "a total equal to the (inclusive) end is malformed"
         );
     }
 

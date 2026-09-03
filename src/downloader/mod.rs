@@ -644,7 +644,7 @@ async fn download_files_with_signal(
             return Err(IaGetError::Interrupted);
         }
 
-        let outcome = process_file(
+        let outcome = match process_file(
             client,
             task,
             index + file_number_start,
@@ -654,7 +654,20 @@ async fn download_files_with_signal(
             rate_limit,
             output_dir,
         )
-        .await?;
+        .await
+        {
+            Ok(outcome) => outcome,
+            // A Ctrl+C detected mid-file (in the existing-file hash or the
+            // streamed body) surfaces as this error, unlike the
+            // between-files check above. Announce it, so a stop never ends
+            // as a silent exit-1 whose error text main would otherwise drop.
+            Err(error) => {
+                if matches!(error, IaGetError::Interrupted) {
+                    print_download_interrupted();
+                }
+                return Err(error);
+            }
+        };
 
         if let FileOutcome::Failed(reason) = outcome {
             failed_files.push((task.file_path.clone(), reason));
@@ -732,7 +745,7 @@ mod tests {
     };
     use std::collections::{HashMap, VecDeque};
     use std::path::Path;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     /// Runs a batch with a fresh client and a live "running" flag, mirroring
     /// the production call minus the Ctrl+C handler. `dir` is the batch's
@@ -1384,6 +1397,46 @@ mod tests {
         assert!(
             matches!(err, IaGetError::Interrupted),
             "an interrupted batch must fail, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_mid_file_is_an_interrupted_error() {
+        // A Ctrl+C that lands while a file is being streamed (not between
+        // files) must still end the batch as Interrupted, not a silent
+        // success or a per-file failure: the flag starts true so the
+        // between-files check passes, and is flipped only once the stalled
+        // download is underway — exactly where the old code went quiet.
+        let (server, dir) = file_server(
+            "interrupt_mid_file",
+            VecDeque::from(vec![MockResponse::stalled(100)]),
+            ok_empty(),
+        );
+        let files = vec![file_task(&server, &dir, None, Some(100), None)];
+        let total = files.len();
+        let running = Arc::new(AtomicBool::new(true));
+        let flag = running.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            flag.store(false, Ordering::SeqCst);
+        });
+
+        let err = download_files_with_signal(
+            &Client::new(),
+            files,
+            total,
+            1,
+            None,
+            false,
+            None,
+            dir.to_str().unwrap(),
+            &running,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, IaGetError::Interrupted),
+            "a mid-file Ctrl+C must fail the batch as Interrupted, got {err:?}"
         );
     }
 

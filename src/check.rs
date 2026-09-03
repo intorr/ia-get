@@ -939,6 +939,14 @@ mod tests {
         fs::write(&path, b"hello").unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+        // Root (and other privilege) ignores mode bits: if the mode-000 file
+        // still opens, the unreadable path cannot be exercised on this host,
+        // so restore the permissions and skip rather than fail spuriously.
+        if fs::File::open(&path).is_ok() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            eprintln!("skipping: mode 000 does not block reads here (root?)");
+            return;
+        }
 
         let report = check_directory(
             &plan(vec![task(
