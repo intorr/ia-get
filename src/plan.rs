@@ -302,9 +302,11 @@ pub fn plan_download_tasks(
 /// The number of bytes this plan still needs to write, as far as the
 /// metadata and the files already on disk allow:
 ///
-/// - a final file that already exists at its expected size is taken to be
-///   done (0): the downloader verifies it in place, or removes it and
-///   re-downloads into the space it freed — net-zero either way, MD5 or not;
+/// - a final file that already exists at its expected size needs only the
+///   shortfall of a re-download (expected minus what its removal frees): it is
+///   either verified in place (no write) or removed and re-downloaded — a
+///   normal file frees ~its size (0 shortfall), a hard link frees nothing
+///   (full shortfall), a sparse file frees only its allocated blocks;
 /// - a leftover `<name>.part` holding a valid prefix only needs the
 ///   remainder;
 /// - everything else needs the whole expected size;
@@ -324,16 +326,16 @@ fn remaining_bytes_for(task: &DownloadTask) -> u64 {
         return 0;
     };
 
-    // A final copy already at the expected size needs no net new space:
-    // the downloader verifies it in place (a hash match writes nothing),
-    // and if it is corrupt it removes the stale file before re-downloading,
-    // so the re-download's bytes are backed by the space that stale file
-    // freed. An MD5 only decides which of those two net-zero paths runs, so
-    // it does not change the accounting.
+    // A final copy already at the expected size needs only the shortfall of a
+    // re-download: the downloader verifies it in place (no write) or, if
+    // corrupt, removes it and re-downloads into the space the removal frees.
+    // Removal frees the file's actually-allocated blocks — 0 for a hard link
+    // (a sibling still holds the inode) and only the allocated blocks for a
+    // sparse file — so the shortfall is expected minus that, not a flat 0.
     if let Ok(meta) = std::fs::metadata(&task.file_path)
         && meta.len() == expected
     {
-        return 0;
+        return expected.saturating_sub(freed_by_removal(&meta));
     }
 
     // A leftover .part holding a valid prefix only needs the remainder.
@@ -344,6 +346,34 @@ fn remaining_bytes_for(task: &DownloadTask) -> u64 {
     }
 
     expected
+}
+
+/// The bytes that removing a file would actually free, for the re-download
+/// shortfall in `remaining_bytes_for`:
+///
+/// - a hard link frees nothing — a sibling still holds the inode and its
+///   blocks, so a corrupt re-download must supply the whole size;
+/// - otherwise the file's actually-allocated blocks, in 512-byte units: a
+///   normal file allocates at least its apparent size (0 shortfall), a
+///   sparse file allocates fewer (the shortfall is the unallocated remainder).
+///
+/// On Windows the standard library exposes no allocated-block or hard-link
+/// count, so the apparent size is assumed freed (correct for the common
+/// normal file); a hard-link or sparse shortfall there is left to the
+/// runtime's ENOSPC handling.
+fn freed_by_removal(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            return 0;
+        }
+        meta.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
 }
 
 #[cfg(test)]
@@ -721,12 +751,12 @@ mod tests {
     }
 
     #[test]
-    fn required_download_space_ignores_a_size_matched_file_with_md5() {
-        // An MD5 only decides verify-in-place vs. remove-and-redownload —
-        // both net-zero space, since the stale file is freed before the
-        // re-download writes its bytes. A size-matched file must therefore
-        // contribute nothing, or an idempotent re-run on a tight disk (no new
-        // bytes actually needed) would be aborted by the pre-download check.
+    fn required_download_space_ignores_a_normal_size_matched_file_with_md5() {
+        // A normal size-matched file frees ~its size on removal, so a corrupt
+        // re-download is net-zero and it contributes nothing. (An MD5 only
+        // decides verify-in-place vs. remove-and-redownload; both are ~net-zero
+        // for a normal file.) Charging its full size would abort an idempotent
+        // re-run on a tight disk that needs no new bytes.
         let dir = TempDir::new("required_space_md5");
         let path = dir.join("done.md5");
         std::fs::write(&path, vec![0u8; 1000]).unwrap();
@@ -740,7 +770,31 @@ mod tests {
         assert_eq!(
             required_download_space(&[done]),
             0,
-            "a size-matched file needs no net new space, MD5 or not"
+            "a normal size-matched file needs no net new space, MD5 or not"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn required_download_space_counts_a_hardlinked_size_matched_file_in_full() {
+        // A hard-linked size-matched file frees nothing on removal (a sibling
+        // holds the inode), so a corrupt re-download needs the full size: the
+        // preflight must not assume the removal frees it.
+        let dir = TempDir::new("required_space_hardlink");
+        let path = dir.join("linked.bin");
+        std::fs::write(&path, vec![0u8; 1000]).unwrap();
+        std::fs::hard_link(&path, dir.join("sibling.bin")).unwrap();
+        let done = task(
+            "https://archive.org/download/item/linked.bin",
+            path.to_str().unwrap().to_string(),
+            Some("0123456789abcdef0123456789abcdef".to_string()),
+            Some(1000),
+            None,
+        );
+        assert_eq!(
+            required_download_space(&[done]),
+            1000,
+            "removing a hard link frees nothing, so the full size is still needed"
         );
     }
 
