@@ -14,8 +14,8 @@ use ia_get::archive_metadata::{
 use ia_get::check::check_directory;
 use ia_get::cookie::cookie_source;
 use ia_get::display::{
-    create_spinner, finish_spinner, format_size, last_glyph, print_downloaded_line,
-    print_file_banner,
+    create_spinner, finish_spinner, format_size, last_glyph, print_check_interrupted,
+    print_downloaded_line, print_file_banner,
 };
 use ia_get::downloader::{self, DownloadTask, parse_rate};
 use ia_get::error::io_error_with_path;
@@ -337,11 +337,12 @@ struct Cli {
 
 /// Main application entry point
 ///
-/// Parses the command line arguments and hands off to [`run`]. `run`
-/// finishes its spinner with a context-rich message on every failure path,
-/// so the error is already on screen; `main` only maps the result to a
-/// process exit code, without letting the runtime print the error a second
-/// time.
+/// Parses the command line arguments and hands off to [`run`]. `run` prints
+/// every failure it returns before returning it — initialization errors on
+/// the spinner, a Ctrl+C during `--check`'s MD5 pass, and the download
+/// flow's own interrupted / per-file / summary lines — so the error is
+/// already on screen; `main` only maps the result to a process exit code,
+/// without letting the runtime print it a second time.
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -462,7 +463,20 @@ async fn run(cli: &Cli) -> Result<()> {
             ),
         );
 
-        let report = check_directory(&plan, xml_file_name, whole_item, &output_dir, cli.md5)?;
+        let report = match check_directory(&plan, xml_file_name, whole_item, &output_dir, cli.md5) {
+            Ok(report) => report,
+            // check_directory surfaces a Ctrl+C during the --md5 hash here;
+            // the spinner is already finished and main only maps the result
+            // to an exit code, so announce it — otherwise a stop mid-check
+            // exits silently (the download side gets the same treatment in
+            // download_files_with_signal).
+            Err(error) => {
+                if matches!(error, IaGetError::Interrupted) {
+                    print_check_interrupted();
+                }
+                return Err(error);
+            }
+        };
         report.print();
 
         if report.is_clean(cli.strict) {

@@ -211,6 +211,15 @@ pub fn print_download_interrupted() {
     );
 }
 
+/// Prints the "--check interrupted" line: the check is read-only, so there
+/// is nothing to resume — just re-run it to finish.
+pub fn print_check_interrupted() {
+    println!(
+        "\n{} Check interrupted. Run the command again to finish.",
+        "✘".red().bold()
+    );
+}
+
 /// Prints the end-of-batch summary line, mirroring the `--check` report's
 /// closing tally: how many files the batch handled and how many succeeded
 /// or failed.

@@ -15,6 +15,8 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::UNIX_EPOCH;
 
 use colored::*;
@@ -187,8 +189,11 @@ impl CheckReport {
 /// Each planned file is checked for presence, size, and — when `verify_md5` —
 /// the MD5 hash; last-modified time is always compared to the metadata's
 /// `<mtime>` and reported. Everything on disk that no planned file (or its
-/// `.part`) explains is collected as unexpected. `setup_signal_handler` is
-/// registered so a long MD5 pass can be aborted with Ctrl+C.
+/// `.part`) explains is collected as unexpected.
+///
+/// Registers the Ctrl+C handler (via `setup_signal_handler`) so a long MD5
+/// pass can be aborted; a stop surfaces as `IaGetError::Interrupted`, which
+/// the caller (`main::run`) announces before `main` maps it to an exit code.
 pub fn check_directory(
     plan: &DownloadPlan,
     xml_file_name: &str,
@@ -196,8 +201,29 @@ pub fn check_directory(
     output_dir: &str,
     verify_md5: bool,
 ) -> Result<CheckReport> {
-    let running = setup_signal_handler();
+    check_directory_with_signal(
+        plan,
+        xml_file_name,
+        whole_item,
+        output_dir,
+        verify_md5,
+        &setup_signal_handler(),
+    )
+}
 
+/// The directory check with an externally provided stop flag, mirroring the
+/// download side's `download_files_with_signal`: tests drive the
+/// Ctrl+C-during-MD5 path with a pre-stopped flag instead of registering a
+/// second (and panicking) signal handler. A stop propagates as
+/// `IaGetError::Interrupted` at the first file whose hash it reaches.
+fn check_directory_with_signal(
+    plan: &DownloadPlan,
+    xml_file_name: &str,
+    whole_item: bool,
+    output_dir: &str,
+    verify_md5: bool,
+    running: &Arc<AtomicBool>,
+) -> Result<CheckReport> {
     let root = if output_dir.is_empty() {
         Path::new(".")
     } else {
@@ -305,7 +331,7 @@ pub fn check_directory(
                         report.read_failed.push(rel.clone());
                         continue;
                     };
-                    match calculate_md5(path_str, &running) {
+                    match calculate_md5(path_str, running) {
                         Ok(hash) if hash.eq_ignore_ascii_case(expected) => {}
                         Ok(hash) => {
                             report
@@ -968,6 +994,39 @@ mod tests {
         assert!(
             !report.is_clean(false),
             "an unreadable file fails the check"
+        );
+    }
+
+    #[test]
+    fn check_directory_interrupt_during_md5_is_an_error() {
+        // A Ctrl+C during the --md5 pass must surface as an error, not a
+        // (wrong) digest: the pre-stopped flag short-circuits the hash. The
+        // public check_directory registers a process-wide handler, so the
+        // test drives the flag-injected variant directly.
+        let (dir, output_dir) = harness("check_interrupt_md5");
+        fs::write(dir.join("a.bin"), b"hello").unwrap();
+        // path_str (the forward-slash spelling) so expected_rel strips the
+        // output_dir prefix — a native (backslash) path would not
+        let file_path = path_str(&dir, "a.bin");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let err = check_directory_with_signal(
+            &plan(vec![task(
+                "https://x/a.bin",
+                file_path,
+                Some(md5_hex(b"hello")),
+                Some(5),
+                None,
+            )]),
+            "item_files.xml",
+            false,
+            &output_dir,
+            true,
+            &stopped,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::IaGetError::Interrupted),
+            "an interrupt during the --md5 hash must propagate, got {err:?}"
         );
     }
 
