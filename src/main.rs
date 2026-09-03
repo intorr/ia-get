@@ -294,7 +294,10 @@ fn build_plan(
 /// against the same plan a download would build. Read-only — nothing is
 /// downloaded or created — and a directory that does not exist is a clear
 /// error, unlike a download which creates its output directory.
-async fn run_check(
+///
+/// Synchronous on purpose: none of its steps await, and an `async fn`
+/// without an await point trips clippy's `unused_async`.
+fn run_check(
     spinner: &ProgressBar,
     cli: &Cli,
     target: &ArchiveTarget,
@@ -546,7 +549,7 @@ async fn run(cli: &Cli) -> Result<()> {
     // instead of writing one: the read-only flow, nothing is downloaded
     // or created.
     if cli.check {
-        return run_check(&spinner, cli, &target, &base_url, files).await;
+        return run_check(&spinner, cli, &target, &base_url, files);
     }
 
     // A whole-item run saves the freshly fetched _files.xml as file #1;
@@ -726,8 +729,8 @@ mod tests {
         assert!(check_disk_space("", &[task]).is_ok());
     }
 
-    #[tokio::test]
-    async fn run_check_missing_directory_is_a_clear_error() {
+    #[test]
+    fn run_check_missing_directory_is_a_clear_error() {
         // -o pointing at a directory that does not exist must yield the
         // distinct CheckDirectoryNotFound, not a CheckFailed "everything
         // missing" report: a walk of a non-existent root lists nothing.
@@ -761,9 +764,7 @@ mod tests {
             }],
         };
 
-        let err = run_check(&create_spinner("test"), &cli, &target, &base_url, files)
-            .await
-            .unwrap_err();
+        let err = run_check(&create_spinner("test"), &cli, &target, &base_url, files).unwrap_err();
 
         assert!(
             matches!(err, IaGetError::CheckDirectoryNotFound(_)),
