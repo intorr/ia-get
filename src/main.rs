@@ -8,8 +8,8 @@
 use clap::Parser;
 use colored::*;
 use ia_get::archive_metadata::{
-    XmlFiles, XmlMetadata, fetch_and_parse_xml, get_xml_url, list_file_rows, list_summary,
-    parse_archive_url, save_xml_metadata, xml_file_name_of,
+    ArchiveTarget, XmlFile, XmlFiles, XmlMetadata, fetch_and_parse_xml, get_xml_url,
+    list_file_rows, list_summary, parse_archive_url, save_xml_metadata, xml_file_name_of,
 };
 use ia_get::check::check_directory;
 use ia_get::cookie::cookie_source;
@@ -21,7 +21,9 @@ use ia_get::downloader::{self, DownloadTask, parse_rate};
 use ia_get::error::io_error_with_path;
 use ia_get::file_filter::FileFilter;
 use ia_get::fs::available_space;
-use ia_get::plan::{join_output_dir, plan_download_tasks, required_download_space, select_files};
+use ia_get::plan::{
+    DownloadPlan, join_output_dir, plan_download_tasks, required_download_space, select_files,
+};
 use ia_get::verbose;
 use ia_get::{IaGetError, Result};
 use indicatif::ProgressBar;
@@ -248,6 +250,137 @@ fn ensure_output_dir(output_dir: &str) -> Result<()> {
     std::fs::create_dir_all(output_dir).map_err(|e| io_error_with_path(output_dir, e))
 }
 
+/// Narrows the archive's entries to this run's candidates and converts
+/// them into the download plan — the pipeline a download and a `--check`
+/// run share:
+///
+/// 1. the URL's selection (the whole item minus the self-referencing
+///    `_files.xml` entry, or the single file a download URL names);
+/// 2. the `--include`/`--exclude` name filters — so excluded files never
+///    take part in collision detection either;
+/// 3. the plan itself, built before anything is announced, so the counts
+///    the summaries print only include the tasks that will actually run
+///    (entries skipped for empty names or path collisions never appear
+///    in the numbering).
+///
+/// Returns the plan plus the counts the download's summaries need: how
+/// many entries the URL selected and how many of those the filters kept
+/// out.
+fn build_plan(
+    files: Vec<XmlFile>,
+    xml_file_name: &str,
+    base_url: &Url,
+    output_dir: &str,
+    target: &ArchiveTarget,
+    filter: &FileFilter,
+) -> Result<(DownloadPlan, usize, usize)> {
+    let selected = select_files(files, xml_file_name, target)?;
+    let selected_total = selected.len();
+    let candidates = selected
+        .into_iter()
+        .filter(|file| filter.matches(&file.name))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Err(IaGetError::NoFilesSelected {
+            identifier: target.identifier.clone(),
+        });
+    }
+    let filtered_out = selected_total - candidates.len();
+    let plan = plan_download_tasks(candidates, base_url, output_dir, target)?;
+    Ok((plan, selected_total, filtered_out))
+}
+
+/// The `--check` flow: verify the directory a download would produce,
+/// against the same plan a download would build. Read-only — nothing is
+/// downloaded or created — and a directory that does not exist is a clear
+/// error, unlike a download which creates its output directory.
+async fn run_check(
+    spinner: &ProgressBar,
+    cli: &Cli,
+    target: &ArchiveTarget,
+    base_url: &Url,
+    files: XmlFiles,
+) -> Result<()> {
+    let output_dir = init_step(spinner, normalize_output_dir(cli.output_dir.as_deref()))?;
+    // Unlike a download, check must not create the directory: it is the
+    // thing being verified, so a missing one is a clear error.
+    let probe = if output_dir.is_empty() {
+        Path::new(".")
+    } else {
+        Path::new(&output_dir)
+    };
+    if !probe.is_dir() {
+        return init_step(
+            spinner,
+            Err(IaGetError::CheckDirectoryNotFound(
+                probe.display().to_string(),
+            )),
+        );
+    }
+
+    let whole_item = target.file_path.is_none();
+    let xml_file_name = xml_file_name_of(base_url);
+    let filter = FileFilter::new(cli.include.clone(), cli.exclude.clone());
+    let (plan, _, _) = init_step(
+        spinner,
+        build_plan(
+            files.files,
+            xml_file_name,
+            base_url,
+            &output_dir,
+            target,
+            &filter,
+        ),
+    )?;
+
+    finish_spinner(
+        spinner,
+        &format!(
+            "{} Verifying {} file{} in {}",
+            "⚙".blue(),
+            plan.tasks.len().to_string().bold(),
+            if plan.tasks.len() == 1 { "" } else { "s" },
+            probe.display().to_string().bold()
+        ),
+    );
+
+    let report = match check_directory(&plan, xml_file_name, whole_item, &output_dir, cli.md5) {
+        Ok(report) => report,
+        // check_directory surfaces a Ctrl+C during the --md5 hash here;
+        // the spinner is already finished and main only maps the result
+        // to an exit code, so announce it — otherwise a stop mid-check
+        // exits silently (the download side gets the same treatment in
+        // download_files_with_signal).
+        Err(error) => {
+            if matches!(error, IaGetError::Interrupted) {
+                print_check_interrupted();
+            }
+            return Err(error);
+        }
+    };
+    report.print();
+
+    if report.is_clean(cli.strict) {
+        println!(
+            "\n{} {}",
+            "✔".green().bold(),
+            "Directory matches the archive".green().bold()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "\n{} {}",
+        "✘".red().bold(),
+        format!("{} problem(s) found", report.failing_count(cli.strict))
+            .red()
+            .bold()
+    );
+    Err(IaGetError::CheckFailed {
+        problems: report.failing_count(cli.strict),
+    })
+}
+
 /// Lists parsed filenames from XML metadata when --list/-l is used
 fn list_files(files: &XmlFiles, spinner: &ProgressBar, xml_file_name: &str) {
     finish_spinner(
@@ -410,94 +543,10 @@ async fn run(cli: &Cli) -> Result<()> {
     }
 
     // In --check mode we verify an existing directory against the metadata
-    // instead of writing one: resolve the same output dir a download would
-    // use, narrow to the same candidates, build the same plan, then compare
-    // it with the disk. Nothing is downloaded or created.
+    // instead of writing one: the read-only flow, nothing is downloaded
+    // or created.
     if cli.check {
-        let output_dir = init_step(&spinner, normalize_output_dir(cli.output_dir.as_deref()))?;
-        // Unlike a download, check must not create the directory: it is the
-        // thing being verified, so a missing one is a clear error.
-        let probe = if output_dir.is_empty() {
-            Path::new(".")
-        } else {
-            Path::new(&output_dir)
-        };
-        if !probe.is_dir() {
-            return init_step(
-                &spinner,
-                Err(IaGetError::CheckDirectoryNotFound(
-                    probe.display().to_string(),
-                )),
-            );
-        }
-
-        let whole_item = target.file_path.is_none();
-        let xml_file_name = xml_file_name_of(&base_url);
-        let filter = FileFilter::new(cli.include.clone(), cli.exclude.clone());
-        let selected = init_step(&spinner, select_files(files.files, xml_file_name, &target))?;
-        let candidates = selected
-            .into_iter()
-            .filter(|file| filter.matches(&file.name))
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return init_step(
-                &spinner,
-                Err(IaGetError::NoFilesSelected {
-                    identifier: target.identifier.clone(),
-                }),
-            );
-        }
-        let plan = init_step(
-            &spinner,
-            plan_download_tasks(candidates, &base_url, &output_dir, &target),
-        )?;
-
-        finish_spinner(
-            &spinner,
-            &format!(
-                "{} Verifying {} file{} in {}",
-                "⚙".blue(),
-                plan.tasks.len().to_string().bold(),
-                if plan.tasks.len() == 1 { "" } else { "s" },
-                probe.display().to_string().bold()
-            ),
-        );
-
-        let report = match check_directory(&plan, xml_file_name, whole_item, &output_dir, cli.md5) {
-            Ok(report) => report,
-            // check_directory surfaces a Ctrl+C during the --md5 hash here;
-            // the spinner is already finished and main only maps the result
-            // to an exit code, so announce it — otherwise a stop mid-check
-            // exits silently (the download side gets the same treatment in
-            // download_files_with_signal).
-            Err(error) => {
-                if matches!(error, IaGetError::Interrupted) {
-                    print_check_interrupted();
-                }
-                return Err(error);
-            }
-        };
-        report.print();
-
-        if report.is_clean(cli.strict) {
-            println!(
-                "\n{} {}",
-                "✔".green().bold(),
-                "Directory matches the archive".green().bold()
-            );
-            return Ok(());
-        }
-
-        println!(
-            "\n{} {}",
-            "✘".red().bold(),
-            format!("{} problem(s) found", report.failing_count(cli.strict))
-                .red()
-                .bold()
-        );
-        return Err(IaGetError::CheckFailed {
-            problems: report.failing_count(cli.strict),
-        });
+        return run_check(&spinner, cli, &target, &base_url, files).await;
     }
 
     // A whole-item run saves the freshly fetched _files.xml as file #1;
@@ -509,35 +558,20 @@ async fn run(cli: &Cli) -> Result<()> {
     let output_dir = init_step(&spinner, normalize_output_dir(cli.output_dir.as_deref()))?;
     init_step(&spinner, ensure_output_dir(&output_dir))?;
 
-    // Narrow the archive's entries to this run's candidates: the URL's
-    // selection first, then the name filters — so excluded files never
-    // take part in collision detection either.
+    // Narrow the archive's entries to this run's candidates and build the
+    // download plan (see build_plan for the pipeline steps).
     let filter = FileFilter::new(cli.include.clone(), cli.exclude.clone());
     let xml_file_name = xml_file_name_of(&base_url);
-    let selected = init_step(&spinner, select_files(files.files, xml_file_name, &target))?;
-    let selected_total = selected.len();
-    let candidates = selected
-        .into_iter()
-        .filter(|file| filter.matches(&file.name))
-        .collect::<Vec<_>>();
-    let filtered_out = selected_total - candidates.len();
-
-    if candidates.is_empty() {
-        return init_step(
-            &spinner,
-            Err(IaGetError::NoFilesSelected {
-                identifier: target.identifier.clone(),
-            }),
-        );
-    }
-
-    // Convert the metadata into the download plan before anything is
-    // announced, so the counts below only include the tasks that will
-    // actually run (entries skipped for empty names or path collisions
-    // never appear in the numbering).
-    let plan = init_step(
+    let (plan, selected_total, filtered_out) = init_step(
         &spinner,
-        plan_download_tasks(candidates, &base_url, &output_dir, &target),
+        build_plan(
+            files.files,
+            xml_file_name,
+            &base_url,
+            &output_dir,
+            &target,
+            &filter,
+        ),
     )?;
 
     // Fail fast if the plan clearly cannot fit on the target volume, before
@@ -690,5 +724,51 @@ mod tests {
             expected_mtime: None,
         };
         assert!(check_disk_space("", &[task]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_check_missing_directory_is_a_clear_error() {
+        // -o pointing at a directory that does not exist must yield the
+        // distinct CheckDirectoryNotFound, not a CheckFailed "everything
+        // missing" report: a walk of a non-existent root lists nothing.
+        let root = std::env::temp_dir().join(format!(
+            "ia-get-check-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let missing = format!("{}/absent", root.display());
+
+        let cli = Cli::parse_from(vec![
+            "ia-get",
+            "--check",
+            "https://archive.org/details/item1",
+            "-o",
+            &missing,
+        ]);
+        let target = parse_archive_url("https://archive.org/details/item1").unwrap();
+        let base_url = get_xml_url(&target.identifier).unwrap();
+        // One real entry: with the guard mutated away, the run sails past
+        // build_plan into the walk and fails as CheckFailed instead
+        let files = XmlFiles {
+            files: vec![XmlFile {
+                name: "scan.jpg".to_string(),
+                size: Some(1),
+                ..Default::default()
+            }],
+        };
+
+        let err = run_check(&create_spinner("test"), &cli, &target, &base_url, files)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, IaGetError::CheckDirectoryNotFound(_)),
+            "got: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

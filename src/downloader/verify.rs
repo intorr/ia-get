@@ -133,6 +133,36 @@ fn size_mismatch(file_path: &str, expected_size: Option<u64>) -> Result<Option<(
     }
 }
 
+/// The verdict for a file type that exists at the final path but cannot be
+/// verified as a file, or `None` for a regular file (the normal case):
+///
+/// - a symlink — valid or dangling (`exists()` follows the link and would
+///   misreport a dangling one as Missing) — would be followed by every
+///   check below (size, hash, and the mtime sync or removal the caller
+///   performs);
+/// - a directory can neither be verified as a file nor safely removed;
+/// - a FIFO (or other special file) would hang the size/hash reads
+///   indefinitely.
+///
+/// All three are reported and left in place.
+fn non_regular_file(meta: &fs::Metadata) -> Option<ExistingFileStatus> {
+    if meta.file_type().is_symlink() {
+        Some(ExistingFileStatus::Unreadable(
+            "a symlink occupies the file path".to_string(),
+        ))
+    } else if meta.file_type().is_dir() {
+        Some(ExistingFileStatus::Unreadable(
+            "a directory occupies the file path".to_string(),
+        ))
+    } else if !meta.file_type().is_file() {
+        Some(ExistingFileStatus::Unreadable(
+            "a non-regular file occupies the file path".to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
 /// Check if an existing file is still valid: the (cheap) size check runs
 /// first so a stale or truncated copy never spends a full-file hash
 /// before being rejected
@@ -144,29 +174,13 @@ pub(crate) fn check_existing_file(
 ) -> Result<ExistingFileStatus> {
     let path = Path::new(file_path);
     match fs::symlink_metadata(path) {
-        // A symlink at the final path — valid or dangling (exists() follows
-        // the link and would misreport a dangling one as Missing) — would
-        // be followed by every check below (size, hash, and the mtime sync
-        // or removal the caller performs): unreadable, left in place.
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Ok(ExistingFileStatus::Unreadable(
-                "a symlink occupies the file path".to_string(),
-            ));
-        }
-        // A directory at the final path can neither be verified as a file
-        // nor safely removed: report it as unreadable and leave it in
-        // place.
-        Ok(meta) if meta.file_type().is_dir() => {
-            return Ok(ExistingFileStatus::Unreadable(
-                "a directory occupies the file path".to_string(),
-            ));
-        }
-        // Only a regular file can be verified: a FIFO (or other special
-        // file) would hang the size/hash reads below indefinitely.
-        Ok(meta) if !meta.file_type().is_file() => {
-            return Ok(ExistingFileStatus::Unreadable(
-                "a non-regular file occupies the file path".to_string(),
-            ));
+        // Present: a regular file proceeds to the size/hash checks below,
+        // everything else (symlink, directory, FIFO, ...) is reported as
+        // unreadable and left in place
+        Ok(meta) => {
+            if let Some(status) = non_regular_file(&meta) {
+                return Ok(status);
+            }
         }
         // Absent: download from scratch.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -179,7 +193,6 @@ pub(crate) fn check_existing_file(
                 "could not read file: {e}"
             )));
         }
-        Ok(_) => {}
     }
 
     let mismatch = match size_mismatch(file_path, expected_size) {

@@ -83,6 +83,14 @@ async fn stream_response_body(
     Ok(downloaded_bytes)
 }
 
+/// Truncates a local file and moves its write cursor to the start, so a
+/// fresh body is streamed over it instead of appended to stale data.
+fn reset_local_file(file: &mut File) -> Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(())
+}
+
 /// A transfer's body could not be used: clear the progress bar, record the
 /// retry, and leave the file positioned at its end so the next attempt
 /// resumes from where this one stopped.
@@ -242,10 +250,13 @@ fn prefix_trusted(status: StatusCode, headers: &HeaderMap, local_size: u64) -> b
 /// response will send, added to the local prefix) when present, else the
 /// metadata size, else the current size (an unknown-size file has no usable
 /// total, matching the previous behaviour).
-fn progress_total(response: &Response, base_size: u64, expected_size: Option<u64>) -> u64 {
-    response
-        .content_length()
-        .map(|remaining| base_size + remaining)
+///
+/// The add is saturating: a hostile or broken `Content-Length` of
+/// `u64::MAX` must not overflow a non-empty local prefix (a debug-build
+/// panic or a release wrap would both misread the transfer).
+fn progress_total(content_length: Option<u64>, base_size: u64, expected_size: Option<u64>) -> u64 {
+    content_length
+        .map(|remaining| base_size.saturating_add(remaining))
         .or(expected_size)
         .unwrap_or(base_size)
 }
@@ -414,8 +425,7 @@ pub(crate) async fn download_file_content(
                 // full body: the local prefix is untrusted, so the file is
                 // reset before the body is streamed.
                 StatusCode::OK => {
-                    file.set_len(0)?;
-                    file.seek(SeekFrom::Start(0))?;
+                    reset_local_file(file)?;
                     download_action = download_action_label(false);
                 }
                 // A 206 that does not continue the local prefix: its body
@@ -424,8 +434,7 @@ pub(crate) async fn download_file_content(
                 // result. Reset the file, discard the response, and retry
                 // with an un-ranged GET.
                 _ => {
-                    file.set_len(0)?;
-                    file.seek(SeekFrom::Start(0))?;
+                    reset_local_file(file)?;
                     drop(response);
                     retry
                         .record(
@@ -444,7 +453,7 @@ pub(crate) async fn download_file_content(
         let base_size = file.metadata()?.len();
 
         let pb = create_progress_bar(
-            progress_total(&response, base_size, expected_size),
+            progress_total(response.content_length(), base_size, expected_size),
             &download_action,
             "green/green",
             true,
@@ -1216,5 +1225,18 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn progress_total_saturates_on_hostile_content_length() {
+        // A response announcing u64::MAX on top of a non-empty local prefix
+        // must saturate, not overflow (debug panic) or wrap (release)
+        assert_eq!(progress_total(Some(u64::MAX), 10, None), u64::MAX);
+        // The announced length extends the local prefix
+        assert_eq!(progress_total(Some(90), 10, None), 100);
+        // Without an announcement the metadata size is used
+        assert_eq!(progress_total(None, 10, Some(100)), 100);
+        // Without either, the current size stands in
+        assert_eq!(progress_total(None, 10, None), 10);
     }
 }
